@@ -175,7 +175,7 @@ public class Given_A_Postgresql_AcademicWeek_Read_With_Different_Caller_Authoriz
         services.Configure<DatabaseOptions>(options => options.IsolationLevel = IsolationLevel.ReadCommitted);
         services.AddTestReadableProfileProjector();
         services.AddScoped<RelationalDocumentStoreRepository>();
-        services.AddPostgresqlReferenceResolver();
+        services.AddPostgresqlBackendIntegrationTestServices();
 
         short schoolResourceKeyId = _mappingSet.ResourceKeyIdByResource[SchoolResource];
         Dictionary<short, DocumentLinkSlugTriple> slugByResourceKeyId = new()
@@ -357,13 +357,16 @@ public class Given_A_Postgresql_AcademicWeek_Read_With_Different_Caller_Authoriz
             MappingSet: _mappingSet,
             QueryElements: [],
             AuthorizationStrategyEvaluators: [],
-            PaginationParameters: new PaginationParameters(
-                Limit: 25,
-                Offset: 0,
-                TotalCount: false,
-                MaximumPageSize: MaximumPageSize
+            Paging: new CollectionPaging.Traditional(
+                new PaginationParameters(
+                    Limit: 25,
+                    Offset: 0,
+                    TotalCount: false,
+                    MaximumPageSize: MaximumPageSize
+                )
             ),
-            TraceId: new TraceId("pg-32-query-academicweek")
+            TraceId: new TraceId("pg-32-query-academicweek"),
+            PageOrderingMode: PageOrderingMode.DocumentId
         );
 
         QueryResult result = await scope
@@ -471,6 +474,7 @@ public class Given_A_Postgresql_AcademicWeek_Read_With_Different_Caller_Authoriz
             """
             INSERT INTO "dms"."Descriptor" (
                 "DocumentId",
+                "ResourceKeyId",
                 "Namespace",
                 "CodeValue",
                 "ShortDescription",
@@ -480,6 +484,7 @@ public class Given_A_Postgresql_AcademicWeek_Read_With_Different_Caller_Authoriz
             )
             VALUES (
                 @documentId,
+                @resourceKeyId,
                 @namespace,
                 @codeValue,
                 @shortDescription,
@@ -489,6 +494,7 @@ public class Given_A_Postgresql_AcademicWeek_Read_With_Different_Caller_Authoriz
             );
             """,
             new NpgsqlParameter("documentId", documentId),
+            new NpgsqlParameter("resourceKeyId", resourceKeyId),
             new NpgsqlParameter("namespace", @namespace),
             new NpgsqlParameter("codeValue", codeValue),
             new NpgsqlParameter("shortDescription", shortDescription),

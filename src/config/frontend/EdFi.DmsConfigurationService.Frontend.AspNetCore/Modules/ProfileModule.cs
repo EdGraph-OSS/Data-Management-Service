@@ -11,7 +11,6 @@ using EdFi.DmsConfigurationService.DataModel.Model.Profile;
 using EdFi.DmsConfigurationService.Frontend.AspNetCore.Infrastructure;
 using EdFi.DmsConfigurationService.Frontend.AspNetCore.Infrastructure.Authorization;
 using EdFi.DmsConfigurationService.Frontend.AspNetCore.Models;
-using FluentValidation;
 using FluentValidation.Results;
 using Microsoft.Extensions.Logging;
 
@@ -104,7 +103,7 @@ public class ProfileModule : IEndpointModule
     }
 
     private static async Task<IResult> GetById(
-        long id,
+        int id,
         HttpContext httpContext,
         IProfileRepository repository,
         ILogger<ProfileModule> logger
@@ -130,7 +129,7 @@ public class ProfileModule : IEndpointModule
     }
 
     private static async Task<IResult> Update(
-        long id,
+        int id,
         ProfileUpdateCommand command,
         ProfileUpdateCommand.Validator validator,
         HttpContext httpContext,
@@ -139,13 +138,9 @@ public class ProfileModule : IEndpointModule
     )
     {
         logger.LogDebug("Entering Profile Update for id: {Id}", id);
+        PutGuards.GuardRouteIdMatchesBodyId(id, command.Id);
+
         await validator.GuardAsync(command);
-        if (command.Id != id)
-        {
-            throw new ValidationException([
-                new ValidationFailure("Id", "Request body id must match the id in the url."),
-            ]);
-        }
         var result = await repository.UpdateProfile(command);
         return result switch
         {
@@ -167,7 +162,7 @@ public class ProfileModule : IEndpointModule
     }
 
     private static async Task<IResult> Delete(
-        long id,
+        int id,
         HttpContext httpContext,
         IProfileRepository repository,
         ILogger<ProfileModule> logger
@@ -179,11 +174,11 @@ public class ProfileModule : IEndpointModule
         {
             ProfileDeleteResult.Success => Results.NoContent(),
             ProfileDeleteResult.FailureInUse => Results.Json(
-                FailureResponse.ForBadRequest(
+                FailureResponse.ForDependentItemExists(
                     "Profile is assigned to applications and cannot be deleted.",
                     httpContext.TraceIdentifier
                 ),
-                statusCode: (int)HttpStatusCode.BadRequest
+                statusCode: (int)HttpStatusCode.Conflict
             ),
             ProfileDeleteResult.FailureNotExists => Results.Json(
                 FailureResponse.ForNotFound($"Profile {id} not found.", httpContext.TraceIdentifier),

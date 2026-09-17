@@ -1,0 +1,392 @@
+// SPDX-License-Identifier: Apache-2.0
+// Licensed to the Ed-Fi Alliance under one or more agreements.
+// The Ed-Fi Alliance licenses this file to you under the Apache License, Version 2.0.
+// See the LICENSE and NOTICES files in the project root for more information.
+
+using EdFi.DataManagementService.Backend.Etag;
+using EdFi.DataManagementService.Backend.Mssql;
+using EdFi.DataManagementService.Backend.Postgresql;
+using EdFi.DataManagementService.Core.Configuration;
+using EdFi.DataManagementService.Core.DocumentCache;
+using EdFi.DataManagementService.Core.DocumentCache.Cdc;
+using FluentAssertions;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using NUnit.Framework;
+
+namespace EdFi.DataManagementService.Backend.Tests.Unit;
+
+[TestFixture]
+[Parallelizable]
+[Category("DocumentCacheServiceRegistration")]
+public class Given_DocumentCacheServiceRegistration
+{
+    [Test]
+    public void It_registers_the_shared_projection_and_administrative_runtime_surface()
+    {
+        IServiceCollection services = new ServiceCollection();
+
+        AddSharedReferenceResolverForTest(services);
+
+        AssertSingletonFactory<DocumentCacheProjectionObservationStore>(services);
+        AssertSingleton<IDocumentCacheProjectionTelemetry, DocumentCacheProjectionTelemetry>(services);
+        AssertSingleton<IDocumentCacheStatusTelemetry, DocumentCacheStatusTelemetry>(services);
+        AssertSingleton<
+            IDocumentCacheDownstreamPublicationHistoryProvider,
+            DocumentCacheUnknownDownstreamPublicationHistoryProvider
+        >(services);
+        AssertSingletonFactory<IDocumentCacheProjectionObservationProvider>(services);
+        AssertSingletonFactory<IDocumentCacheProjectionObservationSink>(services);
+        AssertSingleton<IDocumentCacheStatusService, DocumentCacheStatusService>(services);
+        AssertSingleton<
+            IDocumentCacheProjectionTargetRuntimeContextFactory,
+            DocumentCacheProjectionTargetRuntimeContextFactory
+        >(services);
+        AssertSingleton<IDocumentCacheProjectionItemProcessor, DocumentCacheProjectionItemProcessor>(
+            services
+        );
+        AssertSingleton<IDocumentCacheProjectionScheduler, DocumentCacheProjectionScheduler>(services);
+        AssertSingleton<IDocumentCacheAdministrativeCommandRunner, DocumentCacheAdministrativeCommandRunner>(
+            services
+        );
+        AssertSingleton<
+            IDocumentCacheGuardedNewEmptyActivationCommand,
+            DocumentCacheGuardedNewEmptyActivationCommand
+        >(services);
+        AssertSingleton<IDocumentCacheOfflineActivationCommand, DocumentCacheOfflineActivationCommand>(
+            services
+        );
+        AssertSingleton<IDocumentCacheOfflineDeactivationCommand, DocumentCacheOfflineDeactivationCommand>(
+            services
+        );
+        AssertSingleton<IDocumentCacheOnlineCacheRebuildCommand, DocumentCacheOnlineCacheRebuildCommand>(
+            services
+        );
+        AssertSingleton<
+            IDocumentCacheExplicitIntegrityScrubCommand,
+            DocumentCacheExplicitIntegrityScrubCommand
+        >(services);
+        AssertSingleton<
+            IDocumentCacheInternalOnlyCacheAheadRecoveryCommand,
+            DocumentCacheInternalOnlyCacheAheadRecoveryCommand
+        >(services);
+        AssertSingleton<IDocumentCacheBaselineSeeder, DocumentCacheBaselineSeeder>(services);
+        AssertSingleton<IDocumentCacheAdministrativeDrainer, DocumentCacheAdministrativeDrainer>(services);
+        AssertScoped<IDocumentCacheWriterRetryAdapter, DocumentCacheWriterRetryAdapter>(services);
+        AssertSingletonFactory<IDocumentCacheProjectionTargetDiagnosticSink>(services);
+        AssertScoped<IDocumentCacheReadResponseShaper, DocumentCacheReadResponseShaper>(services);
+        AssertScopedFactory<IDocumentCacheReadAccelerationCoordinator>(services);
+        services
+            .Should()
+            .NotContain(descriptor => descriptor.ServiceType == typeof(IDocumentCacheReadLookupAdapter));
+        services.Should().NotContain(descriptor => descriptor.ServiceType == typeof(IHostedService));
+    }
+
+    [Test]
+    public void It_resolves_the_projection_observation_store_from_configured_document_cache_options()
+    {
+        IServiceCollection services = new ServiceCollection();
+        services.Configure<DocumentCacheOptions>(options => options.Projector.PageSize = 3);
+
+        AddSharedReferenceResolverForTest(services);
+
+        using ServiceProvider serviceProvider = services.BuildServiceProvider();
+        DocumentCacheProjectionObservationStore store =
+            serviceProvider.GetRequiredService<DocumentCacheProjectionObservationStore>();
+
+        serviceProvider
+            .GetRequiredService<IDocumentCacheProjectionObservationProvider>()
+            .Should()
+            .BeSameAs(store);
+        serviceProvider
+            .GetRequiredService<IDocumentCacheProjectionObservationSink>()
+            .Should()
+            .BeSameAs(store);
+    }
+
+    [Test]
+    public void It_preserves_a_custom_downstream_publication_history_provider()
+    {
+        IServiceCollection services = new ServiceCollection();
+        services.AddSingleton<
+            IDocumentCacheDownstreamPublicationHistoryProvider,
+            CustomDocumentCacheDownstreamPublicationHistoryProvider
+        >();
+
+        services.AddPostgresqlReferenceResolver();
+
+        AssertSingleton<
+            IDocumentCacheDownstreamPublicationHistoryProvider,
+            CustomDocumentCacheDownstreamPublicationHistoryProvider
+        >(services);
+    }
+
+    [Test]
+    public void It_registers_the_postgresql_projection_and_administrative_provider_adapters()
+    {
+        IServiceCollection services = new ServiceCollection();
+
+        services.AddPostgresqlReferenceResolver();
+
+        AssertScoped<PostgresqlDocumentCacheWriter, PostgresqlDocumentCacheWriter>(services);
+        AssertScopedFactory<IDocumentCacheWriter>(services);
+        AssertScopedFactory<IDocumentCacheSessionBoundWriter>(services);
+        AssertSingleton<IDocumentProjectionWorkPager, PostgresqlDocumentProjectionWorkPager>(services);
+        AssertSingleton<
+            IDocumentCacheStatusCurrentSourceObserver,
+            PostgresqlDocumentCacheStatusCurrentSourceObserver
+        >(services);
+        AssertSingleton<IDocumentCacheAdministrativeMutex, PostgresqlDocumentCacheAdministrativeMutex>(
+            services
+        );
+        AssertSingleton<
+            IDocumentCacheProviderCommandTimeoutClassifier,
+            PostgresqlDocumentCacheProviderCommandTimeoutClassifier
+        >(services);
+        services
+            .Should()
+            .NotContain(descriptor => descriptor.ServiceType == typeof(ICdcProviderSourcePositionAdapter));
+        services
+            .Should()
+            .NotContain(descriptor => descriptor.ServiceType == typeof(PostgresqlCdcSourcePositionAdapter));
+        AssertSingleton<IServedEtagComposer, ServedEtagComposer>(services);
+        AssertSingletonFactory<IDocumentCacheAdministrativePrimitives>(services);
+        AssertSingleton<
+            IDocumentCacheProjectionDrainPageProcessor,
+            DocumentCacheProjectionDrainPageProcessor
+        >(services);
+        AssertScoped<IDocumentCacheReadLookupAdapter, PostgresqlDocumentCacheReadLookupAdapter>(services);
+        AssertScoped<IDocumentCacheReadResponseShaper, DocumentCacheReadResponseShaper>(services);
+        AssertScopedFactory<IDocumentCacheReadAccelerationCoordinator>(services);
+    }
+
+    [Test]
+    public void It_registers_the_mssql_projection_and_administrative_provider_adapters()
+    {
+        IServiceCollection services = new ServiceCollection();
+
+        services.AddMssqlReferenceResolver();
+
+        AssertScoped<MssqlDocumentCacheWriter, MssqlDocumentCacheWriter>(services);
+        AssertScopedFactory<IDocumentCacheWriter>(services);
+        AssertScopedFactory<IDocumentCacheSessionBoundWriter>(services);
+        AssertSingleton<IDocumentProjectionWorkPager, MssqlDocumentProjectionWorkPager>(services);
+        AssertSingleton<
+            IDocumentCacheStatusCurrentSourceObserver,
+            MssqlDocumentCacheStatusCurrentSourceObserver
+        >(services);
+        AssertSingleton<IDocumentCacheAdministrativeMutex, MssqlDocumentCacheAdministrativeMutex>(services);
+        AssertSingleton<
+            IDocumentCacheProviderCommandTimeoutClassifier,
+            MssqlDocumentCacheProviderCommandTimeoutClassifier
+        >(services);
+        services
+            .Should()
+            .NotContain(descriptor => descriptor.ServiceType == typeof(ICdcProviderSourcePositionAdapter));
+        services
+            .Should()
+            .NotContain(descriptor => descriptor.ServiceType == typeof(MssqlCdcSourcePositionAdapter));
+        AssertSingleton<IServedEtagComposer, ServedEtagComposer>(services);
+        AssertSingletonFactory<IDocumentCacheAdministrativePrimitives>(services);
+        AssertSingleton<
+            IDocumentCacheProjectionDrainPageProcessor,
+            DocumentCacheProjectionDrainPageProcessor
+        >(services);
+        AssertScoped<IDocumentCacheReadLookupAdapter, MssqlDocumentCacheReadLookupAdapter>(services);
+        AssertScoped<IDocumentCacheReadResponseShaper, DocumentCacheReadResponseShaper>(services);
+        AssertScopedFactory<IDocumentCacheReadAccelerationCoordinator>(services);
+    }
+
+    [Test]
+    public void It_registers_status_current_source_observers_for_both_relational_providers()
+    {
+        IServiceCollection services = new ServiceCollection();
+
+        services.AddPostgresqlReferenceResolver();
+        services.AddMssqlReferenceResolver();
+
+        services
+            .Where(descriptor => descriptor.ServiceType == typeof(IDocumentCacheStatusCurrentSourceObserver))
+            .Should()
+            .SatisfyRespectively(
+                descriptor =>
+                {
+                    descriptor.Lifetime.Should().Be(ServiceLifetime.Singleton);
+                    descriptor
+                        .ImplementationType.Should()
+                        .Be(typeof(PostgresqlDocumentCacheStatusCurrentSourceObserver));
+                },
+                descriptor =>
+                {
+                    descriptor.Lifetime.Should().Be(ServiceLifetime.Singleton);
+                    descriptor
+                        .ImplementationType.Should()
+                        .Be(typeof(MssqlDocumentCacheStatusCurrentSourceObserver));
+                }
+            );
+    }
+
+    [Test]
+    public async Task It_resolves_the_postgresql_cdc_control_plane_only_when_opted_in()
+    {
+        using TempCdcServiceRegistrationRoot root = new();
+        IServiceCollection services = new ServiceCollection();
+
+        services.AddLogging();
+        services.Configure<CdcBindingStateStoreOptions>(options => options.RootPath = root.Path);
+        services.AddPostgresqlDmsCdcControlPlane();
+
+        ServiceDescriptor providerDescriptor = services
+            .Should()
+            .ContainSingle(descriptor => descriptor.ServiceType == typeof(ICdcProviderSourcePositionAdapter))
+            .Subject;
+        providerDescriptor.Lifetime.Should().Be(ServiceLifetime.Singleton);
+        providerDescriptor.ImplementationType.Should().Be(typeof(PostgresqlCdcSourcePositionAdapter));
+
+        using ServiceProvider serviceProvider = services.BuildServiceProvider(
+            new ServiceProviderOptions { ValidateOnBuild = true, ValidateScopes = true }
+        );
+
+        serviceProvider
+            .GetRequiredService<ICdcProviderSourcePositionAdapter>()
+            .Provider.Should()
+            .Be(CdcProvider.Postgresql);
+        CdcBindingLifecycleResult result = await serviceProvider
+            .GetRequiredService<ICdcBindingLifecycleService>()
+            .ReadBindingAsync(SampleBindingIdentity(), CancellationToken.None);
+
+        result.Status.Should().Be(CdcControlPlaneOperationStatus.BindingMissing);
+        result.State.Should().NotBeNull();
+        result.State!.State.Should().Be(CdcBindingState.BindingMissing);
+    }
+
+    [Test]
+    public async Task It_resolves_the_mssql_cdc_control_plane_only_when_opted_in()
+    {
+        using TempCdcServiceRegistrationRoot root = new();
+        IServiceCollection services = new ServiceCollection();
+
+        services.AddLogging();
+        services.Configure<CdcBindingStateStoreOptions>(options => options.RootPath = root.Path);
+        services.AddMssqlDmsCdcControlPlane();
+
+        ServiceDescriptor providerDescriptor = services
+            .Should()
+            .ContainSingle(descriptor => descriptor.ServiceType == typeof(ICdcProviderSourcePositionAdapter))
+            .Subject;
+        providerDescriptor.Lifetime.Should().Be(ServiceLifetime.Singleton);
+        providerDescriptor.ImplementationType.Should().Be(typeof(MssqlCdcSourcePositionAdapter));
+
+        using ServiceProvider serviceProvider = services.BuildServiceProvider(
+            new ServiceProviderOptions { ValidateOnBuild = true, ValidateScopes = true }
+        );
+
+        serviceProvider
+            .GetRequiredService<ICdcProviderSourcePositionAdapter>()
+            .Provider.Should()
+            .Be(CdcProvider.SqlServer);
+        CdcBindingLifecycleResult result = await serviceProvider
+            .GetRequiredService<ICdcBindingLifecycleService>()
+            .ReadBindingAsync(SampleBindingIdentity(), CancellationToken.None);
+
+        result.Status.Should().Be(CdcControlPlaneOperationStatus.BindingMissing);
+        result.State.Should().NotBeNull();
+        result.State!.State.Should().Be(CdcBindingState.BindingMissing);
+    }
+
+    private static void AddSharedReferenceResolverForTest(IServiceCollection services)
+    {
+        ReferenceResolverServiceCollectionExtensions.AddReferenceResolver<
+            PostgresqlReferenceResolverAdapterFactory,
+            PostgresqlRelationalCommandExecutor,
+            PostgresqlRelationalWriteSessionFactory,
+            PostgresqlDocumentHydrator,
+            PostgresqlSessionDocumentHydrator
+        >(services);
+    }
+
+    private static void AssertSingleton<TService, TImplementation>(IServiceCollection services)
+        where TService : class
+        where TImplementation : class, TService
+    {
+        ServiceDescriptor descriptor = GetSingleDescriptor<TService>(services);
+
+        descriptor.Lifetime.Should().Be(ServiceLifetime.Singleton);
+        descriptor.ImplementationType.Should().Be(typeof(TImplementation));
+        descriptor.ImplementationFactory.Should().BeNull();
+        descriptor.ImplementationInstance.Should().BeNull();
+    }
+
+    private static void AssertScoped<TService, TImplementation>(IServiceCollection services)
+        where TService : class
+        where TImplementation : class, TService
+    {
+        ServiceDescriptor descriptor = GetSingleDescriptor<TService>(services);
+
+        descriptor.Lifetime.Should().Be(ServiceLifetime.Scoped);
+        descriptor.ImplementationType.Should().Be(typeof(TImplementation));
+        descriptor.ImplementationFactory.Should().BeNull();
+        descriptor.ImplementationInstance.Should().BeNull();
+    }
+
+    private static void AssertSingletonFactory<TService>(IServiceCollection services)
+        where TService : class
+    {
+        ServiceDescriptor descriptor = GetSingleDescriptor<TService>(services);
+
+        descriptor.Lifetime.Should().Be(ServiceLifetime.Singleton);
+        descriptor.ImplementationType.Should().BeNull();
+        descriptor.ImplementationFactory.Should().NotBeNull();
+        descriptor.ImplementationInstance.Should().BeNull();
+    }
+
+    private static void AssertScopedFactory<TService>(IServiceCollection services)
+        where TService : class
+    {
+        ServiceDescriptor descriptor = GetSingleDescriptor<TService>(services);
+
+        descriptor.Lifetime.Should().Be(ServiceLifetime.Scoped);
+        descriptor.ImplementationType.Should().BeNull();
+        descriptor.ImplementationFactory.Should().NotBeNull();
+        descriptor.ImplementationInstance.Should().BeNull();
+    }
+
+    private static ServiceDescriptor GetSingleDescriptor<TService>(IServiceCollection services)
+        where TService : class
+    {
+        return services
+            .Should()
+            .ContainSingle(descriptor => descriptor.ServiceType == typeof(TService))
+            .Subject;
+    }
+
+    private static CdcBindingIdentity SampleBindingIdentity() =>
+        new("dms-local", "default", "1", "data-store-1", 1);
+
+    private sealed class CustomDocumentCacheDownstreamPublicationHistoryProvider
+        : IDocumentCacheDownstreamPublicationHistoryProvider
+    {
+        public Task<DocumentCacheDownstreamPublicationHistoryObservation> ObserveAsync(
+            DocumentCacheTargetKey targetKey,
+            DocumentCachePhysicalSourceFingerprint? currentPhysicalSourceFingerprint,
+            CancellationToken cancellationToken = default
+        ) => throw new NotSupportedException();
+    }
+
+    private sealed class TempCdcServiceRegistrationRoot : IDisposable
+    {
+        public string Path { get; } =
+            System.IO.Path.Combine(
+                System.IO.Path.GetTempPath(),
+                $"cdc-service-registration-{Guid.NewGuid():N}"
+            );
+
+        public void Dispose()
+        {
+            if (Directory.Exists(Path))
+            {
+                Directory.Delete(Path, true);
+            }
+        }
+    }
+}

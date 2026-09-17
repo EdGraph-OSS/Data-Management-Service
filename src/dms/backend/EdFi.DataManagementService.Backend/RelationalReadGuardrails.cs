@@ -99,7 +99,8 @@ internal static class RelationalReadGuardrails
                             ? null
                             : [failure.ConfiguredStrategy.RawConfiguredIndex],
                         TargetResourceFullName: failure.FailureKind
-                        is RelationshipAuthorizationFailureKind.UnknownCustomViewBasisResource
+                            is RelationshipAuthorizationFailureKind.UnknownCustomViewBasisResource
+                                or RelationshipAuthorizationFailureKind.CustomViewBasisNotIdentifyingOrSecurable
                             ? RelationalWriteSupport.FormatResource(failure.Resource)
                             : null
                     )
@@ -126,6 +127,66 @@ internal static class RelationalReadGuardrails
         ];
     }
 
+    /// <summary>
+    /// Maps the ReadChanges custom-view planning failures of one request
+    /// (<see cref="ReadChangesAuthorizationPlanOutcome.CustomViewSecurityConfiguration"/>) to the change-query
+    /// security-configuration failure. The change-query failure carries no diagnostics, so every failure must
+    /// surface in <c>Errors</c>: unknown-basis failures collapse into the canonical unknown-strategy message at
+    /// their first position (their names also fill <c>UnavailableStrategyNames</c>, as the live paths report
+    /// them), a missing join path keeps its live-path wording, and every other kind — the
+    /// <see cref="RelationshipAuthorizationFailureKind.CustomViewBasisNotIdentifyingOrSecurable"/> rule — renders
+    /// the planner's hint. Messages keep CMS local order.
+    /// </summary>
+    public static ChangeQueryAuthorizationFailure.SecurityConfiguration BuildChangeQueryCustomViewSecurityConfigurationFailure(
+        IReadOnlyList<RelationshipAuthorizationFailureMetadata> failures
+    )
+    {
+        ArgumentNullException.ThrowIfNull(failures);
+
+        const string operationLabel = "change query";
+
+        string[] unknownBasisStrategyNames =
+        [
+            .. failures
+                .Where(IsUnknownCustomViewBasisFailure)
+                .Select(static failure => failure.ConfiguredStrategy?.StrategyName)
+                .OfType<string>()
+                .Distinct(StringComparer.Ordinal),
+        ];
+
+        List<string> errors = [];
+        var unknownBasisMessageAdded = false;
+
+        foreach (RelationshipAuthorizationFailureMetadata failure in failures)
+        {
+            if (IsUnknownCustomViewBasisFailure(failure) && unknownBasisStrategyNames.Length > 0)
+            {
+                if (!unknownBasisMessageAdded)
+                {
+                    errors.Add(
+                        SecurityConfigurationFailureMessages.UnknownAuthorizationStrategies(
+                            unknownBasisStrategyNames
+                        )
+                    );
+                    unknownBasisMessageAdded = true;
+                }
+
+                continue;
+            }
+
+            errors.Add(
+                failure.FailureKind is RelationshipAuthorizationFailureKind.NoCustomViewJoinPath
+                    ? CustomViewAuthorizationFailureMessages.NoJoinPath(failure, operationLabel)
+                    : CustomViewAuthorizationFailureMessages.FromPlannerHint(failure, operationLabel)
+            );
+        }
+
+        return new ChangeQueryAuthorizationFailure.SecurityConfiguration(unknownBasisStrategyNames, errors);
+    }
+
+    private static bool IsUnknownCustomViewBasisFailure(RelationshipAuthorizationFailureMetadata failure) =>
+        failure.FailureKind is RelationshipAuthorizationFailureKind.UnknownCustomViewBasisResource;
+
     public static SecurityConfigurationFailureDiagnostic[] BuildNoUsableRootColumnDiagnostics(
         QualifiedResourceName resource
     ) =>
@@ -137,26 +198,49 @@ internal static class RelationalReadGuardrails
             ),
         ];
 
+    /// <param name="supportedCustomViewStrategies">
+    /// Custom view-based strategies this operation resolved and will apply. Custom views are supported
+    /// AND filters on both read paths, so they are neither reported as unsupported effective strategies nor
+    /// omitted from the supported-strategy sentence. Empty (the default) for every operation that does
+    /// not implement custom views, which keeps that operation's wording unchanged.
+    /// </param>
     public static string BuildAuthorizationNotImplementedMessage(
         QualifiedResourceName resource,
         IReadOnlyList<AuthorizationStrategyEvaluator> authorizationStrategyEvaluators,
         string operationLabel,
-        string effectiveAuthorizationActionLabel
+        string effectiveAuthorizationActionLabel,
+        IReadOnlyList<SupportedCustomViewAuthorizationStrategy>? supportedCustomViewStrategies = null
     )
     {
         ArgumentNullException.ThrowIfNull(authorizationStrategyEvaluators);
 
+        HashSet<string> supportedCustomViewNames =
+        [
+            .. (supportedCustomViewStrategies ?? []).Select(static strategy =>
+                strategy.ConfiguredStrategy.StrategyName
+            ),
+        ];
+
         var strategyNames = authorizationStrategyEvaluators
             .Select(static evaluator => evaluator.AuthorizationStrategyName)
+            .Where(name => !supportedCustomViewNames.Contains(name))
             .Distinct(StringComparer.Ordinal)
             .OrderBy(static name => name, StringComparer.Ordinal)
             .Select(static name => $"'{name}'");
 
+        string supportedStrategySentence =
+            supportedCustomViewNames.Count == 0
+                ? "Only requests with no authorization strategies or with "
+                    + $"'{AuthorizationStrategyNameConstants.NamespaceBased}' and/or "
+                    + $"'{AuthorizationStrategyNameConstants.NoFurtherAuthorizationRequired}' are currently supported."
+                : "Only requests with no authorization strategies or with "
+                    + $"'{AuthorizationStrategyNameConstants.NamespaceBased}', "
+                    + $"'{AuthorizationStrategyNameConstants.NoFurtherAuthorizationRequired}', and/or a resolved "
+                    + "custom view-based strategy are currently supported.";
+
         return $"Relational {operationLabel} authorization is not implemented for resource '{RelationalWriteSupport.FormatResource(resource)}' "
             + $"when effective {effectiveAuthorizationActionLabel} authorization requires filtering. Effective strategies: "
-            + $"[{string.Join(", ", strategyNames)}]. Only requests with no authorization strategies or with "
-            + $"'{AuthorizationStrategyNameConstants.NamespaceBased}' and/or "
-            + $"'{AuthorizationStrategyNameConstants.NoFurtherAuthorizationRequired}' are currently supported.";
+            + $"[{string.Join(", ", strategyNames)}]. {supportedStrategySentence}";
     }
 
     public static int ConvertTotalCountOrThrow(

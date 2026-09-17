@@ -1,0 +1,172 @@
+// SPDX-License-Identifier: Apache-2.0
+// Licensed to the Ed-Fi Alliance under one or more agreements.
+// The Ed-Fi Alliance licenses this file to you under the Apache License, Version 2.0.
+// See the LICENSE and NOTICES files in the project root for more information.
+
+using EdFi.DataManagementService.Backend.External;
+
+namespace EdFi.DataManagementService.Backend.Ddl;
+
+internal sealed record DmsCoreColumnDefinition(
+    DbColumnName ColumnName,
+    string SqlType,
+    bool IsNullable,
+    string? DefaultConstraintName = null,
+    string? DefaultExpression = null
+);
+
+internal sealed record DmsCoreTableDefinition(
+    DbTableName TableName,
+    IReadOnlyList<DmsCoreColumnDefinition> Columns,
+    IReadOnlyList<DbColumnName> PrimaryKeyColumns
+);
+
+internal static class DmsCoreTableDefinitions
+{
+    internal static DmsCoreTableDefinition Document(ISqlDialect dialect)
+    {
+        ArgumentNullException.ThrowIfNull(dialect);
+
+        return new DmsCoreTableDefinition(
+            DmsTableNames.Document,
+            [
+                new(Col("DocumentId"), dialect.IdentityBigintColumnType, IsNullable: false),
+                new(Col("DocumentUuid"), dialect.UuidColumnType, IsNullable: false),
+                new(Col("ResourceKeyId"), dialect.SmallintColumnType, IsNullable: false),
+                new(Col("CreatedByOwnershipTokenId"), dialect.SmallintColumnType, IsNullable: true),
+                new(
+                    Col("ContentVersion"),
+                    "bigint",
+                    IsNullable: false,
+                    "DF_Document_ContentVersion",
+                    SequenceDefault(dialect)
+                ),
+                new(
+                    Col("ContentLastModifiedAt"),
+                    DateTimeType(dialect),
+                    IsNullable: false,
+                    "DF_Document_ContentLastModifiedAt",
+                    dialect.CurrentTimestampDefaultExpression
+                ),
+                new(
+                    Col("CreatedAt"),
+                    DateTimeType(dialect),
+                    IsNullable: false,
+                    "DF_Document_CreatedAt",
+                    dialect.CurrentTimestampDefaultExpression
+                ),
+            ],
+            [Col("DocumentId")]
+        );
+    }
+
+    internal static DmsCoreTableDefinition DocumentCache(ISqlDialect dialect)
+    {
+        ArgumentNullException.ThrowIfNull(dialect);
+
+        return new DmsCoreTableDefinition(
+            DmsTableNames.DocumentCache,
+            [
+                new(Col("DocumentId"), dialect.DocumentIdColumnType, IsNullable: false),
+                new(Col("DocumentUuid"), dialect.UuidColumnType, IsNullable: false),
+                new(Col("ProjectName"), StringType(dialect, 256), IsNullable: false),
+                new(Col("ResourceName"), StringType(dialect, 256), IsNullable: false),
+                new(Col("ResourceVersion"), StringType(dialect, 32), IsNullable: false),
+                new(Col("ContentVersion"), "bigint", IsNullable: false),
+                new(Col("StreamEtag"), StreamEtagType(dialect), IsNullable: false),
+                new(Col("LastModifiedAt"), DateTimeType(dialect), IsNullable: false),
+                new(Col("DocumentJson"), dialect.JsonColumnType, IsNullable: false),
+                new(
+                    Col("ComputedAt"),
+                    DateTimeType(dialect),
+                    IsNullable: false,
+                    DocumentCacheInventoryDefinition.DocumentCacheConstraints.ComputedAtDefault,
+                    dialect.CurrentTimestampDefaultExpression
+                ),
+            ],
+            [Col("DocumentId")]
+        );
+    }
+
+    internal static DmsCoreTableDefinition DocumentProjectionWork(ISqlDialect dialect)
+    {
+        ArgumentNullException.ThrowIfNull(dialect);
+
+        return new DmsCoreTableDefinition(
+            DmsTableNames.DocumentProjectionWork,
+            [
+                new(Col("DocumentId"), dialect.DocumentIdColumnType, IsNullable: false),
+                new(Col("RequiredContentVersion"), "bigint", IsNullable: false),
+                new(Col("FirstEnqueuedAt"), DateTimeType(dialect), IsNullable: false),
+                new(Col("LastEnqueuedAt"), DateTimeType(dialect), IsNullable: false),
+            ],
+            [Col("DocumentId")]
+        );
+    }
+
+    internal static DmsCoreTableDefinition CdcHeartbeat(ISqlDialect dialect)
+    {
+        ArgumentNullException.ThrowIfNull(dialect);
+
+        return new DmsCoreTableDefinition(
+            DmsTableNames.CdcHeartbeat,
+            [
+                new(Col("HeartbeatId"), dialect.SmallintColumnType, IsNullable: false),
+                new(Col("HeartbeatSequence"), "bigint", IsNullable: false),
+                new(Col("HeartbeatAt"), DateTimeType(dialect), IsNullable: false),
+            ],
+            [Col("HeartbeatId")]
+        );
+    }
+
+    internal static DmsCoreTableDefinition RepresentationRestampOperation(ISqlDialect dialect)
+    {
+        ArgumentNullException.ThrowIfNull(dialect);
+
+        return new DmsCoreTableDefinition(
+            DmsTableNames.RepresentationRestampOperation,
+            [
+                new(Col("OperationId"), dialect.UuidColumnType, IsNullable: false),
+                new(Col("ContractVersion"), dialect.Rules.ScalarTypeDefaults.Int32Type, IsNullable: false),
+                new(Col("TenantKey"), StringType(dialect, 256), IsNullable: false),
+                new(Col("DataStoreId"), dialect.Rules.ScalarTypeDefaults.Int64Type, IsNullable: false),
+                new(Col("PhysicalSourceFingerprint"), StringType(dialect, 71), IsNullable: false),
+                new(Col("ScopeJson"), dialect.JsonColumnType, IsNullable: false),
+                new(Col("Reason"), StringType(dialect, 1024), IsNullable: false),
+                new(Col("Mode"), StringType(dialect, 8), IsNullable: false),
+                new(Col("PreRestampBoundary"), "bigint", IsNullable: false),
+                new(Col("PreviewDocumentCount"), "bigint", IsNullable: false),
+                new(Col("CommittedDocumentCount"), "bigint", IsNullable: false),
+                new(Col("State"), StringType(dialect, 10), IsNullable: false),
+                new(
+                    Col("CreatedAt"),
+                    DateTimeType(dialect),
+                    IsNullable: false,
+                    "DF_RepresentationRestampOperation_CreatedAt",
+                    dialect.CurrentTimestampDefaultExpression
+                ),
+                new(
+                    Col("UpdatedAt"),
+                    DateTimeType(dialect),
+                    IsNullable: false,
+                    "DF_RepresentationRestampOperation_UpdatedAt",
+                    dialect.CurrentTimestampDefaultExpression
+                ),
+            ],
+            [Col("OperationId")]
+        );
+    }
+
+    private static DbColumnName Col(string name) => new(name);
+
+    private static string StringType(ISqlDialect dialect, int maxLength) =>
+        $"{dialect.Rules.ScalarTypeDefaults.StringType}({maxLength})";
+
+    private static string StreamEtagType(ISqlDialect dialect) =>
+        dialect.Rules.Dialect == SqlDialect.Mssql ? "varchar(64)" : StringType(dialect, 64);
+
+    private static string DateTimeType(ISqlDialect dialect) => dialect.Rules.ScalarTypeDefaults.DateTimeType;
+
+    private static string SequenceDefault(ISqlDialect dialect) =>
+        dialect.RenderSequenceDefaultExpression(DmsTableNames.DmsSchema, DmsTableNames.ChangeVersionSequence);
+}

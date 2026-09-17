@@ -6,11 +6,11 @@
 using System.Collections.Concurrent;
 using System.Data;
 using System.Data.Common;
-using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using EdFi.DataManagementService.Backend.Ddl;
 using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Backend.External.Plans;
+using EdFi.DataManagementService.Core.External.Model;
 using Microsoft.Data.SqlClient;
 
 namespace EdFi.DataManagementService.Backend.Plans;
@@ -22,6 +22,11 @@ namespace EdFi.DataManagementService.Backend.Plans;
 /// <remarks>
 /// The keyset batch emits result sets in a deterministic sequence:
 /// <list type="number">
+/// <item>
+/// Selected page keyset ids, for a <see cref="PageKeysetSpec.Query"/> keyset only. Always present for
+/// that keyset, with no rows when the selection was empty, so the positions below do not move with
+/// selection size.
+/// </item>
 /// <item>Optional <c>TotalCount</c> (single row, single column)</item>
 /// <item><c>dms.Document</c> metadata joined to the page keyset</item>
 /// <item>Root table rows (from <c>TablePlansInDependencyOrder[0]</c>)</item>
@@ -101,6 +106,95 @@ public static class HydrationBatchBuilder
         return BuildExistingKeysetBatch(plan, keyset, planDialect, writer, executionOptions);
     }
 
+    /// <summary>
+    /// Builds a metadata-only batch for an already-planned query page. The batch materializes the
+    /// query keyset and returns only optional total count plus <c>dms.Document</c> metadata for the
+    /// selected candidates.
+    /// </summary>
+    public static string BuildCandidateMetadataBatch(
+        ResourceReadPlan plan,
+        PageKeysetSpec.Query keyset,
+        SqlDialect dialect
+    )
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        ArgumentNullException.ThrowIfNull(keyset);
+
+        var sqlDialect = SqlDialectFactory.Create(dialect);
+        var planDialect = PlanSqlDialectFactory.Create(dialect);
+        var writer = new SqlWriter(sqlDialect);
+
+        planDialect.AppendCreateKeysetTempTable(writer, plan.KeysetTable, CarriesSelectedAnchor(keyset));
+        writer.AppendLine();
+
+        // The selected keys are returned even though this batch's candidates come from the metadata
+        // rows: the page's continuation boundary describes what selection chose, and a row deleted
+        // between materialization and the metadata select below would otherwise lower or erase it.
+        AppendKeysetMaterialization(writer, planDialect, plan.KeysetTable, keyset);
+        writer.AppendLine();
+
+        if (keyset.Plan.TotalCountSql is not null)
+        {
+            writer.AppendLine(PlanSqlStatementText.AsTerminatedStatement(keyset.Plan.TotalCountSql));
+            writer.AppendLine();
+        }
+
+        planDialect.AppendDocumentMetadataSelect(writer, plan.KeysetTable);
+
+        return writer.ToString();
+    }
+
+    /// <summary>
+    /// Builds the single-document hydration batch for a document id that is not client-known at build
+    /// time. The id is still referenced through the single-document parameter token — callers
+    /// co-batching this batch substitute that token with their captured-target expression.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="keysetRowGuardPredicateSql"/> is consumed only by the keyset batch, where it
+    /// stops an absent id from inserting NULL into the keyset table instead of materializing no row.
+    /// The fast path discards it, because it is pure selects: an absent id compares as <c>= NULL</c>
+    /// and yields zero rows on its own.
+    /// </remarks>
+    /// <param name="plan">The compiled resource read plan.</param>
+    /// <param name="dialect">The SQL dialect.</param>
+    /// <param name="executionOptions">Controls optional projection work in the batch.</param>
+    /// <param name="keysetRowGuardPredicateSql">
+    /// Raw predicate that is true only when the captured id exists, for example the composite
+    /// carrier's captured-target-present predicate.
+    /// </param>
+    /// <returns>The assembled SQL command text.</returns>
+    public static string BuildGuardedSingleDocumentBatch(
+        ResourceReadPlan plan,
+        SqlDialect dialect,
+        HydrationExecutionOptions executionOptions,
+        string keysetRowGuardPredicateSql
+    )
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        ArgumentException.ThrowIfNullOrWhiteSpace(keysetRowGuardPredicateSql);
+
+        var sqlDialect = SqlDialectFactory.Create(dialect);
+        var planDialect = PlanSqlDialectFactory.Create(dialect);
+        var keyset = new PageKeysetSpec.Single(0);
+
+        if (ShouldUseSingleDocumentBatch(keyset, planDialect, executionOptions))
+        {
+            // The fast path is pure selects, so an absent id yields zero-row result sets on its own.
+            return GetOrBuildSingleDocumentBatch(plan, planDialect, sqlDialect, executionOptions);
+        }
+
+        var writer = new SqlWriter(sqlDialect);
+
+        return BuildExistingKeysetBatch(
+            plan,
+            keyset,
+            planDialect,
+            writer,
+            executionOptions,
+            keysetRowGuardPredicateSql
+        );
+    }
+
     private static bool ShouldUseSingleDocumentBatch(
         PageKeysetSpec keyset,
         IPlanSqlDialect planDialect,
@@ -154,21 +248,29 @@ public static class HydrationBatchBuilder
         PageKeysetSpec keyset,
         IPlanSqlDialect planDialect,
         SqlWriter writer,
-        HydrationExecutionOptions executionOptions
+        HydrationExecutionOptions executionOptions,
+        string? singleRowGuardPredicateSql = null
     )
     {
         // 1. Create keyset temp table
-        planDialect.AppendCreateKeysetTempTable(writer, plan.KeysetTable);
+        planDialect.AppendCreateKeysetTempTable(writer, plan.KeysetTable, CarriesSelectedAnchor(keyset));
         writer.AppendLine();
 
-        // 2. Materialize keyset
-        AppendKeysetMaterialization(writer, plan.KeysetTable, keyset);
+        // 2. Materialize keyset. A query keyset also returns the keys it inserted as the batch's first
+        //    result set, which is what carries the selected-keyset boundary out of hydration.
+        AppendKeysetMaterialization(
+            writer,
+            planDialect,
+            plan.KeysetTable,
+            keyset,
+            singleRowGuardPredicateSql
+        );
         writer.AppendLine();
 
         // 3. Optional total count
         if (keyset is PageKeysetSpec.Query { Plan.TotalCountSql: not null } queryWithCount)
         {
-            writer.AppendLine(EnsureTrailingSemicolon(queryWithCount.Plan.TotalCountSql));
+            writer.AppendLine(PlanSqlStatementText.AsTerminatedStatement(queryWithCount.Plan.TotalCountSql));
             writer.AppendLine();
         }
 
@@ -188,7 +290,9 @@ public static class HydrationBatchBuilder
         {
             foreach (var descriptorPlan in plan.DescriptorProjectionPlansInOrder)
             {
-                writer.AppendLine(EnsureTrailingSemicolon(descriptorPlan.SelectByKeysetSql));
+                writer.AppendLine(
+                    PlanSqlStatementText.AsTerminatedStatement(descriptorPlan.SelectByKeysetSql)
+                );
                 writer.AppendLine();
             }
         }
@@ -200,7 +304,9 @@ public static class HydrationBatchBuilder
             && plan.DocumentReferenceLookup is { } documentReferenceLookup
         )
         {
-            writer.AppendLine(EnsureTrailingSemicolon(documentReferenceLookup.SelectByKeysetSql));
+            writer.AppendLine(
+                PlanSqlStatementText.AsTerminatedStatement(documentReferenceLookup.SelectByKeysetSql)
+            );
             writer.AppendLine();
         }
 
@@ -230,7 +336,7 @@ public static class HydrationBatchBuilder
         {
             var tablePlan = plan.TablePlansInDependencyOrder[tablePlanIndex];
             writer.AppendLine(
-                EnsureTrailingSemicolon(
+                PlanSqlStatementText.AsTerminatedStatement(
                     RequireSingleDocumentSql(
                         planDialect,
                         $"table read plan at index '{tablePlanIndex}' for table '{tablePlan.TableModel.Table}'",
@@ -251,7 +357,7 @@ public static class HydrationBatchBuilder
             )
             {
                 writer.AppendLine(
-                    EnsureTrailingSemicolon(
+                    PlanSqlStatementText.AsTerminatedStatement(
                         RequireSingleDocumentSql(
                             planDialect,
                             $"descriptor projection plan at index '{descriptorPlanIndex}'",
@@ -273,7 +379,7 @@ public static class HydrationBatchBuilder
         )
         {
             writer.AppendLine(
-                EnsureTrailingSemicolon(
+                PlanSqlStatementText.AsTerminatedStatement(
                     RequireSingleDocumentSql(
                         planDialect,
                         "document-reference lookup plan",
@@ -324,6 +430,10 @@ public static class HydrationBatchBuilder
                 );
                 break;
 
+            case PageKeysetSpec.SelectedPage selectedPage:
+                AddSelectedPageParameters(command, selectedPage);
+                break;
+
             case PageKeysetSpec.Query query:
                 AddQueryParameters(command, query);
                 break;
@@ -337,16 +447,60 @@ public static class HydrationBatchBuilder
         }
     }
 
+    /// <summary>
+    /// Whether the keyset table and its materialization carry the continuation-anchor column.
+    /// </summary>
+    /// <remarks>
+    /// Only a <c>ContentVersion</c>-anchored query keyset does. A <c>DocumentId</c>-anchored page needs
+    /// no second column — the ids it already returns are its anchor — and no other keyset variant
+    /// performs page selection at all, so every one of them emits the batch text it always has. The
+    /// table DDL, the insert column list, and the returning clause all read this one predicate, because
+    /// three separate decisions could disagree and name a column the keyset table does not have.
+    /// <para>
+    /// Public for the same reason, across the assembly boundary: every reader of a batch built here has
+    /// to decide whether to expect the anchor column, and a reader that answered that question its own
+    /// way would be a fourth decision able to drift from the three above. Both readers ask here — the
+    /// hydration reader through <c>HydrationExecutor</c>, and the read-acceleration reader in the
+    /// repository that consumes <see cref="BuildCandidateMetadataBatch" />.
+    /// </para>
+    /// </remarks>
+    public static bool CarriesSelectedAnchor(PageKeysetSpec spec) =>
+        spec is PageKeysetSpec.Query { OrderingMode: PageOrderingMode.ContentVersion };
+
+    /// <summary>
+    /// Materializes the page keyset. A query keyset also returns the keys it inserted as a result set,
+    /// which is what carries the page's continuation boundary out of hydration; the other keysets are
+    /// handed the ids to materialize, so they perform no page selection and have no boundary to report.
+    /// </summary>
     private static void AppendKeysetMaterialization(
         SqlWriter writer,
+        IPlanSqlDialect planDialect,
         KeysetTableContract keyset,
-        PageKeysetSpec spec
+        PageKeysetSpec spec,
+        string? singleRowGuardPredicateSql = null
     )
     {
         var quotedDocIdCol = writer.Dialect.QuoteIdentifier(keyset.DocumentIdColumnName.Value);
+        var carriesAnchor = CarriesSelectedAnchor(spec);
 
         switch (spec)
         {
+            case PageKeysetSpec.Single when singleRowGuardPredicateSql is not null:
+                // Same INSERT ... SELECT ... WHERE shape as the empty-keyset materialization, so an
+                // absent captured id materializes no row instead of inserting NULL.
+                writer
+                    .Append("INSERT INTO ")
+                    .AppendRelation(keyset.Table)
+                    .Append(" (")
+                    .Append(quotedDocIdCol)
+                    .AppendLine(")")
+                    .Append("SELECT ")
+                    .AppendParameter(HydrationSqlConventions.SingleDocumentIdParameterName)
+                    .Append(" WHERE ")
+                    .Append(singleRowGuardPredicateSql)
+                    .AppendLine(";");
+                break;
+
             case PageKeysetSpec.Single:
                 writer
                     .Append("INSERT INTO ")
@@ -358,12 +512,29 @@ public static class HydrationBatchBuilder
                     .AppendLine(");");
                 break;
 
-            case PageKeysetSpec.Query query when HasZeroLimit(query):
-                AppendEmptyKeysetMaterialization(writer, keyset, quotedDocIdCol);
+            // A selected-page keyset supplies its own ids, so hydration reads no selected-id result set
+            // for it and GetResultSetCount counts none.
+            case PageKeysetSpec.SelectedPage { DocumentIds.Count: 0 }:
+                AppendEmptyKeysetMaterialization(writer, keyset, quotedDocIdCol, selectedIdDialect: null);
+                break;
+
+            case PageKeysetSpec.SelectedPage selectedPage:
+                AppendSelectedPageKeysetMaterialization(writer, keyset, selectedPage, quotedDocIdCol);
+                break;
+
+            case PageKeysetSpec.Query query when HasZeroPageSelectionSize(query):
+                AppendEmptyKeysetMaterialization(writer, keyset, quotedDocIdCol, planDialect, carriesAnchor);
                 break;
 
             case PageKeysetSpec.Query query:
-                AppendQueryKeysetMaterialization(writer, keyset, query, quotedDocIdCol);
+                AppendQueryKeysetMaterialization(
+                    writer,
+                    planDialect,
+                    keyset,
+                    query,
+                    quotedDocIdCol,
+                    carriesAnchor
+                );
                 break;
 
             default:
@@ -375,30 +546,123 @@ public static class HydrationBatchBuilder
         }
     }
 
+    /// <summary>
+    /// Materializes the planned page keyset, returning the keys it inserted so the page's continuation
+    /// boundary describes what selection chose.
+    /// </summary>
+    /// <remarks>
+    /// Under a <c>ContentVersion</c> anchor the embedded page-selection SQL already projects both
+    /// <c>DocumentId</c> and the anchor, so this only has to carry both through the insert and the
+    /// returning clause. Hydration can read no column this embedded SQL does not project, which is why
+    /// the anchor rides out with the ids rather than being looked up after selection.
+    /// </remarks>
     private static void AppendQueryKeysetMaterialization(
         SqlWriter writer,
+        IPlanSqlDialect planDialect,
         KeysetTableContract keyset,
         PageKeysetSpec.Query query,
-        string quotedDocIdCol
+        string quotedDocIdCol,
+        bool carriesAnchor
     )
     {
+        var quotedAnchorCol = writer.Dialect.QuoteIdentifier(
+            HydrationSqlConventions.SelectedAnchorColumnName
+        );
+        var insertColumns = carriesAnchor ? $"{quotedDocIdCol}, {quotedAnchorCol}" : quotedDocIdCol;
+
         writer
             .AppendLine("WITH page_ids AS (")
-            .AppendLine(StripTrailingSemicolon(query.Plan.PageDocumentIdSql))
+            .AppendLine(PlanSqlStatementText.AsEmbeddableBody(query.Plan.PageDocumentIdSql))
             .AppendLine(")")
             .Append("INSERT INTO ")
             .AppendRelation(keyset.Table)
             .Append(" (")
-            .Append(quotedDocIdCol)
-            .AppendLine(")")
-            .Append("SELECT ")
-            .Append(quotedDocIdCol)
-            .AppendLine(" FROM page_ids;");
+            .Append(insertColumns)
+            .AppendLine(")");
+        planDialect.AppendKeysetSelectedIdOutputClause(writer, keyset, carriesAnchor);
+        writer.Append("SELECT ").Append(insertColumns).Append(" FROM page_ids");
+        planDialect.AppendKeysetSelectedIdReturningClause(writer, keyset, carriesAnchor);
+        writer.AppendLine(";");
     }
 
+    /// <summary>
+    /// Materializes no keyset row. Returns the (empty) selected-id result set only when
+    /// <paramref name="selectedIdDialect"/> is supplied, so a zero-size query page occupies the same
+    /// result-set positions as any other query keyset in the hydration batch, while a keyset whose
+    /// reader has no position for that result set does not gain one it would never consume.
+    /// </summary>
     private static void AppendEmptyKeysetMaterialization(
         SqlWriter writer,
         KeysetTableContract keyset,
+        string quotedDocIdCol,
+        IPlanSqlDialect? selectedIdDialect,
+        bool carriesAnchor = false
+    )
+    {
+        var quotedAnchorCol = writer.Dialect.QuoteIdentifier(
+            HydrationSqlConventions.SelectedAnchorColumnName
+        );
+
+        writer
+            .Append("INSERT INTO ")
+            .AppendRelation(keyset.Table)
+            .Append(" (")
+            .Append(carriesAnchor ? $"{quotedDocIdCol}, {quotedAnchorCol}" : quotedDocIdCol)
+            .AppendLine(")");
+        selectedIdDialect?.AppendKeysetSelectedIdOutputClause(writer, keyset, carriesAnchor);
+        writer.Append("SELECT CAST(NULL AS bigint) AS ").Append(quotedDocIdCol);
+
+        if (carriesAnchor)
+        {
+            // Same column count as any other anchored page, so a zero-size page's empty result set has
+            // the shape the reader expects rather than a narrower one it would read the wrong ordinal
+            // from.
+            writer.Append(", CAST(NULL AS bigint) AS ").Append(quotedAnchorCol);
+        }
+
+        writer.Append(" WHERE 1 = 0");
+        selectedIdDialect?.AppendKeysetSelectedIdReturningClause(writer, keyset, carriesAnchor);
+        writer.AppendLine(";");
+    }
+
+    private static void AppendSelectedPageKeysetMaterialization(
+        SqlWriter writer,
+        KeysetTableContract keyset,
+        PageKeysetSpec.SelectedPage selectedPage,
+        string quotedDocIdCol
+    )
+    {
+        if (writer.Dialect.Rules.Dialect is SqlDialect.Mssql)
+        {
+            AppendMssqlSelectedPageKeysetMaterialization(writer, keyset, quotedDocIdCol);
+            return;
+        }
+
+        writer
+            .Append("INSERT INTO ")
+            .AppendRelation(keyset.Table)
+            .Append(" (")
+            .Append(quotedDocIdCol)
+            .Append(", ")
+            .AppendQuoted(HydrationSqlConventions.SelectedPageOrdinalColumnName)
+            .AppendLine(")")
+            .AppendLine("VALUES");
+
+        for (var index = 0; index < selectedPage.DocumentIds.Count; index++)
+        {
+            writer
+                .Append("    (")
+                .AppendParameter(SelectedPageDocumentIdParameterName(index))
+                .Append(", ")
+                .AppendParameter(SelectedPageOrdinalParameterName(index))
+                .Append(")");
+            writer.AppendLine(index + 1 < selectedPage.DocumentIds.Count ? "," : ";");
+        }
+    }
+
+    private static void AppendMssqlSelectedPageKeysetMaterialization(
+        SqlWriter writer,
+        KeysetTableContract keyset,
         string quotedDocIdCol
     )
     {
@@ -407,29 +671,51 @@ public static class HydrationBatchBuilder
             .AppendRelation(keyset.Table)
             .Append(" (")
             .Append(quotedDocIdCol)
+            .Append(", ")
+            .AppendQuoted(HydrationSqlConventions.SelectedPageOrdinalColumnName)
             .AppendLine(")")
-            .Append("SELECT CAST(NULL AS bigint) AS ")
+            .AppendLine("SELECT")
+            .Append("    selected_document_ids.")
             .Append(quotedDocIdCol)
-            .AppendLine(" WHERE 1 = 0;");
+            .AppendLine(",")
+            .Append("    selected_document_ids.")
+            .AppendQuoted(HydrationSqlConventions.SelectedPageOrdinalColumnName)
+            .AppendLine()
+            .Append("FROM OPENJSON(")
+            .AppendParameter(HydrationSqlConventions.SelectedPageDocumentIdsJsonParameterName)
+            .AppendLine(")")
+            .AppendLine("WITH (")
+            .Append("    ")
+            .Append(quotedDocIdCol)
+            .AppendLine(" bigint '$.DocumentId',")
+            .Append("    ")
+            .AppendQuoted(HydrationSqlConventions.SelectedPageOrdinalColumnName)
+            .AppendLine(" int '$.Ordinal'")
+            .AppendLine(") selected_document_ids;");
     }
 
-    private static bool HasZeroLimit(PageKeysetSpec.Query query)
+    /// <summary>
+    /// Whether the planned page selection can select nothing because its size is zero. Traditional
+    /// paging carries that size as a limit and cursor paging as a page size; both mean the same thing
+    /// here, so both skip candidate selection entirely rather than executing it for zero rows.
+    /// </summary>
+    private static bool HasZeroPageSelectionSize(PageKeysetSpec.Query query)
     {
         foreach (var parameter in query.Plan.PageParametersInOrder)
         {
-            if (parameter.Role is not QuerySqlParameterRole.Limit)
+            if (parameter.Role is not QuerySqlParameterRole.Limit and not QuerySqlParameterRole.PageSize)
             {
                 continue;
             }
 
-            return query.ParameterValues.TryGetValue(parameter.ParameterName, out var limitValue)
-                && IsZeroLimitValue(limitValue);
+            return query.ParameterValues.TryGetValue(parameter.ParameterName, out var pageSelectionSize)
+                && IsZeroPageSelectionSizeValue(pageSelectionSize);
         }
 
         return false;
     }
 
-    private static bool IsZeroLimitValue(object? value)
+    private static bool IsZeroPageSelectionSizeValue(object? value)
     {
         return value switch
         {
@@ -447,129 +733,62 @@ public static class HydrationBatchBuilder
 
     private static void AddQueryParameters(DbCommand command, PageKeysetSpec.Query query)
     {
-        var requiredParameters = GetRequiredParameters(query.Plan);
-        ValidateRequiredParameterValues(
+        PlannedQueryParameterBinder.AddDbParameters(
+            command,
+            query.Plan,
             query.ParameterValues,
-            [.. requiredParameters.Select(static parameter => parameter.ParameterName)]
+            "Hydration query keyset",
+            "Hydration query keyset parameter",
+            "Unsupported query-parameter binding kind."
         );
-
-        foreach (var parameter in requiredParameters)
-        {
-            AddParameter(command, parameter, query.ParameterValues[parameter.ParameterName]);
-        }
     }
 
-    private static QuerySqlParameter[] GetRequiredParameters(PageDocumentIdSqlPlan plan)
+    private static void AddSelectedPageParameters(DbCommand command, PageKeysetSpec.SelectedPage selectedPage)
     {
-        List<QuerySqlParameter> requiredParameters = [];
-
-        AddRequiredParameters(requiredParameters, plan.PageParametersInOrder);
-
-        if (plan.TotalCountParametersInOrder is { } totalCountParameters)
-        {
-            AddRequiredParameters(requiredParameters, totalCountParameters);
-        }
-
-        return [.. requiredParameters];
-    }
-
-    private static void AddRequiredParameters(
-        List<QuerySqlParameter> requiredParameters,
-        IReadOnlyList<QuerySqlParameter> parameters
-    )
-    {
-        foreach (var parameter in parameters)
-        {
-            if (
-                TryGetRequiredParameter(
-                    requiredParameters,
-                    parameter.ParameterName,
-                    out var existingParameter
-                )
-            )
-            {
-                if (existingParameter != parameter)
-                {
-                    throw new InvalidOperationException(
-                        "Hydration query keyset cannot bind parameter "
-                            + $"'{parameter.ParameterName}' with conflicting binding metadata."
-                    );
-                }
-
-                continue;
-            }
-
-            requiredParameters.Add(parameter);
-        }
-    }
-
-    private static bool TryGetRequiredParameter(
-        IReadOnlyList<QuerySqlParameter> requiredParameters,
-        string candidateParameterName,
-        [NotNullWhen(true)] out QuerySqlParameter? parameter
-    )
-    {
-        parameter = requiredParameters.FirstOrDefault(candidateParameter =>
-            string.Equals(
-                candidateParameter.ParameterName,
-                candidateParameterName,
-                StringComparison.OrdinalIgnoreCase
-            )
-        );
-
-        return parameter is not null;
-    }
-
-    private static void ValidateRequiredParameterValues(
-        IReadOnlyDictionary<string, object?> parameterValues,
-        IReadOnlyList<string> requiredParameterNames
-    )
-    {
-        List<string> missingParameterNames = [];
-
-        foreach (var parameterName in requiredParameterNames)
-        {
-            if (!parameterValues.ContainsKey(parameterName))
-            {
-                missingParameterNames.Add(parameterName);
-            }
-        }
-
-        if (missingParameterNames.Count == 0)
+        if (selectedPage.DocumentIds.Count == 0)
         {
             return;
         }
 
-        throw new InvalidOperationException(
-            "Hydration query keyset is missing required parameter values for "
-                + $"[{string.Join(", ", missingParameterNames.ConvertAll(parameterName => $"'{parameterName}'"))}]."
-        );
-    }
-
-    private static void AddParameter(DbCommand command, QuerySqlParameter parameter, object? value)
-    {
-        switch (parameter.Binding.Kind)
+        if (command is SqlCommand)
         {
-            case QuerySqlParameterBindingKind.Scalar:
-                AddScalarParameter(command, parameter.ParameterName, value);
-                return;
+            AddMssqlSelectedPageJsonParameter(command, selectedPage.DocumentIds);
+            return;
+        }
 
-            case QuerySqlParameterBindingKind.PgsqlArray:
-                AddPgsqlArrayParameter(command, parameter.ParameterName, value);
-                return;
-
-            case QuerySqlParameterBindingKind.MssqlStructured:
-                AddMssqlStructuredParameter(command, parameter, value);
-                return;
-
-            default:
-                throw new ArgumentOutOfRangeException(
-                    nameof(parameter),
-                    parameter.Binding.Kind,
-                    "Unsupported query-parameter binding kind."
-                );
+        for (var index = 0; index < selectedPage.DocumentIds.Count; index++)
+        {
+            AddScalarParameter(
+                command,
+                SelectedPageDocumentIdParameterName(index),
+                selectedPage.DocumentIds[index]
+            );
+            AddScalarParameter(command, SelectedPageOrdinalParameterName(index), index);
         }
     }
+
+    private static void AddMssqlSelectedPageJsonParameter(DbCommand command, IReadOnlyList<long> documentIds)
+    {
+        var dbParameter = command.CreateParameter();
+        dbParameter.ParameterName = $"@{HydrationSqlConventions.SelectedPageDocumentIdsJsonParameterName}";
+        dbParameter.Value = HydrationSqlConventions.SerializeSelectedPageDocumentIds(documentIds);
+
+        if (dbParameter is not SqlParameter sqlParameter)
+        {
+            throw new InvalidOperationException(
+                "SQL Server selected-page hydration binding requires a SqlParameter instance."
+            );
+        }
+
+        sqlParameter.SqlDbType = SqlDbType.NVarChar;
+        sqlParameter.Size = -1;
+
+        command.Parameters.Add(sqlParameter);
+    }
+
+    private static string SelectedPageDocumentIdParameterName(int index) => $"selectedDocumentId_{index}";
+
+    private static string SelectedPageOrdinalParameterName(int index) => $"selectedOrdinal_{index}";
 
     private static void AddScalarParameter(DbCommand command, string bareName, object? value)
     {
@@ -577,112 +796,5 @@ public static class HydrationBatchBuilder
         parameter.ParameterName = $"@{bareName}";
         parameter.Value = value ?? DBNull.Value;
         command.Parameters.Add(parameter);
-    }
-
-    private static void AddPgsqlArrayParameter(DbCommand command, string bareName, object? value)
-    {
-        var parameter = command.CreateParameter();
-        parameter.ParameterName = $"@{bareName}";
-        // PostgreSQL array parameters carry either claim EdOrg ids (long[]) or namespace prefix LIKE
-        // patterns (string[]); Npgsql infers the element type from the runtime array.
-        parameter.Value = value switch
-        {
-            IReadOnlyList<long> int64Values => int64Values.ToArray(),
-            IReadOnlyList<string> stringValues => stringValues.ToArray(),
-            _ => throw new InvalidOperationException(
-                "Hydration query keyset parameter "
-                    + $"'{bareName}' requires an IReadOnlyList<long> or IReadOnlyList<string> runtime value."
-            ),
-        };
-        command.Parameters.Add(parameter);
-    }
-
-    private static void AddMssqlStructuredParameter(
-        DbCommand command,
-        QuerySqlParameter querySqlParameter,
-        object? value
-    )
-    {
-        var dbParameter = command.CreateParameter();
-        dbParameter.ParameterName = $"@{querySqlParameter.ParameterName}";
-        dbParameter.Value = CreateStructuredInt64Table(
-            querySqlParameter.Binding.StructuredColumnName
-                ?? throw new InvalidOperationException(
-                    $"Structured binding for parameter '{querySqlParameter.ParameterName}' is missing a column name."
-                ),
-            RequireInt64List(value, querySqlParameter.ParameterName)
-        );
-
-        if (dbParameter is not SqlParameter sqlParameter)
-        {
-            throw new InvalidOperationException(
-                "SQL Server structured query-parameter binding requires a SqlParameter instance."
-            );
-        }
-
-        sqlParameter.SqlDbType = SqlDbType.Structured;
-        sqlParameter.TypeName =
-            querySqlParameter.Binding.StructuredTypeName
-            ?? throw new InvalidOperationException(
-                $"Structured binding for parameter '{querySqlParameter.ParameterName}' is missing a type name."
-            );
-
-        command.Parameters.Add(sqlParameter);
-    }
-
-    private static IReadOnlyList<long> RequireInt64List(object? value, string parameterName)
-    {
-        if (value is IReadOnlyList<long> int64Values)
-        {
-            return int64Values;
-        }
-
-        throw new InvalidOperationException(
-            "Hydration query keyset parameter "
-                + $"'{parameterName}' requires an IReadOnlyList<long> runtime value."
-        );
-    }
-
-    private static DataTable CreateStructuredInt64Table(
-        string structuredColumnName,
-        IReadOnlyList<long> int64Values
-    )
-    {
-        DataTable structuredTable = new();
-        structuredTable.Columns.Add(structuredColumnName, typeof(long));
-
-        foreach (var value in int64Values)
-        {
-            structuredTable.Rows.Add(value);
-        }
-
-        return structuredTable;
-    }
-
-    /// <summary>
-    /// Ensures a SQL statement ends with a semicolon so it is properly terminated
-    /// when embedded in a multi-statement batch.
-    /// </summary>
-    private static string EnsureTrailingSemicolon(string sql)
-    {
-        var trimmed = sql.AsSpan().TrimEnd();
-        return trimmed.Length > 0 && trimmed[^1] == ';' ? sql : $"{trimmed};";
-    }
-
-    /// <summary>
-    /// Strips a trailing semicolon (and surrounding whitespace) from compiled SQL so it can
-    /// be safely embedded inside a CTE body. Compiled plan SQL (e.g. from
-    /// <see cref="PageDocumentIdSqlCompiler"/>) includes a trailing semicolon as a statement
-    /// terminator, which is invalid inside <c>WITH ... AS (...)</c>.
-    /// </summary>
-    private static string StripTrailingSemicolon(string sql)
-    {
-        var trimmed = sql.AsSpan().TrimEnd();
-        if (trimmed.Length > 0 && trimmed[^1] == ';')
-        {
-            trimmed = trimmed[..^1].TrimEnd();
-        }
-
-        return trimmed.ToString();
     }
 }

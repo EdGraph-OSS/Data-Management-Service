@@ -78,10 +78,13 @@ public class Given_Descriptor_Read_Handler_Namespace_Authorization
             CreateMappingSet(SqlDialect.Pgsql),
             _descriptorResource,
             [],
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+            ),
             evaluators,
             readableProfileProjectionContext: null,
             new TraceId("descriptor-query-contract"),
+            PageOrderingMode.DocumentId,
             context
         );
 
@@ -97,14 +100,296 @@ public class Given_Descriptor_Read_Handler_Namespace_Authorization
             CreateMappingSet(SqlDialect.Pgsql),
             _descriptorResource,
             [],
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+            ),
             [],
             readableProfileProjectionContext: null,
-            new TraceId("descriptor-query-contract-default")
+            new TraceId("descriptor-query-contract-default"),
+            PageOrderingMode.DocumentId
         );
 
         request.AuthorizationStrategyEvaluators.Should().BeEmpty();
         request.RelationalAuthorizationContext.NamespacePrefixes.Should().BeEmpty();
+    }
+
+    [Test]
+    public async Task It_authorizes_a_descriptor_get_by_id_custom_view_against_the_fetched_document_id()
+    {
+        // The descriptor read has already materialized the row by the time the check runs, so the membership
+        // query is bound to that row's DocumentId rather than to a re-resolved target.
+        List<CustomViewAuthorizationExecutionRequest> capturedRequests = [];
+        var commandExecutor = new InMemoryRelationalCommandExecutor([
+            new InMemoryRelationalCommandExecution([
+                InMemoryRelationalResultSet.Create(CreateDescriptorRow(documentId: 101L)),
+            ]),
+        ]);
+        var sut = CreateSut(
+            commandExecutor,
+            CustomViewExecutorReturning(
+                new CustomViewAuthorizationExecutionResult.Authorized(),
+                capturedRequests
+            )
+        );
+
+        var result = await sut.HandleGetByIdAsync(
+            CreateGetByIdRequest(namespacePrefixes: [], authorizationStrategies: [CustomViewStrategy()])
+        );
+
+        result.Should().BeOfType<GetResult.GetSuccess>();
+        capturedRequests.Should().ContainSingle().Which.DocumentId.Should().Be(101L);
+        capturedRequests[0]
+            .Checks.Should()
+            .ContainSingle()
+            .Which.ConfiguredStrategy.StrategyName.Should()
+            .Be(CustomViewStrategyName);
+    }
+
+    [Test]
+    public async Task It_returns_a_custom_view_403_for_a_descriptor_get_by_id_the_view_excludes()
+    {
+        var commandExecutor = new InMemoryRelationalCommandExecutor([
+            new InMemoryRelationalCommandExecution([
+                InMemoryRelationalResultSet.Create(CreateDescriptorRow()),
+            ]),
+        ]);
+        var denial = CustomViewDenial();
+        var sut = CreateSut(
+            commandExecutor,
+            CustomViewExecutorReturning(new CustomViewAuthorizationExecutionResult.NotAuthorized(denial))
+        );
+
+        var result = await sut.HandleGetByIdAsync(
+            CreateGetByIdRequest(namespacePrefixes: [], authorizationStrategies: [CustomViewStrategy()])
+        );
+
+        result
+            .Should()
+            .BeOfType<GetResult.GetFailureCustomViewNotAuthorized>()
+            .Which.CustomViewFailure.Should()
+            .BeSameAs(denial);
+    }
+
+    [Test]
+    public async Task It_reports_a_custom_view_configured_before_NamespaceBased_ahead_of_a_namespace_denial()
+    {
+        // Both are AND filters executing in CMS-configured order and the first failure is reported. The
+        // namespace value here would also fail, so only ordering can produce the custom-view answer.
+        var commandExecutor = new InMemoryRelationalCommandExecutor([
+            new InMemoryRelationalCommandExecution([
+                InMemoryRelationalResultSet.Create(
+                    CreateDescriptorRow(ns: "uri://other.org/SchoolTypeDescriptor")
+                ),
+            ]),
+        ]);
+        var denial = CustomViewDenial();
+        var sut = CreateSut(
+            commandExecutor,
+            CustomViewExecutorReturning(new CustomViewAuthorizationExecutionResult.NotAuthorized(denial))
+        );
+
+        var result = await sut.HandleGetByIdAsync(
+            CreateGetByIdRequest(
+                namespacePrefixes: ["uri://ed-fi.org/"],
+                authorizationStrategies: [CustomViewStrategy(), NamespaceStrategy()]
+            )
+        );
+
+        result.Should().BeOfType<GetResult.GetFailureCustomViewNotAuthorized>();
+    }
+
+    [Test]
+    public async Task It_reports_a_namespace_denial_ahead_of_a_custom_view_configured_after_it()
+    {
+        // The mirror of the previous case: the custom view would also deny, so a namespace answer proves the
+        // later-configured view did not run first.
+        var commandExecutor = new InMemoryRelationalCommandExecutor([
+            new InMemoryRelationalCommandExecution([
+                InMemoryRelationalResultSet.Create(
+                    CreateDescriptorRow(ns: "uri://other.org/SchoolTypeDescriptor")
+                ),
+            ]),
+        ]);
+        var sut = CreateSut(
+            commandExecutor,
+            CustomViewExecutorReturning(
+                new CustomViewAuthorizationExecutionResult.NotAuthorized(CustomViewDenial())
+            )
+        );
+
+        var result = await sut.HandleGetByIdAsync(
+            CreateGetByIdRequest(
+                namespacePrefixes: ["uri://ed-fi.org/"],
+                authorizationStrategies: [NamespaceStrategy(), CustomViewStrategy()]
+            )
+        );
+
+        result
+            .Should()
+            .BeOfType<GetResult.GetFailureNamespaceNotAuthorized>()
+            .Which.NamespaceFailure.FailureKind.Should()
+            .Be(NamespaceAuthorizationFailureKind.NamespaceMismatch);
+    }
+
+    [Test]
+    public async Task It_returns_not_exists_for_a_descriptor_get_by_id_whose_row_was_deleted_before_the_check()
+    {
+        var commandExecutor = new InMemoryRelationalCommandExecutor([
+            new InMemoryRelationalCommandExecution([
+                InMemoryRelationalResultSet.Create(CreateDescriptorRow()),
+            ]),
+        ]);
+        var sut = CreateSut(
+            commandExecutor,
+            CustomViewExecutorReturning(new CustomViewAuthorizationExecutionResult.StaleTarget())
+        );
+
+        var result = await sut.HandleGetByIdAsync(
+            CreateGetByIdRequest(namespacePrefixes: [], authorizationStrategies: [CustomViewStrategy()])
+        );
+
+        result.Should().BeOfType<GetResult.GetFailureNotExists>();
+    }
+
+    [Test]
+    public async Task It_returns_security_configuration_500_when_a_descriptor_get_by_id_custom_view_reports_an_unmappable_payload()
+    {
+        var commandExecutor = new InMemoryRelationalCommandExecutor([
+            new InMemoryRelationalCommandExecution([
+                InMemoryRelationalResultSet.Create(CreateDescriptorRow()),
+            ]),
+        ]);
+        var sut = CreateSut(
+            commandExecutor,
+            CustomViewExecutorReturning(
+                new CustomViewAuthorizationExecutionResult.InvalidAuthorizationFailure("bad payload", null)
+            )
+        );
+
+        var result = await sut.HandleGetByIdAsync(
+            CreateGetByIdRequest(namespacePrefixes: [], authorizationStrategies: [CustomViewStrategy()])
+        );
+
+        result
+            .Should()
+            .BeOfType<GetResult.GetFailureSecurityConfiguration>()
+            .Which.Errors.Should()
+            .Equal("bad payload");
+    }
+
+    [Test]
+    public async Task It_validates_a_descriptor_get_by_id_custom_view_configured_before_a_namespace_no_prefixes_terminal()
+    {
+        // The namespace 403 resolves before any row is fetched, but a custom view configured ahead of it still
+        // executes first, so a missing or non-conforming view has to keep its own 500.
+        var commandExecutor = new InMemoryRelationalCommandExecutor([
+            new InMemoryRelationalCommandExecution([InMemoryRelationalResultSet.Create()]),
+        ]);
+        var sut = CreateSut(commandExecutor);
+
+        var result = await sut.HandleGetByIdAsync(
+            CreateGetByIdRequest(
+                namespacePrefixes: [],
+                authorizationStrategies: [CustomViewStrategy(), NamespaceStrategy()]
+            )
+        );
+
+        result
+            .Should()
+            .BeOfType<GetResult.GetFailureNamespaceNotAuthorized>()
+            .Which.NamespaceFailure.FailureKind.Should()
+            .Be(NamespaceAuthorizationFailureKind.NoPrefixesConfigured);
+        commandExecutor
+            .Commands.Should()
+            .ContainSingle()
+            .Which.CommandText.Should()
+            .Contain(CustomViewStrategyName);
+    }
+
+    [Test]
+    public async Task It_does_not_validate_a_descriptor_get_by_id_custom_view_configured_after_a_namespace_no_prefixes_terminal()
+    {
+        // The run would have aborted at the namespace position, so a view configured after it never executes
+        // and must not be probed either.
+        var commandExecutor = new InMemoryRelationalCommandExecutor([]);
+        var sut = CreateSut(commandExecutor);
+
+        var result = await sut.HandleGetByIdAsync(
+            CreateGetByIdRequest(
+                namespacePrefixes: [],
+                authorizationStrategies: [NamespaceStrategy(), CustomViewStrategy()]
+            )
+        );
+
+        result
+            .Should()
+            .BeOfType<GetResult.GetFailureNamespaceNotAuthorized>()
+            .Which.NamespaceFailure.FailureKind.Should()
+            .Be(NamespaceAuthorizationFailureKind.NoPrefixesConfigured);
+        commandExecutor.Commands.Should().BeEmpty();
+    }
+
+    [Test]
+    public async Task It_validates_a_descriptor_get_by_id_custom_view_configured_before_a_classifier_security_configuration_terminal()
+    {
+        // An unrecognized strategy is a 500 from the relationship classifier. A custom view configured ahead of
+        // it executes first, so its own configuration failure must not be masked.
+        var commandExecutor = new InMemoryRelationalCommandExecutor([
+            new InMemoryRelationalCommandExecution([InMemoryRelationalResultSet.Create()]),
+        ]);
+        var sut = CreateSut(commandExecutor);
+
+        var result = await sut.HandleGetByIdAsync(
+            CreateGetByIdRequest(
+                namespacePrefixes: ["uri://ed-fi.org/"],
+                authorizationStrategies:
+                [
+                    CustomViewStrategy(),
+                    new AuthorizationStrategyEvaluator("UnknownDescriptorStrategy", [], FilterOperator.And),
+                ]
+            )
+        );
+
+        result.Should().BeOfType<GetResult.GetFailureSecurityConfiguration>();
+        commandExecutor
+            .Commands.Should()
+            .ContainSingle()
+            .Which.CommandText.Should()
+            .Contain(CustomViewStrategyName);
+    }
+
+    [Test]
+    public async Task It_validates_a_descriptor_get_by_id_custom_view_configured_before_an_unsupported_strategy()
+    {
+        // OwnershipBased fails closed with a 501, but a custom view configured ahead of it executes first, so
+        // a missing or non-conforming view has to keep its own 500 rather than being hidden by the 501. The one
+        // scripted execution is the validation probe; a row fetch never happens on this path.
+        var commandExecutor = new InMemoryRelationalCommandExecutor([
+            new InMemoryRelationalCommandExecution([InMemoryRelationalResultSet.Create()]),
+        ]);
+        var sut = CreateSut(commandExecutor);
+
+        var result = await sut.HandleGetByIdAsync(
+            CreateGetByIdRequest(
+                namespacePrefixes: ["uri://ed-fi.org/"],
+                authorizationStrategies:
+                [
+                    CustomViewStrategy(),
+                    new AuthorizationStrategyEvaluator(
+                        AuthorizationStrategyNameConstants.OwnershipBased,
+                        [],
+                        FilterOperator.And
+                    ),
+                ]
+            )
+        );
+
+        result.Should().BeOfType<GetResult.GetFailureNotImplemented>();
+        commandExecutor
+            .Commands.Should()
+            .ContainSingle()
+            .Which.CommandText.Should()
+            .Contain(CustomViewStrategyName);
     }
 
     [TestCase(AuthorizationStrategyNameConstants.RelationshipsWithEdOrgsOnly)]
@@ -408,7 +693,6 @@ public class Given_Descriptor_Read_Handler_Namespace_Authorization
     }
 
     [TestCase(AuthorizationStrategyNameConstants.RelationshipsWithEdOrgsOnly)]
-    [TestCase(AuthorizationStrategyNameConstants.OwnershipBased)]
     public async Task It_fails_closed_for_descriptor_query_with_an_unsupported_strategy_without_executing_sql(
         string authorizationStrategyName
     )
@@ -432,6 +716,34 @@ public class Given_Descriptor_Read_Handler_Namespace_Authorization
             .As<QueryResult.QueryFailureNotImplemented>()
             .FailureMessage.Should()
             .Contain(authorizationStrategyName);
+        commandExecutor.Commands.Should().BeEmpty();
+    }
+
+    [Test]
+    public async Task It_fails_closed_for_descriptor_query_with_ownership_based_authorization()
+    {
+        // OwnershipBased is known-but-not-enabled for GET-many exactly as for every other operation:
+        // DMS-1410 owns descriptor GET-many ownership support, so the request keeps its 501
+        // rather than silently succeeding with an empty page.
+        var commandExecutor = new InMemoryRelationalCommandExecutor([]);
+        var sut = CreateSut(commandExecutor);
+
+        var result = await sut.HandleQueryAsync(
+            CreateQueryRequest(
+                namespacePrefixes: ["uri://ed-fi.org/"],
+                authorizationStrategy: new AuthorizationStrategyEvaluator(
+                    AuthorizationStrategyNameConstants.OwnershipBased,
+                    [],
+                    FilterOperator.And
+                )
+            )
+        );
+
+        result
+            .Should()
+            .BeOfType<QueryResult.QueryFailureNotImplemented>()
+            .Which.FailureMessage.Should()
+            .Contain(AuthorizationStrategyNameConstants.OwnershipBased);
         commandExecutor.Commands.Should().BeEmpty();
     }
 
@@ -480,6 +792,38 @@ public class Given_Descriptor_Read_Handler_Namespace_Authorization
         commandExecutor.Commands.Should().BeEmpty();
     }
 
+    [TestCase("UnknownDescriptorStrategy")]
+    [TestCase("MissingBasisWithCustomAuthorization")]
+    public async Task It_returns_namespace_403_for_descriptor_query_without_executing_sql_when_the_failing_strategy_is_configured_after_namespace(
+        string failingStrategyName
+    )
+    {
+        // NamespaceBased is configured first, so its no-prefixes 403 is the terminal even though a
+        // later strategy is a security-configuration failure (unrecognized, or a custom-view name
+        // whose basis resource does not resolve).
+        var commandExecutor = new InMemoryRelationalCommandExecutor([]);
+        var sut = CreateSut(commandExecutor);
+
+        var result = await sut.HandleQueryAsync(
+            CreateQueryRequest(
+                namespacePrefixes: [],
+                authorizationStrategy: NamespaceStrategy(),
+                additionalAuthorizationStrategy: new AuthorizationStrategyEvaluator(
+                    failingStrategyName,
+                    [],
+                    FilterOperator.And
+                )
+            )
+        );
+
+        result
+            .Should()
+            .BeOfType<QueryResult.QueryFailureNamespaceNotAuthorized>()
+            .Which.NamespaceFailure.FailureKind.Should()
+            .Be(NamespaceAuthorizationFailureKind.NoPrefixesConfigured);
+        commandExecutor.Commands.Should().BeEmpty();
+    }
+
     [Test]
     public async Task It_emits_a_pgsql_descriptor_namespace_filter_and_binds_the_prefix_array_when_querying_with_namespace_authorization()
     {
@@ -503,12 +847,10 @@ public class Given_Descriptor_Read_Handler_Namespace_Authorization
         result.Should().BeOfType<QueryResult.QuerySuccess>();
         commandExecutor.Commands.Should().ContainSingle();
         var command = commandExecutor.Commands[0];
+        command.CommandText.Should().Contain("FROM \"dms\".\"Descriptor\" r");
         command
             .CommandText.Should()
-            .Contain("INNER JOIN \"dms\".\"Descriptor\" d ON d.\"DocumentId\" = r.\"DocumentId\"");
-        command
-            .CommandText.Should()
-            .Contain("(d.\"Namespace\" IS NOT NULL AND d.\"Namespace\" LIKE ANY(@namespacePrefixes))");
+            .Contain("(r.\"Namespace\" IS NOT NULL AND r.\"Namespace\" LIKE ANY(@namespacePrefixes))");
         var namespaceParameter = command.Parameters.Single(static p => p.Name == "@namespacePrefixes");
         namespaceParameter
             .Value.Should()
@@ -540,15 +882,13 @@ public class Given_Descriptor_Read_Handler_Namespace_Authorization
         result.Should().BeOfType<QueryResult.QuerySuccess>();
         commandExecutor.Commands.Should().ContainSingle();
         var command = commandExecutor.Commands[0];
-        command
-            .CommandText.Should()
-            .Contain("INNER JOIN [dms].[Descriptor] d ON d.[DocumentId] = r.[DocumentId]");
+        command.CommandText.Should().Contain("FROM [dms].[Descriptor] r");
         command
             .CommandText.Should()
             .Contain(
-                "(d.[Namespace] IS NOT NULL AND ("
-                    + "d.[Namespace] LIKE @namespacePrefixes_0 ESCAPE '\\' "
-                    + "OR d.[Namespace] LIKE @namespacePrefixes_1 ESCAPE '\\'"
+                "(r.[Namespace] IS NOT NULL AND ("
+                    + "r.[Namespace] LIKE @namespacePrefixes_0 ESCAPE '\\' "
+                    + "OR r.[Namespace] LIKE @namespacePrefixes_1 ESCAPE '\\'"
                     + "))"
             );
         command
@@ -588,7 +928,7 @@ public class Given_Descriptor_Read_Handler_Namespace_Authorization
         // The namespace filter shape appears twice: once in COUNT, once in the page subquery.
         var namespacePredicateOccurrences = CountOccurrences(
             command.CommandText,
-            "d.\"Namespace\" IS NOT NULL AND d.\"Namespace\" LIKE ANY(@namespacePrefixes)"
+            "r.\"Namespace\" IS NOT NULL AND r.\"Namespace\" LIKE ANY(@namespacePrefixes)"
         );
         namespacePredicateOccurrences.Should().Be(2);
     }
@@ -674,9 +1014,51 @@ public class Given_Descriptor_Read_Handler_Namespace_Authorization
         return count;
     }
 
+    /// <summary>
+    /// Descriptor ownership enforcement is out of scope for DMS-1060, so a descriptor GET-by-id configured
+    /// with OwnershipBased fails closed with 501 even when NamespaceBased is configured alongside it and the
+    /// client has no namespace prefixes. Reporting the namespace 403 first would answer as though the
+    /// caller's prefixes refused a check that was never enforced.
+    /// </summary>
+    [Test]
+    public async Task It_returns_not_implemented_for_descriptor_get_by_id_with_ownership_when_the_client_has_no_prefixes()
+    {
+        var commandExecutor = new InMemoryRelationalCommandExecutor([]);
+        var sut = CreateSut(commandExecutor);
+
+        var result = await sut.HandleGetByIdAsync(
+            CreateGetByIdRequest(
+                namespacePrefixes: [],
+                authorizationStrategies:
+                [
+                    NamespaceStrategy(),
+                    new AuthorizationStrategyEvaluator(
+                        AuthorizationStrategyNameConstants.OwnershipBased,
+                        [],
+                        FilterOperator.And
+                    ),
+                ]
+            )
+        );
+
+        result
+            .Should()
+            .BeOfType<GetResult.GetFailureNotImplemented>()
+            .Which.FailureMessage.Should()
+            .Contain(AuthorizationStrategyNameConstants.OwnershipBased);
+        commandExecutor.Commands.Should().BeEmpty();
+    }
+
     private static DescriptorGetByIdRequest CreateGetByIdRequest(
         IReadOnlyList<string> namespacePrefixes,
         AuthorizationStrategyEvaluator authorizationStrategy,
+        SqlDialect dialect = SqlDialect.Pgsql,
+        RelationalGetRequestReadMode readMode = RelationalGetRequestReadMode.ExternalResponse
+    ) => CreateGetByIdRequest(namespacePrefixes, [authorizationStrategy], dialect, readMode);
+
+    private static DescriptorGetByIdRequest CreateGetByIdRequest(
+        IReadOnlyList<string> namespacePrefixes,
+        AuthorizationStrategyEvaluator[] authorizationStrategies,
         SqlDialect dialect = SqlDialect.Pgsql,
         RelationalGetRequestReadMode readMode = RelationalGetRequestReadMode.ExternalResponse
     ) =>
@@ -685,35 +1067,78 @@ public class Given_Descriptor_Read_Handler_Namespace_Authorization
             _descriptorResource,
             _documentUuid,
             readMode,
-            [authorizationStrategy],
+            authorizationStrategies,
             readableProfileProjectionContext: null,
             new TraceId("descriptor-get-namespace"),
             new RelationalAuthorizationContext([], namespacePrefixes)
+        );
+
+    private const string CustomViewStrategyName = "SchoolTypeDescriptorWithATag";
+
+    private static AuthorizationStrategyEvaluator CustomViewStrategy(string? strategyName = null) =>
+        new(strategyName ?? CustomViewStrategyName, [], FilterOperator.And);
+
+    private static ICustomViewAuthorizationExecutor CustomViewExecutorReturning(
+        CustomViewAuthorizationExecutionResult result,
+        List<CustomViewAuthorizationExecutionRequest>? capturedRequests = null
+    )
+    {
+        var executor = A.Fake<ICustomViewAuthorizationExecutor>();
+        A.CallTo(() =>
+                executor.ExecuteAsync(A<CustomViewAuthorizationExecutionRequest>._, A<CancellationToken>._)
+            )
+            .Invokes(call =>
+                capturedRequests?.Add(call.GetArgument<CustomViewAuthorizationExecutionRequest>(0)!)
+            )
+            .Returns(Task.FromResult(result));
+
+        return executor;
+    }
+
+    private static CustomViewAuthorizationFailure CustomViewDenial() =>
+        new(
+            CustomViewAuthorizationFailureKind.NoMatchingRow,
+            CustomViewAuthorizationFailureValueSource.Stored,
+            0,
+            CustomViewStrategyName,
+            ["SchoolTypeDescriptorId"],
+            "You may need a School Type Descriptor with a Tag."
         );
 
     private static DescriptorQueryRequest CreateQueryRequest(
         IReadOnlyList<string> namespacePrefixes,
         AuthorizationStrategyEvaluator authorizationStrategy,
         SqlDialect dialect = SqlDialect.Pgsql,
-        bool totalCount = false
+        bool totalCount = false,
+        AuthorizationStrategyEvaluator? additionalAuthorizationStrategy = null
     ) =>
         new(
             CreateMappingSet(dialect),
             _descriptorResource,
             [],
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: totalCount, MaximumPageSize: 500),
-            [authorizationStrategy],
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: totalCount, MaximumPageSize: 500)
+            ),
+            additionalAuthorizationStrategy is null
+                ? [authorizationStrategy]
+                : [authorizationStrategy, additionalAuthorizationStrategy],
             readableProfileProjectionContext: null,
             new TraceId("descriptor-query-namespace"),
+            PageOrderingMode.DocumentId,
             new RelationalAuthorizationContext([], namespacePrefixes)
         );
 
-    private static DescriptorReadHandler CreateSut(InMemoryRelationalCommandExecutor commandExecutor) =>
+    private static DescriptorReadHandler CreateSut(
+        InMemoryRelationalCommandExecutor commandExecutor,
+        ICustomViewAuthorizationExecutor? customViewAuthorizationExecutor = null
+    ) =>
         new(
             commandExecutor,
             A.Fake<Core.Profile.IReadableProfileProjector>(),
             new EdFi.DataManagementService.Backend.Etag.ServedEtagComposer(),
-            NullLogger<DescriptorReadHandler>.Instance
+            NullLogger<DescriptorReadHandler>.Instance,
+            PassthroughDocumentCacheReadAccelerationCoordinator.Instance,
+            customViewAuthorizationExecutor ?? A.Fake<ICustomViewAuthorizationExecutor>()
         );
 
     private static IReadOnlyDictionary<string, object?> CreateDescriptorRow(

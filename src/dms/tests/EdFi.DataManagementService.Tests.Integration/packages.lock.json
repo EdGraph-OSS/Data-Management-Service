@@ -130,6 +130,22 @@
         "resolved": "4.6.0",
         "contentHash": "R7e1+a4vuV/YS+ItfL7f//rG+JBvVeVLX4mHzFEZo4W1qEKl8Zz27AqvQSAqo+BtIzUCo4aAJMYa56VXS4hudw=="
       },
+      "Serilog": {
+        "type": "Direct",
+        "requested": "[4.2.0, )",
+        "resolved": "4.2.0",
+        "contentHash": "gmoWVOvKgbME8TYR+gwMf7osROiWAURterc6Rt2dQyX7wtjZYpqFiA/pY6ztjGQKKV62GGCyOcmtP1UKMHgSmA=="
+      },
+      "Serilog.Extensions.Logging": {
+        "type": "Direct",
+        "requested": "[8.0.0, )",
+        "resolved": "8.0.0",
+        "contentHash": "YEAMWu1UnWgf1c1KP85l1SgXGfiVo0Rz6x08pCiPOIBt2Qe18tcZLvdBUuV5o1QHvrs8FAry9wTIhgBRtjIlEg==",
+        "dependencies": {
+          "Microsoft.Extensions.Logging": "8.0.0",
+          "Serilog": "3.1.1"
+        }
+      },
       "SonarAnalyzer.CSharp": {
         "type": "Direct",
         "requested": "[9.32.0.97167, )",
@@ -162,6 +178,33 @@
         "contentHash": "rpYtIczkzGpf+EkZgDr9CClTdemhsrwA/W5hMoPjLkRFnXzH44zDLoovXeKtmxb1ykXK9aJVODSpiJml8CTw2g==",
         "dependencies": {
           "System.Diagnostics.EventLog": "6.0.0"
+        }
+      },
+      "Google.Protobuf": {
+        "type": "Transitive",
+        "resolved": "3.30.1",
+        "contentHash": "HeWXDQBabQn/sCGicbeLJ0HMunknfC4FdLrOQOsaMJHcpqx3HVIpyyJqTrqJlWnza870twhOb+rBcaTiC/TlNA=="
+      },
+      "Grpc.Core.Api": {
+        "type": "Transitive",
+        "resolved": "2.70.0",
+        "contentHash": "66UotvWcSIq41oiQhLWcQACyKPM4umxXNiht5DQTLZJfNwEswWOcS7Z0xIEHyNIBE7ZpjotH22bEjTkvhPxmVw=="
+      },
+      "Grpc.Net.Client": {
+        "type": "Transitive",
+        "resolved": "2.70.0",
+        "contentHash": "xNv0FFCVJa5S1beUtye82WFCxKThuE1jbN8DO1x1Rj8VSIWXLBUmfSID5a1fGzsU2R/EMfwPoWclJ2RMfQuGXw==",
+        "dependencies": {
+          "Grpc.Net.Common": "2.70.0",
+          "Microsoft.Extensions.Logging.Abstractions": "6.0.0"
+        }
+      },
+      "Grpc.Net.Common": {
+        "type": "Transitive",
+        "resolved": "2.70.0",
+        "contentHash": "rBdEUMyCwa+iB8mqC6JKyPbj3SBHHkReJj/yy/XKJI63GcG6w9DJMMGTVcYHqq4Ci2W4m0HT4jt2pFfFscar8g==",
+        "dependencies": {
+          "Grpc.Core.Api": "2.70.0"
         }
       },
       "Humanizer.Core": {
@@ -562,6 +605,25 @@
         "resolved": "9.0.11",
         "contentHash": "s8yUYuYYu+PAwvBdhLG1KyrGrk9gkYeuPxfAsXsTqqWyepwSyEw8hAaflW4nO98NG52YpYI1am2+9o+79h2RtQ=="
       },
+      "EdFi.Api.CustomValidation": {
+        "type": "Project"
+      },
+      "edfi.api.plugins": {
+        "type": "Project",
+        "dependencies": {
+          "Microsoft.Extensions.Configuration.Abstractions": "[10.0.1, )",
+          "Microsoft.Extensions.DependencyInjection.Abstractions": "[10.0.1, )"
+        }
+      },
+      "edfi.api.plugins.hosting": {
+        "type": "Project",
+        "dependencies": {
+          "EdFi.Api.Plugins": "[1.0.0, )",
+          "Microsoft.Extensions.Configuration.Binder": "[10.0.1, )",
+          "Microsoft.Extensions.DependencyInjection.Abstractions": "[10.0.1, )",
+          "Microsoft.Extensions.Logging.Abstractions": "[10.0.1, )"
+        }
+      },
       "edfi.datamanagementservice.backend": {
         "type": "Project",
         "dependencies": {
@@ -572,6 +634,7 @@
           "Microsoft.CodeAnalysis": "[4.12.0, )",
           "Microsoft.Extensions.Configuration.Abstractions": "[10.0.1, )",
           "Microsoft.Extensions.DependencyInjection.Abstractions": "[10.0.1, )",
+          "Microsoft.Extensions.Hosting.Abstractions": "[10.0.1, )",
           "Microsoft.Extensions.Options": "[10.0.1, )"
         }
       },
@@ -616,7 +679,6 @@
           "EdFi.DataManagementService.Backend.Plans": "[1.0.0, )",
           "EdFi.DataManagementService.Core.External": "[1.0.0, )",
           "Microsoft.CodeAnalysis": "[4.12.0, )",
-          "Microsoft.Extensions.Hosting.Abstractions": "[10.0.1, )",
           "Microsoft.Extensions.Logging.Abstractions": "[10.0.1, )",
           "Npgsql": "[8.0.4, )"
         }
@@ -630,6 +692,7 @@
       "edfi.datamanagementservice.backend.tests.common": {
         "type": "Project",
         "dependencies": {
+          "EdFi.DataManagementService.Backend": "[1.0.0, )",
           "EdFi.DataManagementService.Backend.Ddl": "[1.0.0, )",
           "EdFi.DataManagementService.Backend.External": "[1.0.0, )",
           "EdFi.DataManagementService.Backend.Plans": "[1.0.0, )",
@@ -652,6 +715,7 @@
         "type": "Project",
         "dependencies": {
           "Be.Vlaanderen.Basisregisters.Generators.Guid.Deterministic": "[4.0.0, )",
+          "EdFi.Api.CustomValidation": "[1.0.0, )",
           "EdFi.DataManagementService.Backend.External": "[1.0.0, )",
           "EdFi.DataManagementService.Core.External": "[1.0.0, )",
           "FastGuid": "[1.4.1, )",
@@ -668,9 +732,9 @@
           "Microsoft.IdentityModel.Protocols.OpenIdConnect": "[8.12.0, )",
           "Microsoft.IdentityModel.Tokens": "[8.12.0, )",
           "Npgsql": "[8.0.4, )",
-          "Polly.Core": "[8.4.2, )",
-          "Polly.Extensions": "[8.4.2, )",
-          "Serilog": "[4.0.2, )",
+          "Polly.Core": "[8.5.2, )",
+          "Polly.Extensions": "[8.5.2, )",
+          "Serilog": "[4.2.0, )",
           "Serilog.Extensions.Logging": "[8.0.0, )",
           "Serilog.Settings.Configuration": "[8.0.2, )",
           "Serilog.Sinks.Console": "[6.0.0, )",
@@ -692,20 +756,22 @@
         "type": "Project",
         "dependencies": {
           "AspNetCore.HealthChecks.NpgSql": "[8.0.2, )",
+          "EdFi.Api.Plugins.Hosting": "[1.0.0, )",
           "EdFi.DataManagementService.Backend.Mssql": "[1.0.0, )",
           "EdFi.DataManagementService.Backend.Postgresql": "[1.0.0, )",
           "EdFi.DataManagementService.Core": "[1.0.0, )",
           "EdFi.DataManagementService.Core.External": "[1.0.0, )",
-          "EdFi.DataStandard52.ApiSchema": "[1.0.333, )",
-          "EdFi.DataStandard52.TPDM.ApiSchema": "[1.0.333, )",
+          "EdFi.DataStandard52.ApiSchema": "[1.0.335, )",
+          "EdFi.DataStandard52.TPDM.ApiSchema": "[1.0.335, )",
           "Microsoft.CodeAnalysis": "[4.12.0, )",
-          "Polly.Core": "[8.4.2, )",
-          "Polly.Extensions": "[8.4.2, )",
-          "Serilog": "[4.0.2, )",
+          "Polly.Core": "[8.5.2, )",
+          "Polly.Extensions": "[8.5.2, )",
+          "Serilog": "[4.2.0, )",
           "Serilog.Extensions.Logging": "[8.0.0, )",
           "Serilog.Settings.Configuration": "[8.0.2, )",
           "Serilog.Sinks.Console": "[6.0.0, )",
-          "Serilog.Sinks.File": "[6.0.0, )"
+          "Serilog.Sinks.File": "[6.0.0, )",
+          "Serilog.Sinks.OpenTelemetry": "[4.2.0, )"
         }
       },
       "AspNetCore.HealthChecks.NpgSql": {
@@ -726,15 +792,15 @@
       },
       "EdFi.DataStandard52.ApiSchema": {
         "type": "CentralTransitive",
-        "requested": "[1.0.333, )",
-        "resolved": "1.0.333",
-        "contentHash": "eSjrOzKptV1YYqoda/E7iUqzuEwbP2UsdUHNKpfJclY+e+Q2/SvGCJVBYhirSVxQA06Y03T3ssNr9PYeAWWqEA=="
+        "requested": "[1.0.335, )",
+        "resolved": "1.0.335",
+        "contentHash": "cEJOD63KUG7BrIVN8Eq44hsougfJErhb9/fd5NIuJG2TZid0vAK5gNLgC/U040GexpGTVF5N3JxohFdXBMmkxQ=="
       },
       "EdFi.DataStandard52.TPDM.ApiSchema": {
         "type": "CentralTransitive",
-        "requested": "[1.0.333, )",
-        "resolved": "1.0.333",
-        "contentHash": "XzHgxRKPtynsubpNW3qyiMK9M1E1FqTJXRhNVLqRzfgLvjm//TB+x3rCoyVn61qRNSm1u7ydVYWQ8iPtaGxHUg=="
+        "requested": "[1.0.335, )",
+        "resolved": "1.0.335",
+        "contentHash": "A1L+MdsqchGXd0PnWcjeM7mQeqaa1T32kDRkhKPxHh/wiN5b4rd+xyxiie6L0lpnB0hSTOwIvGlnWcvmX/MirA=="
       },
       "FastGuid": {
         "type": "CentralTransitive",
@@ -994,19 +1060,19 @@
       },
       "Polly.Core": {
         "type": "CentralTransitive",
-        "requested": "[8.4.2, )",
-        "resolved": "8.4.2",
-        "contentHash": "BpE2I6HBYYA5tF0Vn4eoQOGYTYIK1BlF5EXVgkWGn3mqUUjbXAr13J6fZVbp7Q3epRR8yshacBMlsHMhpOiV3g=="
+        "requested": "[8.5.2, )",
+        "resolved": "8.5.2",
+        "contentHash": "1MJKdxv4zwDmiWvYvVN24DsrWUfgQ4F83voH8bhbtLMdPuGy8CfTUzsgQhvyrl1a7hrM6f/ydwLVdVUI0xooUw=="
       },
       "Polly.Extensions": {
         "type": "CentralTransitive",
-        "requested": "[8.4.2, )",
-        "resolved": "8.4.2",
-        "contentHash": "GZ9vRVmR0jV2JtZavt+pGUsQ1O1cuRKG7R7VOZI6ZDy9y6RNPvRvXK1tuS4ffUrv8L0FTea59oEuQzgS0R7zSA==",
+        "requested": "[8.5.2, )",
+        "resolved": "8.5.2",
+        "contentHash": "NcUEkeMB7LMsLBXzY9PuuKP7ylXngUEuhmaWxCrlXqYLbVQQzG1ulAnaEQ2LM1zlSoxRftAjCuhPIH40qeWAlg==",
         "dependencies": {
           "Microsoft.Extensions.Logging.Abstractions": "8.0.0",
           "Microsoft.Extensions.Options": "8.0.0",
-          "Polly.Core": "8.4.2"
+          "Polly.Core": "8.5.2"
         }
       },
       "Sandwych.QuickGraph.Core": {
@@ -1014,22 +1080,6 @@
         "requested": "[1.0.0, )",
         "resolved": "1.0.0",
         "contentHash": "OJEAm5kik+51yBaDfDuSD9+bx3dI23IvcfFcSL+H6v/YfAYtHbiMkAn5aOljNlkHSig3uakMRGhCTYr3lDKrEA=="
-      },
-      "Serilog": {
-        "type": "CentralTransitive",
-        "requested": "[4.0.2, )",
-        "resolved": "4.0.2",
-        "contentHash": "Vehq4uNYtURe/OnHEpWGvMgrvr5Vou7oZLdn3BuEH5FSCeHXDpNJtpzWoqywXsSvCTuiv0I65mZDRnJSeUvisA=="
-      },
-      "Serilog.Extensions.Logging": {
-        "type": "CentralTransitive",
-        "requested": "[8.0.0, )",
-        "resolved": "8.0.0",
-        "contentHash": "YEAMWu1UnWgf1c1KP85l1SgXGfiVo0Rz6x08pCiPOIBt2Qe18tcZLvdBUuV5o1QHvrs8FAry9wTIhgBRtjIlEg==",
-        "dependencies": {
-          "Microsoft.Extensions.Logging": "8.0.0",
-          "Serilog": "3.1.1"
-        }
       },
       "Serilog.Settings.Configuration": {
         "type": "CentralTransitive",
@@ -1058,6 +1108,17 @@
         "contentHash": "lxjg89Y8gJMmFxVkbZ+qDgjl+T4yC5F7WSLTvA+5q0R04tfKVLRL/EHpYoJ/MEQd2EeCKDuylBIVnAYMotmh2A==",
         "dependencies": {
           "Serilog": "4.0.0"
+        }
+      },
+      "Serilog.Sinks.OpenTelemetry": {
+        "type": "CentralTransitive",
+        "requested": "[4.2.0, )",
+        "resolved": "4.2.0",
+        "contentHash": "PzMCyE5G19tjr5IZEi5qg+4UU5QrxBEoBEMu/hhYybTrGKXqUDiSGWKZNUDBgelaVKqLADlsmlJVyKce5SyPrg==",
+        "dependencies": {
+          "Google.Protobuf": "3.30.1",
+          "Grpc.Net.Client": "2.70.0",
+          "Serilog": "4.2.0"
         }
       },
       "System.IdentityModel.Tokens.Jwt": {

@@ -6,16 +6,19 @@
 using System.Text.Json.Nodes;
 using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Core.ApiSchema;
+using EdFi.DataManagementService.Core.Configuration;
 using EdFi.DataManagementService.Core.External.Backend;
 using EdFi.DataManagementService.Core.External.Frontend;
 using EdFi.DataManagementService.Core.Middleware;
 using EdFi.DataManagementService.Core.Model;
 using EdFi.DataManagementService.Core.Pipeline;
 using EdFi.DataManagementService.Core.Startup;
+using EdFi.DataManagementService.Core.Telemetry;
 using EdFi.DataManagementService.Core.Tests.Unit.Handler;
 using FakeItEasy;
 using FluentAssertions;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -41,6 +44,36 @@ public static class TestHelper
     }
 
     /// <summary>
+    /// A scoped service provider carrying the one service the paging middlewares resolve off the
+    /// request: an <see cref="IDataStoreSelection"/> whose effective target is of the given kind.
+    /// </summary>
+    /// <remarks>
+    /// <c>No.ServiceProvider</c> returns null for every type, so a step resolving the selection with
+    /// <c>GetRequiredService</c> throws against it. A fixture that is not about which database served
+    /// the request still needs a target, and <see cref="EffectiveTargetKind.Primary"/> is the one that
+    /// leaves the live ordering rule — and so every expectation written before targets mattered —
+    /// exactly as it was.
+    /// <para>
+    /// The connection string is a placeholder that only has to be non-blank:
+    /// <see cref="EffectiveDataStoreTarget"/> rejects a blank one, and nothing in these fixtures opens
+    /// a connection.
+    /// </para>
+    /// </remarks>
+    internal static IServiceProvider ServiceProviderWithEffectiveTarget(
+        EffectiveTargetKind kind = EffectiveTargetKind.Primary
+    )
+    {
+        var dataStoreSelection = A.Fake<IDataStoreSelection>();
+        A.CallTo(() => dataStoreSelection.GetEffectiveTarget())
+            .Returns(new EffectiveDataStoreTarget(kind, "test-connection-string"));
+
+        var serviceProvider = A.Fake<IServiceProvider>();
+        A.CallTo(() => serviceProvider.GetService(typeof(IDataStoreSelection))).Returns(dataStoreSelection);
+
+        return serviceProvider;
+    }
+
+    /// <summary>
     /// Builds a ResourceSchema for the given endpointName on the given apiSchemaDocument
     /// </summary>
     internal static ResourceSchema BuildResourceSchema(
@@ -63,6 +96,8 @@ public static class TestHelper
     {
         services.AddSingleton<IResourceKeyRowReader, NullResourceKeyRowReader>();
         services.AddSingleton<IResourceKeyValidator>(A.Fake<IResourceKeyValidator>());
+        services.TryAddSingleton(TimeProvider.System);
+        services.TryAddSingleton(new CacheSettings());
         services.AddSingleton<ResourceKeyValidationCacheProvider>();
         services.AddSingleton<IEffectiveSchemaSetProvider>(A.Fake<IEffectiveSchemaSetProvider>());
         services.AddTransient<ValidateResourceKeySeedMiddleware>();
@@ -86,6 +121,15 @@ public static class TestHelper
         services.AddTransient<ILogger<ResolveMappingSetMiddleware>>(_ =>
             NullLogger<ResolveMappingSetMiddleware>.Instance
         );
+    }
+
+    /// <summary>
+    /// Registers the collection-paging telemetry the query and partitions pipelines resolve, for tests
+    /// composing those pipelines where the emitted metrics are not under test.
+    /// </summary>
+    public static void AddCollectionPagingTelemetry(IServiceCollection services)
+    {
+        services.AddSingleton<ICollectionPagingTelemetry>(NoOpCollectionPagingTelemetry.Instance);
     }
 
     /// <summary>

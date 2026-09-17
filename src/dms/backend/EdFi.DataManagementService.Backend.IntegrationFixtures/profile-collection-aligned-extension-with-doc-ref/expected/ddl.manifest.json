@@ -1,16 +1,16 @@
 {
-  "effective_schema_hash": "f3612acf9def461d2363a5a1600b4f75d2ed6717f8f9d5809852cd98ad78dc9d",
-  "relational_mapping_version": "v2",
+  "effective_schema_hash": "0f01f1d665b09fc0a0df0dff64733693f8daf75e097cc90a1ac93c7d12ca47d1",
+  "relational_mapping_version": "v3",
   "ddl": [
     {
       "dialect": "mssql",
-      "normalized_sql_sha256": "92aca542ff50d6ecaf98fc6a45c54a3ef12b157e62170cccf02e05efdd4b1731",
-      "statement_count": 95
+      "normalized_sql_sha256": "f796c60596d7e009576b277851a1449dc4ed3453c4033276cf24abf904b7a68c",
+      "statement_count": 128
     },
     {
       "dialect": "pgsql",
-      "normalized_sql_sha256": "476ba7b2f69219f3b1c947d0d27002b7a11eb4d8b1b09c70427093d82c794918",
-      "statement_count": 95
+      "normalized_sql_sha256": "f38132821d35b65cb5256a022e77c07cf0abea8feac3254bf771d19baaa23d35",
+      "statement_count": 140
     }
   ]
 }

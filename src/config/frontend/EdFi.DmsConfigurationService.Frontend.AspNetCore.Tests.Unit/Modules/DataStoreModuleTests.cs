@@ -7,6 +7,7 @@ using System.Net;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using EdFi.DmsConfigurationService.Backend.Repositories;
 using EdFi.DmsConfigurationService.Backend.Services;
 using EdFi.DmsConfigurationService.DataModel;
@@ -25,6 +26,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using NUnit.Framework;
 
 namespace EdFi.DmsConfigurationService.Frontend.AspNetCore.Tests.Unit.Modules;
@@ -34,6 +36,7 @@ public class DataStoreModuleTests
     private readonly IDataStoreRepository _dataStoreRepository = A.Fake<IDataStoreRepository>();
     private readonly IConnectionStringEncryptionService _encryptionService =
         A.Fake<IConnectionStringEncryptionService>();
+    private readonly WebApplicationFactoryTracker<Program> _factoryTracker = new();
 
     private static readonly string FakeEncryptedConnection1 = Convert.ToBase64String(
         new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17 }
@@ -46,6 +49,9 @@ public class DataStoreModuleTests
     private static readonly string FakeEncryptedSnapshot1 = Convert.ToBase64String(
         new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19 }
     );
+
+    [TearDown]
+    public void DisposeWebApplicationFactories() => _factoryTracker.DisposeTrackedFactories();
 
     private HttpClient SetUpClient()
     {
@@ -89,6 +95,7 @@ public class DataStoreModuleTests
                 }
             );
         });
+        _factoryTracker.Track(factory);
         var client = factory.CreateClient();
         client.DefaultRequestHeaders.Add("X-Test-Scope", AuthorizationScopes.AdminScope.Name);
         return client;
@@ -111,13 +118,14 @@ public class DataStoreModuleTests
                             Id = 1,
                             DataStoreType = "Production",
                             Name = "Test Instance",
+                            Provider = "postgresql",
                             ConnectionString = FakeEncryptedConnection1,
                             DataStoreDerivatives = [new(1, 1, "ReadReplica", FakeEncryptedReplica1)],
                         },
                     ])
                 );
 
-            A.CallTo(() => _dataStoreRepository.GetDataStore(A<long>._))
+            A.CallTo(() => _dataStoreRepository.GetDataStore(A<int>._))
                 .Returns(
                     new DataStoreGetResult.Success(
                         new DataStoreResponse
@@ -125,6 +133,7 @@ public class DataStoreModuleTests
                             Id = 1,
                             DataStoreType = "Production",
                             Name = "Test Instance",
+                            Provider = "sqlserver",
                             ConnectionString = FakeEncryptedConnection1,
                             DataStoreContexts =
                             [
@@ -143,10 +152,10 @@ public class DataStoreModuleTests
             A.CallTo(() => _dataStoreRepository.UpdateDataStore(A<DataStoreUpdateCommand>._))
                 .Returns(new DataStoreUpdateResult.Success());
 
-            A.CallTo(() => _dataStoreRepository.DeleteDataStore(A<long>._))
+            A.CallTo(() => _dataStoreRepository.DeleteDataStore(A<int>._))
                 .Returns(new DataStoreDeleteResult.Success());
 
-            A.CallTo(() => _dataStoreRepository.QueryApplicationByDataStore(A<long>._, A<PagingQuery>._))
+            A.CallTo(() => _dataStoreRepository.QueryApplicationByDataStore(A<int>._, A<PagingQuery>._))
                 .Returns(
                     new ApplicationByDataStoreQueryResult.Success([
                         new ApplicationResponse
@@ -212,6 +221,24 @@ public class DataStoreModuleTests
             updateResponse.StatusCode.Should().Be(HttpStatusCode.NoContent);
             deleteResponse.StatusCode.Should().Be(HttpStatusCode.NoContent);
             queryApplicationsByDataStoreResponse.StatusCode.Should().Be(HttpStatusCode.OK);
+        }
+
+        [Test]
+        public async Task Should_return_data_store_provider_property_when_present()
+        {
+            using var client = SetUpClient();
+
+            var queryResponse = await client.GetAsync("/v3/dataStores/?offset=0&limit=25");
+            var getResponse = await client.GetAsync("/v3/dataStores/1");
+
+            queryResponse.StatusCode.Should().Be(HttpStatusCode.OK);
+            getResponse.StatusCode.Should().Be(HttpStatusCode.OK);
+
+            JsonArray queryBody = JsonNode.Parse(await queryResponse.Content.ReadAsStringAsync())!.AsArray();
+            queryBody[0]!["provider"]!.GetValue<string>().Should().Be("postgresql");
+
+            JsonObject getBody = JsonNode.Parse(await getResponse.Content.ReadAsStringAsync())!.AsObject();
+            getBody["provider"]!.GetValue<string>().Should().Be("sqlserver");
         }
 
         [Test]
@@ -338,6 +365,31 @@ public class DataStoreModuleTests
 
             response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
         }
+
+        [Test]
+        public async Task Should_return_bad_request_when_datastore_body_id_is_omitted()
+        {
+            using var client = SetUpClient();
+
+            var response = await client.PutAsync(
+                "/v3/dataStores/1",
+                new StringContent(
+                    """
+                    {
+                        "dataStoreType": "Production",
+                        "name": "Test Instance",
+                        "connectionString": "Server=localhost;Database=TestDb;"
+                    }
+                    """,
+                    Encoding.UTF8,
+                    "application/json"
+                )
+            );
+
+            response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+            string content = await response.Content.ReadAsStringAsync();
+            content.Should().Contain("Request body id must match the id in the url.");
+        }
     }
 
     [TestFixture]
@@ -346,16 +398,16 @@ public class DataStoreModuleTests
         [SetUp]
         public void SetUp()
         {
-            A.CallTo(() => _dataStoreRepository.GetDataStore(A<long>._))
+            A.CallTo(() => _dataStoreRepository.GetDataStore(A<int>._))
                 .Returns(new DataStoreGetResult.FailureNotFound());
 
             A.CallTo(() => _dataStoreRepository.UpdateDataStore(A<DataStoreUpdateCommand>._))
                 .Returns(new DataStoreUpdateResult.FailureNotExists());
 
-            A.CallTo(() => _dataStoreRepository.DeleteDataStore(A<long>._))
+            A.CallTo(() => _dataStoreRepository.DeleteDataStore(A<int>._))
                 .Returns(new DataStoreDeleteResult.FailureNotExists());
 
-            A.CallTo(() => _dataStoreRepository.QueryApplicationByDataStore(A<long>._, A<PagingQuery>._))
+            A.CallTo(() => _dataStoreRepository.QueryApplicationByDataStore(A<int>._, A<PagingQuery>._))
                 .Returns(new ApplicationByDataStoreQueryResult.FailureNotExists());
         }
 
@@ -481,6 +533,263 @@ public class DataStoreModuleTests
             using var client = SetUpClient();
             var response = await client.GetAsync("/v3/dataStores?direction=asc");
             response.StatusCode.Should().Be(HttpStatusCode.OK);
+        }
+    }
+
+    /// <summary>
+    /// A get returns the stored cipher text, so a client that reads a data store, changes an
+    /// unrelated field and writes the object back resubmits that exact value. Encrypting it a second
+    /// time leaves a value no reader can turn back into a connection string, so the write path has to
+    /// refuse it. These fixtures run against the real validator the host registers.
+    /// </summary>
+    [TestFixture]
+    public class ConnectionStringValidationTests : DataStoreModuleTests
+    {
+        private const string ValidConnectionString = "Server=localhost;Database=TestDb;";
+
+        [SetUp]
+        public void SetUpRepository()
+        {
+            // The fake is shared by the fixture, so recorded calls are cleared to keep each test's
+            // "was the repository reached" assertion its own.
+            Fake.ClearRecordedCalls(_dataStoreRepository);
+
+            A.CallTo(() => _dataStoreRepository.InsertDataStore(A<DataStoreInsertCommand>._))
+                .Returns(new DataStoreInsertResult.Success(1));
+            A.CallTo(() => _dataStoreRepository.UpdateDataStore(A<DataStoreUpdateCommand>._))
+                .Returns(new DataStoreUpdateResult.Success());
+        }
+
+        /// <summary>
+        /// What a get returns for this plain text: the stored bytes, Base64 encoded.
+        /// </summary>
+        private static string StoredValueFor(string plainText) =>
+            Convert.ToBase64String(
+                new ConnectionStringEncryptionService(
+                    Options.Create(
+                        new EdFi.DmsConfigurationService.Backend.DatabaseOptions
+                        {
+                            DatabaseConnection = "Server=test;",
+                            EncryptionKey = "TestEncryptionKey123456789012345678901234567890",
+                        }
+                    )
+                ).Encrypt(plainText)!
+            );
+
+        private static StringContent InsertBody(string? connectionString) =>
+            new(
+                JsonSerializer.Serialize(
+                    new DataStoreInsertCommand
+                    {
+                        DataStoreType = "Production",
+                        Name = "Test Instance",
+                        ConnectionString = connectionString,
+                    }
+                ),
+                Encoding.UTF8,
+                "application/json"
+            );
+
+        private static StringContent UpdateBody(string? connectionString, string name = "Test Instance") =>
+            new(
+                JsonSerializer.Serialize(
+                    new DataStoreUpdateCommand
+                    {
+                        Id = 1,
+                        DataStoreType = "Production",
+                        Name = name,
+                        ConnectionString = connectionString,
+                    }
+                ),
+                Encoding.UTF8,
+                "application/json"
+            );
+
+        private static async Task ShouldBeDataValidationFailure(HttpResponseMessage response)
+        {
+            response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+
+            JsonNode body = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+            body["type"]!.GetValue<string>().Should().Be("urn:ed-fi:api:bad-request:data");
+            body["validationErrors"]!.AsObject().Should().ContainKey("ConnectionString");
+        }
+
+        // Plain texts of different lengths, so the stored value covers more than one Base64 padding
+        // shape. The exhaustive sweep over lengths lives with the cipher text detector.
+        [TestCase("Server=a;Db=b")]
+        [TestCase("Server=localhost;Db=b")]
+        [TestCase("Server=localhost;Database=TestDb;abc")]
+        public async Task It_rejects_resubmitted_cipher_text_on_post(string plainText)
+        {
+            using var client = SetUpClient();
+
+            var response = await client.PostAsync("/v3/dataStores/", InsertBody(StoredValueFor(plainText)));
+
+            await ShouldBeDataValidationFailure(response);
+            A.CallTo(() => _dataStoreRepository.InsertDataStore(A<DataStoreInsertCommand>._))
+                .MustNotHaveHappened();
+        }
+
+        [TestCase("Server=a;Db=b")]
+        [TestCase("Server=localhost;Db=b")]
+        [TestCase("Server=localhost;Database=TestDb;abc")]
+        public async Task It_rejects_resubmitted_cipher_text_on_put(string plainText)
+        {
+            using var client = SetUpClient();
+
+            var response = await client.PutAsync("/v3/dataStores/1", UpdateBody(StoredValueFor(plainText)));
+
+            await ShouldBeDataValidationFailure(response);
+            A.CallTo(() => _dataStoreRepository.UpdateDataStore(A<DataStoreUpdateCommand>._))
+                .MustNotHaveHappened();
+        }
+
+        [TestCase("not-a-connection-string")]
+        [TestCase(";;;")]
+        [TestCase("host=")]
+        [TestCase("")]
+        [TestCase("   ")]
+        public async Task It_rejects_an_unusable_value_on_post(string connectionString)
+        {
+            using var client = SetUpClient();
+
+            var response = await client.PostAsync("/v3/dataStores/", InsertBody(connectionString));
+
+            await ShouldBeDataValidationFailure(response);
+            A.CallTo(() => _dataStoreRepository.InsertDataStore(A<DataStoreInsertCommand>._))
+                .MustNotHaveHappened();
+        }
+
+        [TestCase("not-a-connection-string")]
+        [TestCase(";;;")]
+        [TestCase("host=")]
+        [TestCase("")]
+        [TestCase("   ")]
+        public async Task It_rejects_an_unusable_value_on_put(string connectionString)
+        {
+            using var client = SetUpClient();
+
+            var response = await client.PutAsync("/v3/dataStores/1", UpdateBody(connectionString));
+
+            await ShouldBeDataValidationFailure(response);
+            A.CallTo(() => _dataStoreRepository.UpdateDataStore(A<DataStoreUpdateCommand>._))
+                .MustNotHaveHappened();
+        }
+
+        [Test]
+        public async Task It_accepts_a_new_connection_string_on_post()
+        {
+            using var client = SetUpClient();
+
+            var response = await client.PostAsync("/v3/dataStores/", InsertBody(ValidConnectionString));
+
+            response.StatusCode.Should().Be(HttpStatusCode.Created);
+            A.CallTo(() =>
+                    _dataStoreRepository.InsertDataStore(
+                        A<DataStoreInsertCommand>.That.Matches(command =>
+                            command.ConnectionString == ValidConnectionString
+                        )
+                    )
+                )
+                .MustHaveHappenedOnceExactly();
+        }
+
+        [Test]
+        public async Task It_accepts_a_new_connection_string_on_put()
+        {
+            using var client = SetUpClient();
+
+            var response = await client.PutAsync("/v3/dataStores/1", UpdateBody(ValidConnectionString));
+
+            response.StatusCode.Should().Be(HttpStatusCode.NoContent);
+            A.CallTo(() =>
+                    _dataStoreRepository.UpdateDataStore(
+                        A<DataStoreUpdateCommand>.That.Matches(command =>
+                            command.ConnectionString == ValidConnectionString
+                        )
+                    )
+                )
+                .MustHaveHappenedOnceExactly();
+        }
+
+        /// <summary>
+        /// The case this validation must not break: an update that is really about another field.
+        /// </summary>
+        [Test]
+        public async Task It_accepts_an_update_that_changes_another_field()
+        {
+            using var client = SetUpClient();
+
+            var response = await client.PutAsync(
+                "/v3/dataStores/1",
+                UpdateBody(ValidConnectionString, name: "Renamed Instance")
+            );
+
+            response.StatusCode.Should().Be(HttpStatusCode.NoContent);
+            A.CallTo(() =>
+                    _dataStoreRepository.UpdateDataStore(
+                        A<DataStoreUpdateCommand>.That.Matches(command =>
+                            command.Name == "Renamed Instance"
+                            && command.ConnectionString == ValidConnectionString
+                        )
+                    )
+                )
+                .MustHaveHappenedOnceExactly();
+        }
+
+        /// <summary>
+        /// A provider's own parse failure message repeats the text it could not read, so a rejection
+        /// must never carry the submitted value into the response.
+        /// </summary>
+        [Test]
+        public async Task It_does_not_repeat_the_submitted_value_in_the_response()
+        {
+            using var client = SetUpClient();
+            string storedValue = StoredValueFor(ValidConnectionString);
+
+            foreach (string submitted in new[] { storedValue, "not-a-connection-string", "host=" })
+            {
+                var response = await client.PostAsync("/v3/dataStores/", InsertBody(submitted));
+
+                (await response.Content.ReadAsStringAsync()).Should().NotContain(submitted);
+            }
+        }
+
+        /// <summary>
+        /// The move this validation has to leave open: the client that read a data store writes back
+        /// the fields it changed and leaves the connection string out, and the repository is asked to
+        /// keep what is stored. Whether the stored bytes actually survive is a repository concern and
+        /// is covered by the backend integration tests.
+        /// </summary>
+        [Test]
+        public async Task It_accepts_an_update_that_leaves_the_connection_string_out()
+        {
+            using var client = SetUpClient();
+
+            DataStoreUpdateCommand? received = null;
+            A.CallTo(() => _dataStoreRepository.UpdateDataStore(A<DataStoreUpdateCommand>._))
+                .Invokes((DataStoreUpdateCommand command) => received = command)
+                .Returns(new DataStoreUpdateResult.Success());
+
+            var response = await client.PutAsync(
+                "/v3/dataStores/1",
+                new StringContent(
+                    """
+                    {
+                        "id": 1,
+                        "dataStoreType": "Production",
+                        "name": "Renamed Instance"
+                    }
+                    """,
+                    Encoding.UTF8,
+                    "application/json"
+                )
+            );
+
+            response.StatusCode.Should().Be(HttpStatusCode.NoContent);
+            received.Should().NotBeNull();
+            received!.ConnectionString.Should().BeNull();
+            received.Name.Should().Be("Renamed Instance");
         }
     }
 }

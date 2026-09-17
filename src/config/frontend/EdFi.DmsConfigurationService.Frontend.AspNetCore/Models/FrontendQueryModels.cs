@@ -64,7 +64,7 @@ public class FrontendPagingQuery : PagingQuery
 public class FrontendVendorQuery : FrontendPagingQuery
 {
     [FromQuery(Name = "id")]
-    public long? Id { get; set; }
+    public int? Id { get; set; }
 
     [FromQuery(Name = "company")]
     public string? Company { get; set; }
@@ -94,7 +94,7 @@ public class FrontendVendorQuery : FrontendPagingQuery
 public class FrontendApplicationQuery : FrontendPagingQuery
 {
     [FromQuery(Name = "id")]
-    public long? Id { get; set; }
+    public int? Id { get; set; }
 
     [FromQuery(Name = "applicationName")]
     public string? ApplicationName { get; set; }
@@ -120,15 +120,20 @@ public class FrontendApplicationQuery : FrontendPagingQuery
 public class FrontendApiClientQuery : FrontendPagingQuery
 {
     [FromQuery(Name = "applicationid")]
-    public long? ApplicationId { get; set; }
+    public int? ApplicationId { get; set; }
 
     public ApiClientQuery ToQuery() => ApplyPagingTo(new ApiClientQuery { ApplicationId = ApplicationId });
+}
+
+public class FrontendOwnershipTokenQuery : FrontendPagingQuery
+{
+    public OwnershipTokenQuery ToQuery() => ApplyPagingTo(new OwnershipTokenQuery());
 }
 
 public class FrontendDataStoreQuery : FrontendPagingQuery
 {
     [FromQuery(Name = "id")]
-    public long? Id { get; set; }
+    public int? Id { get; set; }
 
     [FromQuery(Name = "name")]
     public string? Name { get; set; }
@@ -150,7 +155,7 @@ public class FrontendDataStoreQuery : FrontendPagingQuery
 public class FrontendClaimSetQuery : FrontendPagingQuery
 {
     [FromQuery(Name = "id")]
-    public long? Id { get; set; }
+    public int? Id { get; set; }
 
     [FromQuery(Name = "name")]
     public string? Name { get; set; }
@@ -166,7 +171,7 @@ public class FrontendProfileQuery : FrontendPagingQuery
 {
     [FromQuery(Name = "id")]
     [Description("Filter profiles by identifier.")]
-    public long? Id { get; set; }
+    public int? Id { get; set; }
 
     [FromQuery(Name = "name")]
     [Description("Filter profiles by name.")]
@@ -179,7 +184,7 @@ public class FrontendResourceClaimQuery : FrontendPagingQuery
 {
     [FromQuery(Name = "id")]
     [Description("Filter resource claims by identifier.")]
-    public long? Id { get; set; }
+    public int? Id { get; set; }
 
     [FromQuery(Name = "name")]
     [Description("Filter resource claims by name.")]
@@ -206,4 +211,22 @@ public class FrontendResourceClaimActionAuthStrategyQuery : FrontendPagingQuery
 
     public ResourceClaimActionAuthStrategyQuery ToQuery() =>
         ApplyPagingTo(new ResourceClaimActionAuthStrategyQuery { ResourceName = ResourceName });
+}
+
+public class FrontendActionQuery : FrontendPagingQuery
+{
+    [FromQuery(Name = "id")]
+    [Description("Filter actions by identifier.")]
+    public int? Id { get; set; }
+
+    [FromQuery(Name = "name")]
+    [Description("Filter actions by name.")]
+    public string? Name { get; set; }
+
+    public ActionQuery ToQuery() => ApplyPagingTo(new ActionQuery { Id = Id, Name = Name });
+}
+
+public class FrontendAuthorizationStrategyQuery : FrontendPagingQuery
+{
+    public AuthorizationStrategyQuery ToQuery() => ApplyPagingTo(new AuthorizationStrategyQuery());
 }

@@ -17,9 +17,7 @@ public class Given_HydrationReader_With_Document_Metadata_Result_Sets
     public async Task It_reads_document_metadata_rows_using_the_fixed_ordinal_contract()
     {
         DateTimeOffset firstContentLastModifiedAt = new(2026, 4, 3, 14, 10, 11, TimeSpan.Zero);
-        DateTimeOffset firstIdentityLastModifiedAt = new(2026, 4, 3, 14, 12, 13, TimeSpan.Zero);
         DateTimeOffset secondContentLastModifiedAt = new(2026, 4, 4, 8, 9, 10, TimeSpan.Zero);
-        DateTimeOffset secondIdentityLastModifiedAt = new(2026, 4, 4, 8, 11, 12, TimeSpan.Zero);
 
         using var reader = HydrationDescriptorResultTestHelper.CreateReader(
             CreateDocumentMetadataTable(
@@ -27,17 +25,15 @@ public class Given_HydrationReader_With_Document_Metadata_Result_Sets
                     42L,
                     Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"),
                     101L,
-                    201L,
                     firstContentLastModifiedAt,
-                    firstIdentityLastModifiedAt
+                    7
                 ),
                 (
                     84L,
                     Guid.Parse("cccccccc-4444-5555-6666-dddddddddddd"),
                     102L,
-                    202L,
                     secondContentLastModifiedAt,
-                    secondIdentityLastModifiedAt
+                    9
                 )
             )
         );
@@ -51,17 +47,15 @@ public class Given_HydrationReader_With_Document_Metadata_Result_Sets
                     DocumentId: 42L,
                     DocumentUuid: Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"),
                     ContentVersion: 101L,
-                    IdentityVersion: 201L,
                     ContentLastModifiedAt: firstContentLastModifiedAt,
-                    IdentityLastModifiedAt: firstIdentityLastModifiedAt
+                    ResourceKeyId: 7
                 ),
                 new DocumentMetadataRow(
                     DocumentId: 84L,
                     DocumentUuid: Guid.Parse("cccccccc-4444-5555-6666-dddddddddddd"),
                     ContentVersion: 102L,
-                    IdentityVersion: 202L,
                     ContentLastModifiedAt: secondContentLastModifiedAt,
-                    IdentityLastModifiedAt: secondIdentityLastModifiedAt
+                    ResourceKeyId: 9
                 )
             );
     }
@@ -75,7 +69,6 @@ public class Given_HydrationReader_With_Document_Metadata_Result_Sets
                     42L,
                     Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"),
                     101L,
-                    201L,
                     new DateTimeOffset(2026, 4, 3, 14, 10, 11, TimeSpan.Zero)
                 )
             )
@@ -84,7 +77,30 @@ public class Given_HydrationReader_With_Document_Metadata_Result_Sets
         var act = () => HydrationReader.ReadDocumentMetadataAsync(reader, CancellationToken.None);
 
         var exception = await act.Should().ThrowAsync<InvalidOperationException>();
-        exception.Which.Message.Should().StartWith("Document metadata result set has 5 columns but expected");
+        exception.Which.Message.Should().Be("Document metadata result set has 4 columns but expected 5.");
+    }
+
+    [Test]
+    public async Task It_rejects_legacy_seven_column_document_metadata_result_sets()
+    {
+        using var reader = HydrationDescriptorResultTestHelper.CreateReader(
+            CreateLegacySevenColumnDocumentMetadataTable(
+                (
+                    42L,
+                    Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"),
+                    101L,
+                    201L,
+                    new DateTimeOffset(2026, 4, 3, 14, 10, 11, TimeSpan.Zero),
+                    new DateTimeOffset(2026, 4, 3, 14, 12, 13, TimeSpan.Zero),
+                    7
+                )
+            )
+        );
+
+        var act = () => HydrationReader.ReadDocumentMetadataAsync(reader, CancellationToken.None);
+
+        var exception = await act.Should().ThrowAsync<InvalidOperationException>();
+        exception.Which.Message.Should().Be("Document metadata result set has 7 columns but expected 5.");
     }
 
     private static DataTable CreateDocumentMetadataTable(
@@ -92,9 +108,8 @@ public class Given_HydrationReader_With_Document_Metadata_Result_Sets
             long DocumentId,
             Guid DocumentUuid,
             long ContentVersion,
-            long IdentityVersion,
             DateTimeOffset ContentLastModifiedAt,
-            DateTimeOffset IdentityLastModifiedAt
+            short ResourceKeyId
         )[] rows
     )
     {
@@ -102,9 +117,8 @@ public class Given_HydrationReader_With_Document_Metadata_Result_Sets
         table.Columns.Add("DocumentId", typeof(long));
         table.Columns.Add("DocumentUuid", typeof(Guid));
         table.Columns.Add("ContentVersion", typeof(long));
-        table.Columns.Add("IdentityVersion", typeof(long));
         table.Columns.Add("ContentLastModifiedAt", typeof(DateTimeOffset));
-        table.Columns.Add("IdentityLastModifiedAt", typeof(DateTimeOffset));
+        table.Columns.Add("ResourceKeyId", typeof(short));
 
         foreach (var row in rows)
         {
@@ -112,9 +126,8 @@ public class Given_HydrationReader_With_Document_Metadata_Result_Sets
                 row.DocumentId,
                 row.DocumentUuid,
                 row.ContentVersion,
-                row.IdentityVersion,
                 row.ContentLastModifiedAt,
-                row.IdentityLastModifiedAt
+                row.ResourceKeyId
             );
         }
 
@@ -126,8 +139,33 @@ public class Given_HydrationReader_With_Document_Metadata_Result_Sets
             long DocumentId,
             Guid DocumentUuid,
             long ContentVersion,
-            long IdentityVersion,
             DateTimeOffset ContentLastModifiedAt
+        )[] rows
+    )
+    {
+        DataTable table = new();
+        table.Columns.Add("DocumentId", typeof(long));
+        table.Columns.Add("DocumentUuid", typeof(Guid));
+        table.Columns.Add("ContentVersion", typeof(long));
+        table.Columns.Add("ContentLastModifiedAt", typeof(DateTimeOffset));
+
+        foreach (var row in rows)
+        {
+            table.Rows.Add(row.DocumentId, row.DocumentUuid, row.ContentVersion, row.ContentLastModifiedAt);
+        }
+
+        return table;
+    }
+
+    private static DataTable CreateLegacySevenColumnDocumentMetadataTable(
+        params (
+            long DocumentId,
+            Guid DocumentUuid,
+            long ContentVersion,
+            long IdentityVersion,
+            DateTimeOffset ContentLastModifiedAt,
+            DateTimeOffset IdentityLastModifiedAt,
+            short ResourceKeyId
         )[] rows
     )
     {
@@ -137,6 +175,8 @@ public class Given_HydrationReader_With_Document_Metadata_Result_Sets
         table.Columns.Add("ContentVersion", typeof(long));
         table.Columns.Add("IdentityVersion", typeof(long));
         table.Columns.Add("ContentLastModifiedAt", typeof(DateTimeOffset));
+        table.Columns.Add("IdentityLastModifiedAt", typeof(DateTimeOffset));
+        table.Columns.Add("ResourceKeyId", typeof(short));
 
         foreach (var row in rows)
         {
@@ -145,7 +185,9 @@ public class Given_HydrationReader_With_Document_Metadata_Result_Sets
                 row.DocumentUuid,
                 row.ContentVersion,
                 row.IdentityVersion,
-                row.ContentLastModifiedAt
+                row.ContentLastModifiedAt,
+                row.IdentityLastModifiedAt,
+                row.ResourceKeyId
             );
         }
 

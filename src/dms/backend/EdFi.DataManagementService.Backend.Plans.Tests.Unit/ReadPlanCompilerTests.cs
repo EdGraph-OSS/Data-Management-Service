@@ -6,6 +6,7 @@
 using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Backend.External.Plans;
 using EdFi.DataManagementService.Backend.Plans;
+using FakeItEasy;
 using FluentAssertions;
 using NUnit.Framework;
 using static EdFi.DataManagementService.Backend.Plans.Tests.Unit.ReadPlanProjectionMutationHelper;
@@ -328,11 +329,59 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
     }
 
     [Test]
-    public void It_should_reject_mssql_table_read_plans_with_single_document_sql()
+    public void It_should_reject_mssql_table_read_plans_missing_single_document_sql()
+    {
+        var readPlan = CreateReadPlanWithTableSingleDocumentSql(_mssqlProjectionReadPlan, null);
+
+        var act = ValidateSingleDocumentSql(readPlan, SqlDialect.Mssql);
+
+        act.Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage(
+                "table read plan at index '0' for table 'edfi.StudentProjection' is missing required SelectBySingleDocumentSql for SQL Server read plans"
+            );
+    }
+
+    [Test]
+    public void It_should_reject_mssql_descriptor_projection_plans_missing_single_document_sql()
+    {
+        var readPlan = CreateReadPlanWithDescriptorProjectionSingleDocumentSql(
+            _mssqlProjectionReadPlan,
+            null
+        );
+
+        var act = ValidateSingleDocumentSql(readPlan, SqlDialect.Mssql);
+
+        act.Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage(
+                "descriptor projection plan at index '0' is missing required SelectBySingleDocumentSql for SQL Server read plans"
+            );
+    }
+
+    [Test]
+    public void It_should_reject_mssql_document_reference_lookup_plans_missing_single_document_sql()
+    {
+        var readPlan = CreateReadPlanWithDocumentReferenceLookupSingleDocumentSql(
+            _mssqlProjectionReadPlan,
+            null
+        );
+
+        var act = ValidateSingleDocumentSql(readPlan, SqlDialect.Mssql);
+
+        act.Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage(
+                "document-reference lookup plan is missing required SelectBySingleDocumentSql for SQL Server read plans"
+            );
+    }
+
+    [Test]
+    public void It_should_reject_table_read_plans_carrying_single_document_sql_for_a_dialect_without_support()
     {
         var readPlan = CreateReadPlanWithTableSingleDocumentSql(_mssqlProjectionReadPlan, "SELECT 1;");
 
-        var act = ValidateSingleDocumentSql(readPlan, SqlDialect.Mssql);
+        var act = ValidateSingleDocumentSql(readPlan, DialectWithoutSingleDocumentHydration());
 
         act.Should()
             .Throw<InvalidOperationException>()
@@ -342,14 +391,14 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
     }
 
     [Test]
-    public void It_should_reject_mssql_descriptor_projection_plans_with_single_document_sql()
+    public void It_should_reject_descriptor_projection_plans_carrying_single_document_sql_for_a_dialect_without_support()
     {
         var readPlan = CreateReadPlanWithDescriptorProjectionSingleDocumentSql(
-            _mssqlProjectionReadPlan,
+            CreateReadPlanWithoutTableSingleDocumentSql(_mssqlProjectionReadPlan),
             "SELECT 1;"
         );
 
-        var act = ValidateSingleDocumentSql(readPlan, SqlDialect.Mssql);
+        var act = ValidateSingleDocumentSql(readPlan, DialectWithoutSingleDocumentHydration());
 
         act.Should()
             .Throw<InvalidOperationException>()
@@ -359,14 +408,14 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
     }
 
     [Test]
-    public void It_should_reject_mssql_document_reference_lookup_plans_with_single_document_sql()
+    public void It_should_reject_document_reference_lookup_plans_carrying_single_document_sql_for_a_dialect_without_support()
     {
         var readPlan = CreateReadPlanWithDocumentReferenceLookupSingleDocumentSql(
-            _mssqlProjectionReadPlan,
+            CreateReadPlanWithoutTableOrDescriptorSingleDocumentSql(_mssqlProjectionReadPlan),
             "SELECT 1;"
         );
 
-        var act = ValidateSingleDocumentSql(readPlan, SqlDialect.Mssql);
+        var act = ValidateSingleDocumentSql(readPlan, DialectWithoutSingleDocumentHydration());
 
         act.Should()
             .Throw<InvalidOperationException>()
@@ -1008,14 +1057,37 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
     }
 
     [Test]
-    public void It_should_leave_mssql_DocumentReferenceLookup_single_document_sql_null()
+    public void It_should_emit_exact_mssql_DocumentReferenceLookup_single_document_sql_for_single_binding_with_SELECT_DISTINCT()
     {
-        _mssqlProjectionReadPlan.DocumentReferenceLookup.Should().NotBeNull();
-        _mssqlProjectionReadPlan.DocumentReferenceLookup!.SelectBySingleDocumentSql.Should().BeNull();
+        var lookup = _mssqlProjectionReadPlan.DocumentReferenceLookup;
+
+        lookup.Should().NotBeNull();
+        lookup!
+            .SelectBySingleDocumentSql.Should()
+            .Be(
+                """
+                SELECT
+                    doc.[DocumentId],
+                    doc.[DocumentUuid],
+                    doc.[ResourceKeyId]
+                FROM
+                    (
+                        SELECT DISTINCT t0.[School_DocumentId] AS [DocumentId]
+                        FROM [edfi].[StudentProjection] t0
+                        WHERE t0.[DocumentId] = @DocumentId
+                        AND t0.[School_DocumentId] IS NOT NULL
+                    ) p
+                INNER JOIN [dms].[Document] doc ON doc.[DocumentId] = p.[DocumentId]
+                ORDER BY
+                    doc.[DocumentId] ASC
+                ;
+
+                """
+            );
     }
 
     [Test]
-    public void It_should_emit_exact_pgsql_DocumentReferenceLookup_sql_for_multiple_bindings_joined_with_UNION()
+    public void It_should_emit_exact_pgsql_DocumentReferenceLookup_sql_for_multiple_bindings_on_one_table_as_a_single_scan()
     {
         var readPlan = new ReadPlanCompiler(SqlDialect.Pgsql).Compile(
             CreateRootMultiBindingReferenceProjectionResourceModel()
@@ -1033,15 +1105,11 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
                     doc."ResourceKeyId"
                 FROM
                     (
-                        SELECT t0."School_DocumentId" AS "DocumentId"
+                        SELECT DISTINCT v0."DocumentId"
                         FROM "edfi"."StudentReferenceProjection" t0
                         INNER JOIN "page" k ON t0."DocumentId" = k."DocumentId"
-                        WHERE t0."School_DocumentId" IS NOT NULL
-                        UNION
-                        SELECT t1."Calendar_DocumentId" AS "DocumentId"
-                        FROM "edfi"."StudentReferenceProjection" t1
-                        INNER JOIN "page" k ON t1."DocumentId" = k."DocumentId"
-                        WHERE t1."Calendar_DocumentId" IS NOT NULL
+                        CROSS JOIN LATERAL (VALUES (t0."School_DocumentId"), (t0."Calendar_DocumentId")) AS v0("DocumentId")
+                        WHERE v0."DocumentId" IS NOT NULL
                     ) p
                 INNER JOIN "dms"."Document" doc ON doc."DocumentId" = p."DocumentId"
                 ORDER BY
@@ -1051,6 +1119,7 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
                 """
             );
 
+        lookup.SelectByKeysetSql.Should().NotContain("UNION");
         lookup
             .SourcesInOrder.Select(static source => source.FkColumn.Value)
             .Should()
@@ -1062,7 +1131,41 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
     }
 
     [Test]
-    public void It_should_emit_exact_pgsql_DocumentReferenceLookup_single_document_sql_for_multiple_bindings_joined_with_UNION()
+    public void It_should_emit_exact_mssql_DocumentReferenceLookup_sql_for_multiple_bindings_on_one_table_as_a_single_scan()
+    {
+        var readPlan = new ReadPlanCompiler(SqlDialect.Mssql).Compile(
+            CreateRootMultiBindingReferenceProjectionResourceModel()
+        );
+        var lookup = readPlan.DocumentReferenceLookup;
+
+        lookup.Should().NotBeNull();
+        lookup!
+            .SelectByKeysetSql.Should()
+            .Be(
+                """
+                SELECT
+                    doc.[DocumentId],
+                    doc.[DocumentUuid],
+                    doc.[ResourceKeyId]
+                FROM
+                    (
+                        SELECT DISTINCT v0.[DocumentId]
+                        FROM [edfi].[StudentReferenceProjection] t0
+                        INNER JOIN [#page] k ON t0.[DocumentId] = k.[DocumentId]
+                        CROSS APPLY (VALUES (t0.[School_DocumentId]), (t0.[Calendar_DocumentId])) AS v0([DocumentId])
+                        WHERE v0.[DocumentId] IS NOT NULL
+                    ) p
+                INNER JOIN [dms].[Document] doc ON doc.[DocumentId] = p.[DocumentId]
+                ORDER BY
+                    doc.[DocumentId] ASC
+                ;
+
+                """
+            );
+    }
+
+    [Test]
+    public void It_should_emit_exact_pgsql_DocumentReferenceLookup_single_document_sql_for_multiple_bindings_on_one_table_as_a_single_scan()
     {
         var readPlan = new ReadPlanCompiler(SqlDialect.Pgsql).Compile(
             CreateRootMultiBindingReferenceProjectionResourceModel()
@@ -1080,15 +1183,11 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
                     doc."ResourceKeyId"
                 FROM
                     (
-                        SELECT t0."School_DocumentId" AS "DocumentId"
+                        SELECT DISTINCT v0."DocumentId"
                         FROM "edfi"."StudentReferenceProjection" t0
+                        CROSS JOIN LATERAL (VALUES (t0."School_DocumentId"), (t0."Calendar_DocumentId")) AS v0("DocumentId")
                         WHERE t0."DocumentId" = @DocumentId
-                        AND t0."School_DocumentId" IS NOT NULL
-                        UNION
-                        SELECT t1."Calendar_DocumentId" AS "DocumentId"
-                        FROM "edfi"."StudentReferenceProjection" t1
-                        WHERE t1."DocumentId" = @DocumentId
-                        AND t1."Calendar_DocumentId" IS NOT NULL
+                        AND v0."DocumentId" IS NOT NULL
                     ) p
                 INNER JOIN "dms"."Document" doc ON doc."DocumentId" = p."DocumentId"
                 ORDER BY
@@ -1098,6 +1197,45 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
                 """
             );
         lookup.SelectBySingleDocumentSql.Should().NotContain("INNER JOIN \"page\"");
+    }
+
+    /// <summary>
+    /// The <c>CROSS APPLY (VALUES ...)</c> single-scan form is what SQL Server emits for any root table
+    /// carrying two or more document references, so it needs its own pin rather than riding on the
+    /// single-binding case.
+    /// </summary>
+    [Test]
+    public void It_should_emit_exact_mssql_DocumentReferenceLookup_single_document_sql_for_multiple_bindings_on_one_table_as_a_single_scan()
+    {
+        var readPlan = new ReadPlanCompiler(SqlDialect.Mssql).Compile(
+            CreateRootMultiBindingReferenceProjectionResourceModel()
+        );
+        var lookup = readPlan.DocumentReferenceLookup;
+
+        lookup.Should().NotBeNull();
+        lookup!
+            .SelectBySingleDocumentSql.Should()
+            .Be(
+                """
+                SELECT
+                    doc.[DocumentId],
+                    doc.[DocumentUuid],
+                    doc.[ResourceKeyId]
+                FROM
+                    (
+                        SELECT DISTINCT v0.[DocumentId]
+                        FROM [edfi].[StudentReferenceProjection] t0
+                        CROSS APPLY (VALUES (t0.[School_DocumentId]), (t0.[Calendar_DocumentId])) AS v0([DocumentId])
+                        WHERE t0.[DocumentId] = @DocumentId
+                        AND v0.[DocumentId] IS NOT NULL
+                    ) p
+                INNER JOIN [dms].[Document] doc ON doc.[DocumentId] = p.[DocumentId]
+                ORDER BY
+                    doc.[DocumentId] ASC
+                ;
+
+                """
+            );
     }
 
     [TestCase(SqlDialect.Pgsql)]
@@ -1146,26 +1284,23 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
             tableModel: collectionTable
         );
 
-        if (dialect is SqlDialect.Mssql)
-        {
-            lookup.SelectBySingleDocumentSql.Should().BeNull();
-            return;
-        }
-
         lookup.SelectBySingleDocumentSql.Should().NotBeNull();
-        lookup.SelectBySingleDocumentSql.Should().NotContain("INNER JOIN \"page\"");
+        lookup.SelectBySingleDocumentSql.Should().NotContain(BatchPageJoinToken(dialect));
         AssertDocumentReferenceLookupSingleDocumentWhereUsesExpectedRootLocator(
             lookup.SelectBySingleDocumentSql!,
+            dialect,
             sourceIndex: 0,
             tableModel: rootTable
         );
         AssertDocumentReferenceLookupSingleDocumentWhereUsesExpectedRootLocator(
             lookup.SelectBySingleDocumentSql!,
+            dialect,
             sourceIndex: 1,
             tableModel: alignedExtensionTable
         );
         AssertDocumentReferenceLookupSingleDocumentWhereUsesExpectedRootLocator(
             lookup.SelectBySingleDocumentSql!,
+            dialect,
             sourceIndex: 2,
             tableModel: collectionTable
         );
@@ -1561,13 +1696,31 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
     }
 
     [Test]
-    public void It_should_leave_mssql_DescriptorProjection_single_document_sql_null()
+    public void It_should_emit_exact_mssql_DescriptorProjection_single_document_sql_for_projection_metadata_resources()
     {
-        _mssqlProjectionReadPlan.DescriptorProjectionPlansInOrder.Should().ContainSingle();
-        _mssqlProjectionReadPlan
-            .DescriptorProjectionPlansInOrder[0]
+        var descriptorPlan = _mssqlProjectionReadPlan.DescriptorProjectionPlansInOrder.Single();
+
+        descriptorPlan
             .SelectBySingleDocumentSql.Should()
-            .BeNull();
+            .Be(
+                """
+                SELECT
+                    p.[DescriptorId],
+                    d.[Uri]
+                FROM
+                    (
+                        SELECT DISTINCT t0.[AcademicSubjectDescriptorId] AS [DescriptorId]
+                        FROM [edfi].[StudentProjection] t0
+                        WHERE t0.[DocumentId] = @DocumentId
+                        AND t0.[AcademicSubjectDescriptorId] IS NOT NULL
+                    ) p
+                INNER JOIN [dms].[Descriptor] d ON d.[DocumentId] = p.[DescriptorId]
+                ORDER BY
+                    p.[DescriptorId] ASC
+                ;
+
+                """
+            );
     }
 
     [Test]
@@ -1769,6 +1922,66 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
             );
     }
 
+    [Test]
+    public void It_should_emit_exact_mssql_DescriptorProjection_sql_for_multiple_sources_on_one_table_as_a_single_scan()
+    {
+        var model = CreateKeyUnifiedDescriptorProjectionResourceModelWithStoredDescriptorSource();
+        var descriptorProjectionPlans = CompileDescriptorProjectionPlans(
+            model,
+            SqlDialect.Mssql,
+            CreateHydrationColumnOrdinalsExcludingStorageOnlyColumns(model.Root)
+        );
+
+        descriptorProjectionPlans.Should().ContainSingle();
+
+        var descriptorProjectionPlan = descriptorProjectionPlans.Single();
+
+        descriptorProjectionPlan
+            .SelectByKeysetSql.Should()
+            .Be(
+                """
+                SELECT
+                    p.[DescriptorId],
+                    d.[Uri]
+                FROM
+                    (
+                        SELECT DISTINCT v0.[DescriptorId]
+                        FROM [edfi].[Student] t0
+                        INNER JOIN [#page] k ON t0.[DocumentId] = k.[DocumentId]
+                        CROSS APPLY (VALUES (t0.[SchoolYearTypeDescriptorIdCanonical]), (t0.[ProgramTypeDescriptorId])) AS v0([DescriptorId])
+                        WHERE v0.[DescriptorId] IS NOT NULL
+                    ) p
+                INNER JOIN [dms].[Descriptor] d ON d.[DocumentId] = p.[DescriptorId]
+                ORDER BY
+                    p.[DescriptorId] ASC
+                ;
+
+                """
+            );
+        descriptorProjectionPlan
+            .SelectBySingleDocumentSql.Should()
+            .Be(
+                """
+                SELECT
+                    p.[DescriptorId],
+                    d.[Uri]
+                FROM
+                    (
+                        SELECT DISTINCT v0.[DescriptorId]
+                        FROM [edfi].[Student] t0
+                        CROSS APPLY (VALUES (t0.[SchoolYearTypeDescriptorIdCanonical]), (t0.[ProgramTypeDescriptorId])) AS v0([DescriptorId])
+                        WHERE t0.[DocumentId] = @DocumentId
+                        AND v0.[DescriptorId] IS NOT NULL
+                    ) p
+                INNER JOIN [dms].[Descriptor] d ON d.[DocumentId] = p.[DescriptorId]
+                ORDER BY
+                    p.[DescriptorId] ASC
+                ;
+
+                """
+            );
+    }
+
     [TestCase(SqlDialect.Pgsql)]
     [TestCase(SqlDialect.Mssql)]
     public void It_should_join_descriptor_projection_keysets_through_explicit_root_locators_for_stable_key_tables(
@@ -1821,26 +2034,31 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
             tableModel: alignedExtensionTable
         );
 
-        if (dialect is SqlDialect.Mssql)
-        {
-            descriptorProjectionPlan.SelectBySingleDocumentSql.Should().BeNull();
-            return;
-        }
+        // Three distinct source tables each contributing one descriptor column stay three separate
+        // branches, and none is expanded through the row-set primitive.
+        descriptorProjectionPlan
+            .SelectByKeysetSql.Split("UNION", StringSplitOptions.None)
+            .Should()
+            .HaveCount(3);
+        descriptorProjectionPlan.SelectByKeysetSql.Should().NotContain("VALUES (");
 
         descriptorProjectionPlan.SelectBySingleDocumentSql.Should().NotBeNull();
-        descriptorProjectionPlan.SelectBySingleDocumentSql.Should().NotContain("INNER JOIN \"page\"");
+        descriptorProjectionPlan.SelectBySingleDocumentSql.Should().NotContain(BatchPageJoinToken(dialect));
         AssertDescriptorProjectionSingleDocumentWhereUsesExpectedRootLocator(
             descriptorProjectionPlan.SelectBySingleDocumentSql!,
+            dialect,
             sourceIndex: 0,
             tableModel: rootTable
         );
         AssertDescriptorProjectionSingleDocumentWhereUsesExpectedRootLocator(
             descriptorProjectionPlan.SelectBySingleDocumentSql!,
+            dialect,
             sourceIndex: 1,
             tableModel: collectionTable
         );
         AssertDescriptorProjectionSingleDocumentWhereUsesExpectedRootLocator(
             descriptorProjectionPlan.SelectBySingleDocumentSql!,
+            dialect,
             sourceIndex: 2,
             tableModel: alignedExtensionTable
         );
@@ -2192,8 +2410,8 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
     [Test]
     public void It_should_emit_pgsql_single_document_select_list_filter_and_order_by_columns_in_model_order_for_every_table_plan()
     {
-        AssertPgsqlSingleDocumentSqlProjectionAndOrderingMatchesModel(_pgsqlRootOnlyReadPlan);
-        AssertPgsqlSingleDocumentSqlProjectionAndOrderingMatchesModel(_pgsqlReadPlan);
+        AssertSingleDocumentSqlProjectionAndOrderingMatchesModel(_pgsqlRootOnlyReadPlan);
+        AssertSingleDocumentSqlProjectionAndOrderingMatchesModel(_pgsqlReadPlan);
     }
 
     [Test]
@@ -2206,14 +2424,10 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
     }
 
     [Test]
-    public void It_should_leave_mssql_table_single_document_sql_null()
+    public void It_should_emit_mssql_single_document_select_list_filter_and_order_by_columns_in_model_order_for_every_table_plan()
     {
-        _mssqlRootOnlyReadPlan
-            .TablePlansInDependencyOrder.Should()
-            .AllSatisfy(static tablePlan => tablePlan.SelectBySingleDocumentSql.Should().BeNull());
-        _mssqlReadPlan
-            .TablePlansInDependencyOrder.Should()
-            .AllSatisfy(static tablePlan => tablePlan.SelectBySingleDocumentSql.Should().BeNull());
+        AssertSingleDocumentSqlProjectionAndOrderingMatchesModel(_mssqlRootOnlyReadPlan);
+        AssertSingleDocumentSqlProjectionAndOrderingMatchesModel(_mssqlReadPlan);
     }
 
     [Test]
@@ -2881,9 +3095,7 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
         }
     }
 
-    private static void AssertPgsqlSingleDocumentSqlProjectionAndOrderingMatchesModel(
-        ResourceReadPlan readPlan
-    )
+    private static void AssertSingleDocumentSqlProjectionAndOrderingMatchesModel(ResourceReadPlan readPlan)
     {
         foreach (var tablePlan in readPlan.TablePlansInDependencyOrder)
         {
@@ -3090,6 +3302,7 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
 
     private static void AssertDescriptorProjectionSingleDocumentWhereUsesExpectedRootLocator(
         string sql,
+        SqlDialect dialect,
         int sourceIndex,
         DbTableModel tableModel
     )
@@ -3100,7 +3313,7 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
                 "descriptor projection plan"
             );
         var expectedWhereCondition =
-            $"WHERE t{sourceIndex}.\"{rootScopeLocatorColumn.Value}\" = @"
+            $"WHERE t{sourceIndex}.{QuoteIdentifier(dialect, rootScopeLocatorColumn.Value)} = @"
             + HydrationSqlConventions.SingleDocumentIdParameterName;
 
         sql.Should().Contain(expectedWhereCondition);
@@ -3112,7 +3325,7 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
             return;
         }
 
-        sql.Should().NotContain($"WHERE t{sourceIndex}.\"{firstKeyColumn.Value}\" = @");
+        sql.Should().NotContain($"WHERE t{sourceIndex}.{QuoteIdentifier(dialect, firstKeyColumn.Value)} = @");
     }
 
     private static void AssertDocumentReferenceLookupKeysetJoinUsesExpectedRootLocator(
@@ -3149,6 +3362,7 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
 
     private static void AssertDocumentReferenceLookupSingleDocumentWhereUsesExpectedRootLocator(
         string sql,
+        SqlDialect dialect,
         int sourceIndex,
         DbTableModel tableModel
     )
@@ -3159,7 +3373,7 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
                 "document-reference lookup plan"
             );
         var expectedWhereCondition =
-            $"WHERE t{sourceIndex}.\"{rootScopeLocatorColumn.Value}\" = @"
+            $"WHERE t{sourceIndex}.{QuoteIdentifier(dialect, rootScopeLocatorColumn.Value)} = @"
             + HydrationSqlConventions.SingleDocumentIdParameterName;
 
         sql.Should().Contain(expectedWhereCondition);
@@ -3171,12 +3385,17 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
             return;
         }
 
-        sql.Should().NotContain($"WHERE t{sourceIndex}.\"{firstKeyColumn.Value}\" = @");
+        sql.Should().NotContain($"WHERE t{sourceIndex}.{QuoteIdentifier(dialect, firstKeyColumn.Value)} = @");
     }
 
     private static string QuoteIdentifier(SqlDialect dialect, string identifier)
     {
         return dialect == SqlDialect.Pgsql ? $"\"{identifier}\"" : $"[{identifier}]";
+    }
+
+    private static string BatchPageJoinToken(SqlDialect dialect)
+    {
+        return dialect == SqlDialect.Pgsql ? "INNER JOIN \"page\"" : "INNER JOIN [#page]";
     }
 
     private static string CreateReadPlanFingerprint(ResourceReadPlan readPlan)
@@ -3194,6 +3413,32 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
             );
     }
 
+    private static Action ValidateSingleDocumentSql(ResourceReadPlan readPlan, IPlanSqlDialect planDialect)
+    {
+        return () =>
+            ReadPlanSingleDocumentSqlValidator.ValidateOrThrow(
+                readPlan,
+                planDialect,
+                reason => new InvalidOperationException(reason)
+            );
+    }
+
+    /// <summary>
+    /// A dialect that declines single-document hydration while behaving like SQL Server in every other
+    /// respect. Both shipped dialects support single-document hydration, so this is the only way to
+    /// reach the validator's absent-SQL arm, which is the contract a future dialect would land against.
+    /// Wrapping a real dialect rather than hand-implementing the interface keeps this test from
+    /// breaking every time <see cref="IPlanSqlDialect"/> gains a member.
+    /// </summary>
+    private static IPlanSqlDialect DialectWithoutSingleDocumentHydration()
+    {
+        var dialect = A.Fake<IPlanSqlDialect>(options =>
+            options.Wrapping(PlanSqlDialectFactory.Create(SqlDialect.Mssql))
+        );
+        A.CallTo(() => dialect.SupportsSingleDocumentHydration).Returns(false);
+        return dialect;
+    }
+
     private static ResourceReadPlan CreateReadPlanWithTableSingleDocumentSql(
         ResourceReadPlan readPlan,
         string? selectBySingleDocumentSql,
@@ -3209,6 +3454,53 @@ public class Given_ReadPlanCompiler : WritePlanCompilerTestBase
         return readPlan with
         {
             TablePlansInDependencyOrder = [.. tablePlans],
+        };
+    }
+
+    /// <summary>
+    /// Clears single-document SQL from every table plan. The absent-SQL validation arm checks table
+    /// plans before descriptor and lookup plans, so reaching either of those arms requires the table
+    /// plans to be clean first.
+    /// </summary>
+    private static ResourceReadPlan CreateReadPlanWithoutTableSingleDocumentSql(ResourceReadPlan readPlan)
+    {
+        var tablePlans = readPlan
+            .TablePlansInDependencyOrder.Select(tablePlan =>
+                tablePlan with
+                {
+                    SelectBySingleDocumentSql = null,
+                }
+            )
+            .ToArray();
+
+        return readPlan with
+        {
+            TablePlansInDependencyOrder = [.. tablePlans],
+        };
+    }
+
+    /// <summary>
+    /// Clears single-document SQL from every table and descriptor projection plan, which is what the
+    /// lookup arm of absent-SQL validation needs in order to be reached at all.
+    /// </summary>
+    private static ResourceReadPlan CreateReadPlanWithoutTableOrDescriptorSingleDocumentSql(
+        ResourceReadPlan readPlan
+    )
+    {
+        var cleared = CreateReadPlanWithoutTableSingleDocumentSql(readPlan);
+
+        var descriptorPlans = cleared
+            .DescriptorProjectionPlansInOrder.Select(descriptorPlan =>
+                descriptorPlan with
+                {
+                    SelectBySingleDocumentSql = null,
+                }
+            )
+            .ToArray();
+
+        return cleared with
+        {
+            DescriptorProjectionPlansInOrder = [.. descriptorPlans],
         };
     }
 

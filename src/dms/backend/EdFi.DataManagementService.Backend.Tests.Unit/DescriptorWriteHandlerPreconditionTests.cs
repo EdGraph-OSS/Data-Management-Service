@@ -1366,7 +1366,11 @@ public class Given_Descriptor_Write_Preconditions
 
     private static InMemoryRelationalResultSet CreateContentVersionRow(long contentVersion) =>
         InMemoryRelationalResultSet.Create(
-            new Dictionary<string, object?> { ["ContentVersion"] = contentVersion }
+            new Dictionary<string, object?>
+            {
+                ["ContentVersion"] = contentVersion,
+                ["DocumentCacheEnqueueOutcome"] = (int)DocumentCacheEnqueueOutcome.AlreadySatisfied,
+            }
         );
 
     private static InMemoryRelationalResultSet CreateResolvedExistingDocumentRow(DocumentUuid documentUuid)
@@ -1378,6 +1382,7 @@ public class Given_Descriptor_Write_Preconditions
                 ["DocumentUuid"] = documentUuid.Value,
                 ["ResourceKeyId"] = 1,
                 ["ContentVersion"] = 44L,
+                ["ContentLastModifiedAt"] = new DateTimeOffset(2026, 4, 11, 12, 30, 45, TimeSpan.Zero),
             }
         );
     }

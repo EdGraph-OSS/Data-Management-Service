@@ -3,10 +3,11 @@
 // The Ed-Fi Alliance licenses this file to you under the Apache License, Version 2.0.
 // See the LICENSE and NOTICES files in the project root for more information.
 
-using System.Data.Common;
 using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Backend.External.Plans;
 using EdFi.DataManagementService.Backend.Plans;
+using EdFi.DataManagementService.Core.Configuration;
+using EdFi.DataManagementService.Core.DocumentCache;
 using EdFi.DataManagementService.Core.Profile;
 using FakeItEasy;
 using FluentAssertions;
@@ -72,16 +73,28 @@ public class Given_ReferenceResolver_Service_Collection_Extensions
         var writeFlattener = scope.ServiceProvider.GetRequiredService<IRelationalWriteFlattener>();
         var sessionDocumentHydrator = scope.ServiceProvider.GetRequiredService<ISessionDocumentHydrator>();
         var readMaterializer = scope.ServiceProvider.GetRequiredService<IRelationalReadMaterializer>();
+        var documentCacheMaterializationDataStore =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheMaterializationDataStore>();
+        var documentCacheSourceMetadataReader =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheSourceMetadataReader>();
+        var documentCacheDescriptorHydrator =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheDescriptorHydrator>();
+        var documentCacheMaterializer =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheMaterializer>();
+        var documentCacheWriterRetryAdapter =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheWriterRetryAdapter>();
         var readTargetLookupService =
             scope.ServiceProvider.GetRequiredService<IRelationalReadTargetLookupService>();
         var singleRecordRelationshipAuthorizationExecutor =
             scope.ServiceProvider.GetRequiredService<ISingleRecordRelationshipAuthorizationExecutor>();
+        var ownershipAuthorizationExecutor =
+            scope.ServiceProvider.GetRequiredService<IOwnershipAuthorizationExecutor>();
         var relationshipAuthorizationProviderFailureExtractor =
             scope.ServiceProvider.GetRequiredService<IRelationshipAuthorizationProviderFailureExtractor>();
+        var documentCacheReadAccelerationCoordinator =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheReadAccelerationCoordinator>();
         var currentStateLoader =
             scope.ServiceProvider.GetRequiredService<IRelationalWriteCurrentStateLoader>();
-        var writeFreshnessChecker =
-            scope.ServiceProvider.GetRequiredService<IRelationalWriteFreshnessChecker>();
         var noProfileMergeSynthesizer =
             scope.ServiceProvider.GetRequiredService<IRelationalWriteNoProfileMergeSynthesizer>();
         var noProfilePersister = scope.ServiceProvider.GetRequiredService<IRelationalWritePersister>();
@@ -116,12 +129,28 @@ public class Given_ReferenceResolver_Service_Collection_Extensions
             .Subject;
 
         commandExecutor.Should().BeOfType<TestRelationalCommandExecutor>();
+        // Registered so the repository's own resolution cannot fail once the ReadSingle gate opens: an
+        // unregistered executor would surface as a container error on the first ownership-configured read
+        // rather than at composition time.
+        ownershipAuthorizationExecutor.Should().BeOfType<OwnershipAuthorizationExecutor>();
         parameterConfigurator.Should().BeOfType<DefaultRelationalParameterConfigurator>();
         writeSessionFactory.Should().BeOfType<TestRelationalWriteSessionFactory>();
         documentHydrator.Should().BeOfType<TestDocumentHydrator>();
         writeFlattener.Should().BeOfType<RelationalWriteFlattener>();
         sessionDocumentHydrator.Should().BeOfType<TestSessionDocumentHydrator>();
         readMaterializer.Should().BeOfType<RelationalReadMaterializer>();
+        documentCacheMaterializationDataStore
+            .Should()
+            .BeOfType<AmbientDocumentCacheMaterializationDataStore>();
+        documentCacheSourceMetadataReader.Should().BeOfType<DocumentCacheSourceMetadataReader>();
+        documentCacheDescriptorHydrator.Should().BeOfType<DocumentCacheDescriptorHydrator>();
+        documentCacheMaterializer.Should().BeOfType<DocumentCacheMaterializer>();
+        documentCacheWriterRetryAdapter.Should().BeOfType<DocumentCacheWriterRetryAdapter>();
+        scope.ServiceProvider.GetService<IDocumentCacheReadLookupAdapter>().Should().BeNull();
+        documentCacheReadAccelerationCoordinator
+            .Should()
+            .BeSameAs(PassthroughDocumentCacheReadAccelerationCoordinator.Instance);
+        scope.ServiceProvider.GetService<IDocumentCacheWriter>().Should().BeNull();
         readTargetLookupService.Should().BeOfType<RelationalReadTargetLookupService>();
         singleRecordRelationshipAuthorizationExecutor
             .Should()
@@ -130,7 +159,6 @@ public class Given_ReferenceResolver_Service_Collection_Extensions
             .Should()
             .BeOfType<DefaultRelationshipAuthorizationProviderFailureExtractor>();
         currentStateLoader.Should().BeOfType<RelationalWriteCurrentStateLoader>();
-        writeFreshnessChecker.Should().BeOfType<RelationalWriteFreshnessChecker>();
         noProfileMergeSynthesizer.Should().BeOfType<RelationalWriteNoProfileMergeSynthesizer>();
         noProfilePersister.Should().BeOfType<RelationalWriteNoProfilePersister>();
         writeExceptionClassifier.Should().BeOfType<NoOpRelationalWriteExceptionClassifier>();
@@ -147,6 +175,94 @@ public class Given_ReferenceResolver_Service_Collection_Extensions
         edOrgAuthorizationSubjectSelector.Should().NotBeNull();
         factory.CommandExecutor.Should().BeSameAs(commandExecutor);
         adapter.CommandExecutor.Should().BeSameAs(commandExecutor);
+    }
+
+    [Test]
+    public void DocumentCacheMaterializer_ServiceRegistration_registers_the_materializer_without_cross_story_call_sites()
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<ILoggerFactory>(NullLoggerFactory.Instance);
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton(A.Fake<IReadableProfileProjector>());
+
+        services.AddReferenceResolver<
+            ExecutorBackedReferenceResolverAdapterFactory,
+            TestRelationalCommandExecutor,
+            TestRelationalWriteSessionFactory,
+            TestDocumentHydrator,
+            TestSessionDocumentHydrator
+        >();
+
+        services
+            .Where(descriptor =>
+                descriptor.ServiceType == typeof(IDocumentCacheMaterializer)
+                || descriptor.ServiceType == typeof(IDocumentCacheMaterializationDataStore)
+                || descriptor.ServiceType == typeof(IDocumentCacheSourceMetadataReader)
+                || descriptor.ServiceType == typeof(IDocumentCacheDescriptorHydrator)
+            )
+            .Should()
+            .AllSatisfy(descriptor => descriptor.Lifetime.Should().Be(ServiceLifetime.Scoped));
+
+        services
+            .Select(descriptor => descriptor.ServiceType.FullName ?? descriptor.ServiceType.Name)
+            .Should()
+            .NotContain(serviceTypeName =>
+                serviceTypeName.Contains("DocumentCacheTarget", StringComparison.Ordinal)
+                || serviceTypeName.Contains("DocumentProjectionWork", StringComparison.Ordinal)
+                || serviceTypeName.Contains("Lifecycle", StringComparison.Ordinal)
+                || serviceTypeName.Contains("Kafka", StringComparison.Ordinal)
+            );
+
+        using var serviceProvider = BuildServiceProvider(services);
+        using var scope = serviceProvider.CreateScope();
+
+        scope
+            .ServiceProvider.GetRequiredService<IDocumentCacheSourceMetadataReader>()
+            .Should()
+            .BeOfType<DocumentCacheSourceMetadataReader>();
+        scope
+            .ServiceProvider.GetRequiredService<IDocumentCacheDescriptorHydrator>()
+            .Should()
+            .BeOfType<DocumentCacheDescriptorHydrator>();
+        scope
+            .ServiceProvider.GetRequiredService<IDocumentCacheMaterializer>()
+            .Should()
+            .BeOfType<DocumentCacheMaterializer>();
+        scope.ServiceProvider.GetService<IDocumentCacheWriter>().Should().BeNull();
+    }
+
+    [Test]
+    public void DocumentCacheWriter_ServiceRegistration_registers_shared_retry_adapter_without_provider_writer()
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<ILoggerFactory>(NullLoggerFactory.Instance);
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton(A.Fake<IReadableProfileProjector>());
+
+        services.AddReferenceResolver<
+            ExecutorBackedReferenceResolverAdapterFactory,
+            TestRelationalCommandExecutor,
+            TestRelationalWriteSessionFactory,
+            TestDocumentHydrator,
+            TestSessionDocumentHydrator
+        >();
+
+        ServiceDescriptor retryDescriptor = services.Single(descriptor =>
+            descriptor.ServiceType == typeof(IDocumentCacheWriterRetryAdapter)
+        );
+
+        retryDescriptor.Lifetime.Should().Be(ServiceLifetime.Scoped);
+        retryDescriptor.ImplementationType.Should().Be<DocumentCacheWriterRetryAdapter>();
+        services.Should().NotContain(descriptor => descriptor.ServiceType == typeof(IDocumentCacheWriter));
+
+        using var serviceProvider = BuildServiceProvider(services);
+        using var scope = serviceProvider.CreateScope();
+
+        scope
+            .ServiceProvider.GetRequiredService<IDocumentCacheWriterRetryAdapter>()
+            .Should()
+            .BeOfType<DocumentCacheWriterRetryAdapter>();
+        scope.ServiceProvider.GetService<IDocumentCacheWriter>().Should().BeNull();
     }
 
     [Test]
@@ -192,7 +308,14 @@ public class Given_ReferenceResolver_Service_Collection_Extensions
         // which depends on Core-owned IDocumentLinkSlugResolver and bound ResourceLinksOptions.
         // Provide stubs so the composition surface validates end-to-end without pulling in the
         // full Core DI extension.
+        services.TryAddSingleton(new DeadlockRetrySettings());
         services.TryAddSingleton<IDocumentLinkSlugResolver, NoLinkSlugResolver>();
+        services.TryAddSingleton<IDocumentCacheProjectionSupervisor, StubDocumentCacheProjectionSupervisor>();
+        services.TryAddSingleton<IDocumentCacheTargetRegistry, StubDocumentCacheTargetRegistry>();
+        services.TryAddSingleton<IDocumentProjectionWorkPager, StubDocumentProjectionWorkPager>();
+        services.TryAddSingleton(A.Fake<IDocumentCacheAdministrativeMutex>());
+        services.TryAddSingleton(A.Fake<IDocumentCacheAdministrativePrimitives>());
+        services.TryAddSingleton(A.Fake<IDocumentCacheProviderCommandTimeoutClassifier>());
         services.AddOptions<ResourceLinksOptions>();
 
         return services.BuildServiceProvider(
@@ -206,14 +329,47 @@ public class Given_ReferenceResolver_Service_Collection_Extensions
             throw new InvalidOperationException("NoLinkSlugResolver is unused in composition-surface tests.");
     }
 
+    private sealed class StubDocumentCacheProjectionSupervisor : IDocumentCacheProjectionSupervisor
+    {
+        public System.Collections.Immutable.ImmutableArray<DocumentCacheProjectionTargetRuntimeContext> CurrentTargetContexts =>
+            [];
+
+        public Task<DocumentCacheTargetRegistrySnapshot> RefreshAsync(
+            DocumentCacheTargetRefreshReason reason,
+            CancellationToken cancellationToken = default
+        ) => throw new InvalidOperationException("Stub supervisor is unused in composition-surface tests.");
+    }
+
+    private sealed class StubDocumentCacheTargetRegistry : IDocumentCacheTargetRegistry
+    {
+        private static readonly DateTimeOffset ObservedAt = new(2026, 8, 1, 12, 0, 0, TimeSpan.Zero);
+
+        public DocumentCacheTargetRegistrySnapshot CurrentSnapshot { get; } = new([], ObservedAt);
+
+        public DocumentCacheTargetRuntimeSnapshot CurrentRuntimeSnapshot { get; } = new([], ObservedAt);
+
+        public Task<DocumentCacheTargetRegistrySnapshot> RefreshAsync(
+            DocumentCacheTargetRefreshReason reason,
+            CancellationToken cancellationToken = default
+        ) => throw new InvalidOperationException("Stub registry is unused in composition-surface tests.");
+    }
+
+    private sealed class StubDocumentProjectionWorkPager : IDocumentProjectionWorkPager
+    {
+        public RelationalProviderToken ProviderToken => RelationalProviderToken.Postgresql;
+
+        public Task<DocumentProjectionWorkPage> ReadPageAsync(
+            DocumentProjectionWorkPageRequest request,
+            CancellationToken cancellationToken = default
+        ) => throw new InvalidOperationException("Stub work pager is unused in composition-surface tests.");
+    }
+
     private sealed class TestReferenceResolverAdapterFactory : IReferenceResolverAdapterFactory
     {
         public IReferenceResolverAdapter CreateAdapter() => new TestReferenceResolverAdapter();
 
-        public IReferenceResolverAdapter CreateSessionAdapter(
-            DbConnection connection,
-            DbTransaction transaction
-        ) => new TestReferenceResolverAdapter();
+        public IReferenceResolverAdapter CreateSessionAdapter(IRelationalCommandExecutor commandExecutor) =>
+            new TestReferenceResolverAdapter();
     }
 
     private sealed class TestReferenceResolverAdapter : IReferenceResolverAdapter
@@ -239,14 +395,9 @@ public class Given_ReferenceResolver_Service_Collection_Extensions
             return new ExecutorBackedReferenceResolverAdapter(CommandExecutor);
         }
 
-        public IReferenceResolverAdapter CreateSessionAdapter(
-            DbConnection connection,
-            DbTransaction transaction
-        )
+        public IReferenceResolverAdapter CreateSessionAdapter(IRelationalCommandExecutor commandExecutor)
         {
-            return new ExecutorBackedReferenceResolverAdapter(
-                new SessionRelationalCommandExecutor(connection, transaction)
-            );
+            return new ExecutorBackedReferenceResolverAdapter(commandExecutor);
         }
     }
 
@@ -290,8 +441,7 @@ public class Given_ReferenceResolver_Service_Collection_Extensions
     private sealed class TestSessionDocumentHydrator : ISessionDocumentHydrator
     {
         public Task<HydratedPage> HydrateAsync(
-            DbConnection connection,
-            DbTransaction transaction,
+            IRelationalWriteSession writeSession,
             ResourceReadPlan plan,
             PageKeysetSpec keyset,
             HydrationExecutionOptions executionOptions,

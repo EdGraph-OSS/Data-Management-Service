@@ -6,6 +6,7 @@
 using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Backend.Mssql;
 using EdFi.DataManagementService.Core.Configuration;
+using EdFi.DataManagementService.Core.DocumentCache;
 using EdFi.DataManagementService.Core.External.Backend;
 using EdFi.DataManagementService.Core.External.Model;
 using EdFi.DataManagementService.Core.Profile;
@@ -28,6 +29,7 @@ public class Given_Mssql_Reference_Resolver_Service_Collection_Extensions
 
         services.AddLogging();
         services.AddSingleton(A.Fake<IReadableProfileProjector>());
+        services.AddSingleton(A.Fake<IDataStoreProvider>());
         services.AddScoped<IDataStoreSelection, DataStoreSelection>();
         services.AddMssqlReferenceResolver();
 
@@ -38,8 +40,6 @@ public class Given_Mssql_Reference_Resolver_Service_Collection_Extensions
         var writeFlattener = scope.ServiceProvider.GetRequiredService<IRelationalWriteFlattener>();
         var currentStateLoader =
             scope.ServiceProvider.GetRequiredService<IRelationalWriteCurrentStateLoader>();
-        var writeFreshnessChecker =
-            scope.ServiceProvider.GetRequiredService<IRelationalWriteFreshnessChecker>();
         var noProfileMergeSynthesizer =
             scope.ServiceProvider.GetRequiredService<IRelationalWriteNoProfileMergeSynthesizer>();
         var noProfilePersister = scope.ServiceProvider.GetRequiredService<IRelationalWritePersister>();
@@ -56,6 +56,35 @@ public class Given_Mssql_Reference_Resolver_Service_Collection_Extensions
         var parameterConfigurator =
             scope.ServiceProvider.GetRequiredService<IRelationalParameterConfigurator>();
         var readMaterializer = scope.ServiceProvider.GetRequiredService<IRelationalReadMaterializer>();
+        var documentCacheMaterializationDataStore =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheMaterializationDataStore>();
+        var documentCacheWriter = scope.ServiceProvider.GetRequiredService<IDocumentCacheWriter>();
+        var documentCacheSessionBoundWriter =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheSessionBoundWriter>();
+        var documentCacheWriterRetryAdapter =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheWriterRetryAdapter>();
+        var documentProjectionWorkPager =
+            scope.ServiceProvider.GetRequiredService<IDocumentProjectionWorkPager>();
+        var documentCacheAdministrativeMutex =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheAdministrativeMutex>();
+        var documentCacheAdministrativePrimitives =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheAdministrativePrimitives>();
+        var providerCommandTimeoutClassifier =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheProviderCommandTimeoutClassifier>();
+        var documentCacheBaselineSeeder =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheBaselineSeeder>();
+        var documentCacheOfflineActivationCommand =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheOfflineActivationCommand>();
+        var documentCacheOfflineDeactivationCommand =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheOfflineDeactivationCommand>();
+        var documentCacheOnlineCacheRebuildCommand =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheOnlineCacheRebuildCommand>();
+        var documentCacheInternalOnlyCacheAheadRecoveryCommand =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheInternalOnlyCacheAheadRecoveryCommand>();
+        var documentCacheExplicitIntegrityScrubCommand =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheExplicitIntegrityScrubCommand>();
+        var documentCacheProjectionDrainPageProcessor =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheProjectionDrainPageProcessor>();
         var readTargetLookupService =
             scope.ServiceProvider.GetRequiredService<IRelationalReadTargetLookupService>();
         var writeExceptionClassifier =
@@ -70,11 +99,12 @@ public class Given_Mssql_Reference_Resolver_Service_Collection_Extensions
             scope.ServiceProvider.GetRequiredService<IRelationalDeleteEtagPreconditionChecker>();
         var relationshipAuthorizationProviderFailureExtractor =
             scope.ServiceProvider.GetRequiredService<IRelationshipAuthorizationProviderFailureExtractor>();
+        var documentCacheReadAccelerationCoordinator =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheReadAccelerationCoordinator>();
 
         resolver.Should().BeOfType<ReferenceResolver>();
         writeFlattener.Should().BeOfType<RelationalWriteFlattener>();
         currentStateLoader.Should().BeOfType<RelationalWriteCurrentStateLoader>();
-        writeFreshnessChecker.Should().BeOfType<RelationalWriteFreshnessChecker>();
         noProfileMergeSynthesizer.Should().BeOfType<RelationalWriteNoProfileMergeSynthesizer>();
         noProfilePersister.Should().BeOfType<RelationalWriteNoProfilePersister>();
         targetLookupService.Should().BeOfType<RelationalWriteTargetLookupService>();
@@ -87,6 +117,30 @@ public class Given_Mssql_Reference_Resolver_Service_Collection_Extensions
         commandExecutor.Should().BeOfType<MssqlRelationalCommandExecutor>();
         parameterConfigurator.Should().BeOfType<MssqlRelationalParameterConfigurator>();
         readMaterializer.Should().BeOfType<RelationalReadMaterializer>();
+        documentCacheMaterializationDataStore.Should().BeOfType<MssqlDocumentCacheMaterializationDataStore>();
+        documentCacheWriter.Should().BeOfType<MssqlDocumentCacheWriter>();
+        documentCacheSessionBoundWriter.Should().BeSameAs(documentCacheWriter);
+        documentCacheWriterRetryAdapter.Should().BeOfType<DocumentCacheWriterRetryAdapter>();
+        documentProjectionWorkPager.Should().BeOfType<MssqlDocumentProjectionWorkPager>();
+        documentCacheAdministrativeMutex.Should().BeOfType<MssqlDocumentCacheAdministrativeMutex>();
+        documentCacheAdministrativePrimitives.Should().BeOfType<DocumentCacheAdministrativePrimitives>();
+        documentCacheAdministrativePrimitives.ProviderToken.Should().Be(RelationalProviderToken.SqlServer);
+        providerCommandTimeoutClassifier
+            .Should()
+            .BeOfType<MssqlDocumentCacheProviderCommandTimeoutClassifier>();
+        documentCacheBaselineSeeder.Should().BeOfType<DocumentCacheBaselineSeeder>();
+        documentCacheOfflineActivationCommand.Should().BeOfType<DocumentCacheOfflineActivationCommand>();
+        documentCacheOfflineDeactivationCommand.Should().BeOfType<DocumentCacheOfflineDeactivationCommand>();
+        documentCacheOnlineCacheRebuildCommand.Should().BeOfType<DocumentCacheOnlineCacheRebuildCommand>();
+        documentCacheInternalOnlyCacheAheadRecoveryCommand
+            .Should()
+            .BeOfType<DocumentCacheInternalOnlyCacheAheadRecoveryCommand>();
+        documentCacheExplicitIntegrityScrubCommand
+            .Should()
+            .BeOfType<DocumentCacheExplicitIntegrityScrubCommand>();
+        documentCacheProjectionDrainPageProcessor
+            .Should()
+            .BeOfType<DocumentCacheProjectionDrainPageProcessor>();
         readTargetLookupService.Should().BeOfType<RelationalReadTargetLookupService>();
         writeExceptionClassifier.Should().BeOfType<MssqlRelationalWriteExceptionClassifier>();
         writeConstraintResolver.Should().BeOfType<RelationalWriteConstraintResolver>();
@@ -97,6 +151,109 @@ public class Given_Mssql_Reference_Resolver_Service_Collection_Extensions
         relationshipAuthorizationProviderFailureExtractor
             .Should()
             .BeOfType<DefaultRelationshipAuthorizationProviderFailureExtractor>();
+        documentCacheReadAccelerationCoordinator
+            .Should()
+            .BeSameAs(PassthroughDocumentCacheReadAccelerationCoordinator.Instance);
+    }
+
+    [Test]
+    public void It_registers_the_full_read_acceleration_coordinator_when_read_acceleration_is_enabled()
+    {
+        var services = new ServiceCollection();
+
+        services.AddLogging();
+        services.AddSingleton(A.Fake<IReadableProfileProjector>());
+        services.AddSingleton(A.Fake<IDataStoreProvider>());
+        services.AddScoped<IDataStoreSelection, DataStoreSelection>();
+        services.Configure<DocumentCacheOptions>(options => options.ReadAcceleration.Enabled = true);
+        services.AddMssqlReferenceResolver();
+
+        using var serviceProvider = BuildServiceProvider(services);
+        using var scope = serviceProvider.CreateScope();
+
+        scope
+            .ServiceProvider.GetRequiredService<IDocumentCacheReadAccelerationCoordinator>()
+            .Should()
+            .BeOfType<DocumentCacheReadAccelerationCoordinator>();
+    }
+
+    [Test]
+    public void DocumentCacheWriter_ServiceRegistration_registers_mssql_writer_and_projection_pager_adapters()
+    {
+        var services = new ServiceCollection();
+
+        services.AddLogging();
+        services.AddSingleton(A.Fake<IReadableProfileProjector>());
+        services.AddSingleton(A.Fake<IDataStoreProvider>());
+        services.AddScoped<IDataStoreSelection, DataStoreSelection>();
+        services.AddMssqlReferenceResolver();
+
+        services
+            .Where(descriptor => descriptor.ServiceType == typeof(MssqlDocumentCacheWriter))
+            .Should()
+            .ContainSingle()
+            .Which.Should()
+            .Match<ServiceDescriptor>(descriptor =>
+                descriptor.Lifetime == ServiceLifetime.Scoped
+                && descriptor.ImplementationType == typeof(MssqlDocumentCacheWriter)
+            );
+        AssertScopedFactory<IDocumentCacheWriter>(services);
+        AssertScopedFactory<IDocumentCacheSessionBoundWriter>(services);
+        services
+            .Where(descriptor => descriptor.ServiceType == typeof(IDocumentProjectionWorkPager))
+            .Should()
+            .ContainSingle()
+            .Which.Should()
+            .Match<ServiceDescriptor>(descriptor =>
+                descriptor.Lifetime == ServiceLifetime.Singleton
+                && descriptor.ImplementationType == typeof(MssqlDocumentProjectionWorkPager)
+            );
+        services
+            .Where(descriptor => descriptor.ServiceType == typeof(IDocumentCacheAdministrativeMutex))
+            .Should()
+            .ContainSingle()
+            .Which.Should()
+            .Match<ServiceDescriptor>(descriptor =>
+                descriptor.Lifetime == ServiceLifetime.Singleton
+                && descriptor.ImplementationType == typeof(MssqlDocumentCacheAdministrativeMutex)
+            );
+        services
+            .Single(descriptor =>
+                descriptor.ServiceType == typeof(IDocumentCacheProjectionDrainPageProcessor)
+            )
+            .ImplementationType.Should()
+            .Be<DocumentCacheProjectionDrainPageProcessor>();
+
+        using var serviceProvider = BuildServiceProvider(services);
+        using var scope = serviceProvider.CreateScope();
+
+        var documentCacheWriter = scope.ServiceProvider.GetRequiredService<IDocumentCacheWriter>();
+        var documentCacheSessionBoundWriter =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheSessionBoundWriter>();
+
+        documentCacheWriter.Should().BeOfType<MssqlDocumentCacheWriter>();
+        documentCacheSessionBoundWriter.Should().BeSameAs(documentCacheWriter);
+        scope
+            .ServiceProvider.GetRequiredService<IDocumentProjectionWorkPager>()
+            .Should()
+            .BeOfType<MssqlDocumentProjectionWorkPager>();
+        scope
+            .ServiceProvider.GetRequiredService<IDocumentCacheAdministrativeMutex>()
+            .Should()
+            .BeOfType<MssqlDocumentCacheAdministrativeMutex>();
+    }
+
+    [Test]
+    public void It_does_not_register_the_mssql_Cdc_source_position_adapter_by_default()
+    {
+        var services = new ServiceCollection();
+
+        services.AddMssqlReferenceResolver();
+
+        services
+            .Where(descriptor => descriptor.ServiceType == typeof(MssqlCdcSourcePositionAdapter))
+            .Should()
+            .BeEmpty();
     }
 
     [Test]
@@ -123,9 +280,45 @@ public class Given_Mssql_Reference_Resolver_Service_Collection_Extensions
             .BeOfType<MssqlTokenInfoEducationOrganizationLookup>();
     }
 
+    [Test]
+    public void It_builds_an_embeddable_sql_server_small_list_reference_lookup_command()
+    {
+        var factory = new MssqlReferenceResolverAdapterFactory(A.Fake<IRelationalCommandExecutor>());
+
+        var command = factory.TryBuildSessionLookupCommand(
+            CreateLookupRequest(MssqlReferenceLookupSmallListStrategy.BulkLookupThreshold - 1)
+        );
+
+        command.Should().NotBeNull();
+        command!.Parameters.Should().HaveCount(1999);
+        command
+            .Parameters.Should()
+            .AllSatisfy(parameter => parameter.ConfigureParameter.Should().NotBeNull());
+    }
+
+    [Test]
+    public void It_selects_the_sql_server_table_valued_fallback_at_the_bulk_threshold()
+    {
+        var factory = new MssqlReferenceResolverAdapterFactory(A.Fake<IRelationalCommandExecutor>());
+
+        var command = factory.TryBuildSessionLookupCommand(
+            CreateLookupRequest(MssqlReferenceLookupSmallListStrategy.BulkLookupThreshold)
+        );
+
+        command.Should().BeNull();
+        var bulkCommand = MssqlReferenceLookupBulkStrategy.BuildCommand(
+            CreateLookupRequest(MssqlReferenceLookupSmallListStrategy.BulkLookupThreshold)
+        );
+        bulkCommand.Parameters.Should().ContainSingle();
+        bulkCommand.Parameters[0].ConfigureParameter.Should().NotBeNull();
+    }
+
     private static ServiceProvider BuildServiceProvider(IServiceCollection services)
     {
+        services.TryAddSingleton(new DeadlockRetrySettings());
         services.TryAddSingleton<IDocumentLinkSlugResolver, NoLinkSlugResolver>();
+        services.TryAddSingleton<IDocumentCacheProjectionSupervisor, StubDocumentCacheProjectionSupervisor>();
+        services.TryAddSingleton<IDocumentCacheTargetRegistry, StubDocumentCacheTargetRegistry>();
         services.AddOptions<ResourceLinksOptions>();
 
         return services.BuildServiceProvider(
@@ -133,10 +326,72 @@ public class Given_Mssql_Reference_Resolver_Service_Collection_Extensions
         );
     }
 
+    private static void AssertScopedFactory<TService>(IServiceCollection services)
+        where TService : class
+    {
+        ServiceDescriptor descriptor = services
+            .Where(descriptor => descriptor.ServiceType == typeof(TService))
+            .Should()
+            .ContainSingle()
+            .Subject;
+
+        descriptor.Lifetime.Should().Be(ServiceLifetime.Scoped);
+        descriptor.ImplementationFactory.Should().NotBeNull();
+        descriptor.ImplementationType.Should().BeNull();
+        descriptor.ImplementationInstance.Should().BeNull();
+    }
+
+    private static ReferenceLookupRequest CreateLookupRequest(int count)
+    {
+        var requestResource = new QualifiedResourceName("Ed-Fi", "Student");
+        var mappingSet = RelationalAccessTestData.CreateMappingSet(requestResource) with
+        {
+            Key = new MappingSetKey("test-hash", SqlDialect.Mssql, "v1"),
+        };
+
+        return new ReferenceLookupRequest(
+            mappingSet,
+            requestResource,
+            Enumerable
+                .Range(1, count)
+                .Select(index =>
+                    RelationalAccessTestData.CreateSchoolLookup(
+                        new ReferentialId(Guid.ParseExact($"{index:x8}000000000000000000000000", "N"))
+                    )
+                )
+                .ToArray()
+        );
+    }
+
     private sealed class NoLinkSlugResolver : IDocumentLinkSlugResolver
     {
         public DocumentLinkSlugTriple Resolve(MappingSet mappingSet, short resourceKeyId) =>
             throw new InvalidOperationException("NoLinkSlugResolver is unused in composition-surface tests.");
+    }
+
+    private sealed class StubDocumentCacheProjectionSupervisor : IDocumentCacheProjectionSupervisor
+    {
+        public System.Collections.Immutable.ImmutableArray<DocumentCacheProjectionTargetRuntimeContext> CurrentTargetContexts =>
+            [];
+
+        public Task<DocumentCacheTargetRegistrySnapshot> RefreshAsync(
+            DocumentCacheTargetRefreshReason reason,
+            CancellationToken cancellationToken = default
+        ) => throw new InvalidOperationException("Stub supervisor is unused in composition-surface tests.");
+    }
+
+    private sealed class StubDocumentCacheTargetRegistry : IDocumentCacheTargetRegistry
+    {
+        private static readonly DateTimeOffset ObservedAt = new(2026, 8, 1, 12, 0, 0, TimeSpan.Zero);
+
+        public DocumentCacheTargetRegistrySnapshot CurrentSnapshot { get; } = new([], ObservedAt);
+
+        public DocumentCacheTargetRuntimeSnapshot CurrentRuntimeSnapshot { get; } = new([], ObservedAt);
+
+        public Task<DocumentCacheTargetRegistrySnapshot> RefreshAsync(
+            DocumentCacheTargetRefreshReason reason,
+            CancellationToken cancellationToken = default
+        ) => throw new InvalidOperationException("Stub registry is unused in composition-surface tests.");
     }
 
     private sealed class StubRelationalTokenInfoEducationOrganizationLookup

@@ -3,7 +3,14 @@
 Status: Draft (planning aid derived from `reference/design/backend-redesign/epics/*`).
 
 Scope:
-- Includes all epics/stories under `reference/design/backend-redesign/epics/` (currently 16 epics, 125 story files).
+- Covers the baseline E00-E15 story inventory below plus the focused E18-E21 addenda. It
+  is not an exhaustive index of every later, deferred, spike-generated, or placeholder
+  story file now present under `reference/design/backend-redesign/epics/`.
+- Spike-generated follow-ons are excluded until this index is regenerated, unless a focused
+  addendum explicitly includes them, so a story carrying a Jira key is not necessarily
+  represented here. In particular, the DMS-1190 Stories 38-42 remain governed by
+  `10-update-tracking-change-queries/EPIC.md` § Follow-on Stories (spawned by DMS-1190),
+  which records their keys, dependencies, and the release gate.
 - Captures *implementation* dependencies implied by acceptance criteria and shared design contracts.
 - Does not attempt to define ownership, sequencing within sprints, or exact delivery dates.
 
@@ -40,6 +47,12 @@ graph TD
   E13["E13 Runtime/E2E test migration"]
   E14["E14 Authorization (deferred)"]
   E15["E15 Runtime plan compilation + caching"]
+  E16["E16 Bootstrap developer environment"]
+  E17["E17 MSSQL implementation and parity gap closure"]
+  E18["E18 DocumentCache projection"]
+  E19["E19 Relational CDC/Kafka streaming"]
+  E20["E20 Partitioned cursor paging"]
+  E21["E21 DMS storage reduction"]
 
   E00 --> E01 --> E02 --> E03 --> E04
 
@@ -50,6 +63,7 @@ graph TD
   E01 --> E05
   E02 --> E05
   E15 --> E05
+  E21 -. MappingSet probe/collation metadata .-> E05
 
   E00 --> E06
   E03 --> E06
@@ -70,12 +84,48 @@ graph TD
   E08 --> E13
   E11 --> E13
 
+  E03 --> E16
+
+  E02 --> E18
+  E08 --> E18
+  E10 --> E18
+  E11 --> E18
+
+  E16 --> E19
+  E18 --> E19
+
+  E08 --> E20
+  E10 --> E20
+  E15 --> E20
+
+  E01 --> E21
+  E02 --> E21
+  E07 --> E21
+  E09 --> E21
+  E10 --> E21
+  E15 --> E21
+
   E14
+  E17
 ```
 
 Notes:
 - `E07` and `E09` are tightly coupled in practice (write correctness requires transactional identity maintenance + propagation + deadlock retry), but are shown as a one-way dependency to keep the graph readable.
 - `E05` is optional; `E06` can select runtime-compiled mapping sets without packs.
+- `E19` connector-template and fixture work can proceed in parallel, but its integrated
+  delivery consumes the E18 projection and status outputs. Behavioral ownership is defined
+  only by the design documents linked from the two epics.
+- `E20` reuses E08 page selection/hydration and E10 live change-version filters, and extends the E15
+  plan-SQL foundations plus the plan-contract and deterministic-binding artifacts that own
+  `PageDocumentIdSqlCompiler` and `PageDocumentIdSql`, whose canonicalized/golden output must stay
+  stable. E14 row-level authorization planning is a reused upstream foundation and compatibility
+  input for `E20`, not a blocking edge. E12 benchmarks and E13 parity/E2E infrastructure are soft
+  delivery inputs.
+- `E21` is an umbrella for the storage-reduction ideas identified by DMS-1398. Only its natural-key
+  and `dms.ReferentialIdentity` removal workstream is specified locally today; that workstream
+  consumes the E01/E02 model and DDL contracts, E07/E09 write and identity behavior, E10 Change Query
+  behavior, and E15 runtime plan foundations. Add dependencies for the other DMS-1398 workstreams
+  when their Jira children are mirrored locally.
 
 ---
 
@@ -88,17 +138,60 @@ Notes:
 | E02 | [Deterministic DDL Emission](02-ddl-emission/EPIC.md) | E01 | Engine-specific DDL (pgsql/mssql) + deterministic ordering/canonicalization |
 | E03 | [Provisioning Workflow (Create-Only)](03-provisioning-workflow/EPIC.md) | E02 | CLI + provisioning guardrails; enables DB-apply and runtime validation |
 | E04 | [Verification Harness](04-verification-harness/EPIC.md) | E00–E03 | Fixture runner + determinism/snapshot/golden/DB-apply tests |
-| E05 | [Mapping Pack Generation and Consumption (Optional)](05-mpack-generation/EPIC.md) | E00–E02, E15 | `.mpack` build/validate/load; enables AOT mapping distribution |
+| E05 | [Mapping Pack Generation and Consumption (Optional)](05-mpack-generation/EPIC.md) | E00–E02, E15 (soft: E21 — align the pack payload with the compiled `MappingSet` probe/collation metadata before building) | `.mpack` build/validate/load; enables AOT mapping distribution |
 | E06 | [Runtime Schema Validation & Mapping Set Selection](06-runtime-mapping-selection/EPIC.md) | E00, E03, E15 (and E05 optional) | Per-DB fingerprint validation + mapping selection + caching; removes hot reload |
 | E07 | [Relational Write Path (POST/PUT)](07-relational-write-path/EPIC.md) | E06, E01, E02, E15 | End-to-end relational writes; includes write-side current-document reconstitution for profile projection, populates propagated reference identity columns, and relies on DB triggers for stamps/identity maintenance |
 | E08 | [Relational Read Path (GET + Query)](08-relational-read-path/EPIC.md) | E06, E01, E02 | End-to-end relational reads and reconstitution (incl. abstract+descriptor projection) |
 | E09 | [Strict Identity Maintenance & Concurrency](09-identity-concurrency/EPIC.md) | E07, E02 | Transactional referential-identity correctness + cascade/trigger propagation semantics + deadlock retry |
-| E10 | [Update Tracking + Change Queries](10-update-tracking-change-queries/EPIC.md) | E07, E08, E02 | Stored `_etag/_lastModifiedDate/ChangeVersion`, journaling triggers, change selection |
+| E10 | [Update Tracking + Change Queries](10-update-tracking-change-queries/EPIC.md) | E07, E08, E02 | Stored representation stamps, composed `_etag`, journaling triggers, change selection |
 | E11 | [Delete Path & Conflict Diagnostics](11-delete-path/EPIC.md) | E07, E02 | Delete-by-id + FK conflict mapping + diagnostics |
 | E12 | [Operational Guardrails](12-ops-guardrails/EPIC.md) | E07, E09 (and E10 recommended) | Drift prevention/repair + observability + identity-update fan-out guardrails + benchmarks |
 | E13 | [Test Strategy & Migration](13-test-migration/EPIC.md) | E03, E06–E08, E11 | E2E/integration/parity tests and docs aligned to provisioning model |
 | E14 | [Authorization Design Spike (Relational Primary Store)](14-authorization/EPIC.md) | — | Implementation-ready authorization design (implementation deferred); does not block baseline redesign |
 | E15 | [Runtime Plan Compilation + Caching (Shared)](15-plan-compilation/EPIC.md) | E01, E02 | Dialect-specific compiled plans + runtime cache used by runtime mapping selection and optional pack builders |
+| E16 | [Bootstrap DMS Developer Environment Initialization](16-bootstrap/EPIC.md) | E03 | Local/bootstrap scripts and selected data-store context consumed by CDC connector registration |
+| E17 | [Close MSSQL Implementation and Parity Gaps](17-mssql-gap-closure/EPIC.md) | — | SQL Server deployment, runtime-validation, persistence-correctness, and operational-workflow parity |
+| E18 | [`dms.DocumentCache` Projection](18-document-cache/EPIC.md) | E02, E08, E10, E11 | Projection schema, runtime, verification, utility, and operator work packages |
+| E19 | [Relational CDC/Kafka Streaming](19-cdc-kafka/EPIC.md) | E18 for supported CDC, E16 for local connector registration | Provider, connector, bootstrap, verification, E2E, and operator work packages |
+| E20 | [Partitioned Cursor Paging](20-partitioned-cursor-paging/EPIC.md) | E08, E10, E15 | ODS-compatible cursor GET-many paging, authorized partition boundaries, OpenAPI, parity, and performance evidence |
+| E21 | [DMS Storage Reduction](21-storage-reduction/EPIC.md) | E01, E02, E07, E09, E10, E15 for the known natural-key workstream | High-impact storage reductions from DMS-1398 plus natural-key resolution and `dms.ReferentialIdentity` removal |
+
+---
+
+## Focused E18/E19 Story Dependency Addendum
+
+This is the single cross-epic story dependency index. Design behavior is linked from the
+epics and is not repeated here.
+
+| `18-document-cache` story | Immediate implementation dependency |
+| --- | --- |
+| 18-00 | E02 DDL/provisioning infrastructure and E10 representation stamps |
+| 18-01 | 18-00 for integrated durable-state/trigger validation; configuration scaffolding may proceed alongside it |
+| 18-02 | 18-00, E08, and E10 |
+| 18-03 | 18-00, 18-02, E10, and E11 |
+| 18-04 | 18-00, 18-01, 18-02, and 18-03 |
+| 18-05 | 18-00 through 18-04 |
+| 18-06 | 18-00, 18-01, 18-04, and 18-05 |
+| 18-07 | 18-00 through 18-06 |
+| 18-08 | E10, queue-capable 18-00, lifecycle validation from 18-01, 18-02, administrative serialization from 18-04, and queue/status evidence from 18-06 |
+| 18-09 (recommended follow-on) | 18-01, 18-04, 18-06, and 18-07; coordinate command naming and bootstrap integration with 19-04/19-07 |
+
+| `19-cdc-kafka` story | Implementation dependency |
+| --- | --- |
+| 19-00 | 19-01, 19-02, 18-01, 18-03, 18-04, 18-06 |
+| 19-01 | 18-00 |
+| 19-02 | 19-01 and 19-03 (hard); template/rendering work may begin earlier |
+| 19-03 | —; external transform implementation consumed by 19-02 and 19-05 |
+| 19-04 | 18-01, 18-04, 18-06, plus 19-00 |
+| 19-05 | 19-01 and 19-03 (hard); 19-00 and 19-04 for broker-backed readiness; 18-02 (soft) |
+| 19-06 | 18-01, 18-04, 18-06, plus 19-00 through 19-05 |
+| 19-07 | 18-07 and completed 19-00 through 19-06 |
+
+E18-00 is the schema prerequisite for every integrated lifecycle or durable-work path.
+E18-03 owns the atomic cache-write/conditional-acknowledgement component consumed by
+E18-04 and E18-05 direct fill. E19 initial admission consumes E18-01 activation contracts
+and preflight classifications, E18-04 guarded execution and queue processing, and E18-06
+caught-up observation before the provider barrier.
 
 ---
 
@@ -260,13 +353,20 @@ Epic: `10-update-tracking-change-queries/EPIC.md`
 
 | Story | Title | Hard Depends On | Soft Depends On | Produces / Touches |
 | --- | --- | --- | --- | --- |
-| E10-S00 | [`00-token-stamping.md`](10-update-tracking-change-queries/00-token-stamping.md) | E02-S01, E07-S03 | — | Stamping triggers for `dms.Document` (Content/Identity stamps) |
+| E10-S00 | [`00-token-stamping.md`](10-update-tracking-change-queries/00-token-stamping.md) | E02-S01, E07-S03 | — | Stamping triggers for `dms.Document` content stamps |
 | E10-S01 | [`01-journaling-contract.md`](10-update-tracking-change-queries/01-journaling-contract.md) | E02-S01, E03-S01 | E10-S00 | Triggers own journal writes; integration smoke tests |
-| E10-S02 | [`02-derived-metadata.md`](10-update-tracking-change-queries/02-derived-metadata.md) | E10-S00, E08-S01 | — | Serve `_etag/_lastModifiedDate/ChangeVersion` from stored stamps |
-| E10-S03 | [`03-if-match.md`](10-update-tracking-change-queries/03-if-match.md) | E10-S02, E07-S03 | — | `If-Match` enforcement using stored `_etag` + guarded no-op stale-compare handling |
+| E10-S02 | [`02-derived-metadata.md`](10-update-tracking-change-queries/02-derived-metadata.md) | E10-S00, E08-S01 | — | Compose `_etag`; serve `_lastModifiedDate/ChangeVersion` from stored stamps |
+| E10-S03 | [`03-if-match.md`](10-update-tracking-change-queries/03-if-match.md) | E10-S02, E07-S03 | — | `If-Match` enforcement using stored representation stamps + guarded no-op stale-compare handling |
 | E10-S04 | [`04-change-query-selection.md`](10-update-tracking-change-queries/04-change-query-selection.md) | E10-S01 | — | Change Query candidate selection (journal + verify) |
 | E10-S05 | [`05-change-query-api.md`](10-update-tracking-change-queries/05-change-query-api.md) | E10-S04 | — | Optional HTTP endpoints for change queries |
 | E10-S06 | [`06-descriptor-stamping.md`](10-update-tracking-change-queries/06-descriptor-stamping.md) | E10-S00 | E07-S06 | Ensure `dms.Descriptor` updates stamp/journal descriptor documents |
+
+This baseline table intentionally stops at E10-S06. Later E10 work, including the
+DMS-1190 follow-on Stories 38-42, is not silently represented by this table. Release gates
+are also outside this implementation-dependency index; the authoritative DMS-1190
+runtime/OpenAPI release gate is recorded in
+[`10-update-tracking-change-queries/EPIC.md`](10-update-tracking-change-queries/EPIC.md)
+§ Follow-on Stories (spawned by DMS-1190).
 
 ### E11 — Delete Path & Conflict Diagnostics
 
@@ -324,6 +424,68 @@ Epic: `15-plan-compilation/EPIC.md`
 | E15-S04b | [`04b-stable-collection-merge-plans.md`](15-plan-compilation/04b-stable-collection-merge-plans.md) | E01-S11, E15-S04 | — | Stable-identity collection merge write-plan retrofit |
 | E15-S05 | [`05-read-plan-compiler-hydration.md`](15-plan-compilation/05-read-plan-compiler-hydration.md) | E15-S03 | — | Full hydration read plans (`SelectByKeysetSql`) for all tables |
 | E15-S06 | [`06-projection-plan-compilers.md`](15-plan-compilation/06-projection-plan-compilers.md) | E15-S05 | E15-S04, E15-S04b | Projection plans (reference identity + descriptor URI) |
+
+### E20 — Partitioned Cursor Paging
+
+Epic: `20-partitioned-cursor-paging/EPIC.md`
+
+The eleven work packages are filed as `DMS-1348` children `DMS-1383` through `DMS-1393`, and each
+file's frontmatter carries its own key. They are the result of consolidation during design: typed
+path operations, provider cursor SQL, and descriptor cursor execution were each folded into a
+sibling package, and a separate ODS reference-deployment package was dropped in favor of the static
+comparison cases owned by DMS-1390. The file-name number prefixes are left at their
+pre-consolidation values and carry no meaning beyond ordering.
+
+DMS-1383 owns the typed contracts, codec, and configuration that DMS-1384's validators consume.
+DMS-1391 independently owns the harness and a traditional baseline captured from an identified
+pre-change commit. DMS-1385 keeps traditional page-selection output behaviorally and textually
+unchanged so that DMS-1392 can use that baseline as regression evidence, but DMS-1391 does not gate
+DMS-1385. DMS-1387 boundary-compiler and SQL-golden work requires DMS-1383 through DMS-1385, while
+route activation additionally requires DMS-1386. DMS-1392 is a separate final gate that consumes
+DMS-1385 through DMS-1391, and DMS-1393 owns independently sequenced production telemetry; the graph
+remains acyclic.
+
+| Story | Title | Hard Depends On | Soft Depends On | Produces / Touches |
+| --- | --- | --- | --- | --- |
+| DMS-1383 | [`00a-cursor-contract-primitives.md`](20-partitioned-cursor-paging/00a-cursor-contract-primitives.md) | — | E08-S04, E08-S05, E10, E14, E15-S01, E15-S02 | Typed paging/range contracts, token codec, result-boundary shapes, configuration |
+| DMS-1384 | [`00b-cursor-and-partition-validation.md`](20-partitioned-cursor-paging/00b-cursor-and-partition-validation.md) | DMS-1383 | E08-S04, E08-S05, E10 | Cursor precedence validation, partition validation, ProblemDetails shell, operation-scoped rejection, typed path operations, query canonicalization |
+| DMS-1385 | [`02-shared-candidate-planning.md`](20-partitioned-cursor-paging/02-shared-candidate-planning.md) | DMS-1383 | E08-S04, E08-S05, E10, E14, E15-S01, E15-S02 | Extended shared page-document-id plan, Core filter sharing, uniqueness assertion, and PostgreSQL/SQL Server cursor SQL goldens |
+| DMS-1386 | [`04-regular-resource-cursor-execution.md`](20-partitioned-cursor-paging/04-regular-resource-cursor-execution.md) | DMS-1383, DMS-1384, DMS-1385 | E08-S00, E08-S04, E08-S05 | Regular-resource and descriptor keyset boundary propagation and the shared response header |
+| DMS-1387 | [`06-partition-pipeline-and-sql.md`](20-partitioned-cursor-paging/06-partition-pipeline-and-sql.md) | DMS-1383, DMS-1384, DMS-1385, plus DMS-1386 for route activation | — | Typed `/partitions` route, dedicated Core partition pipeline, `IPartitionQueryHandler` backend contract, provider boundary CTEs, and typed inclusive ranges |
+| DMS-1388 | [`07-openapi-and-client-contract.md`](20-partitioned-cursor-paging/07-openapi-and-client-contract.md) | DMS-1383, DMS-1386, DMS-1387 | — | Runtime-gated cursor metadata and resource/extension/descriptor/profile partition OpenAPI augmentation plus a separable client-docs slice |
+| DMS-1389 | [`08a-authorization-matrix.md`](20-partitioned-cursor-paging/08a-authorization-matrix.md) | DMS-1386, DMS-1387 | E14, E15 | Cross-strategy accessible-set agreement and forged-range negative cases |
+| DMS-1390 | [`08b-public-contract-parity-and-e2e.md`](20-partitioned-cursor-paging/08b-public-contract-parity-and-e2e.md) | DMS-1386, DMS-1387, DMS-1388 | DMS-1389 | Public contract coverage, static ODS-comparison cases, approved-difference enforcement, and E2E evidence |
+| DMS-1391 | [`09-performance-harness-and-baseline.md`](20-partitioned-cursor-paging/09-performance-harness-and-baseline.md) | — | E12, E13 | Cross-provider harness and three-scenario pre-change traditional baseline |
+| DMS-1392 | [`10-performance-and-observability-final-gate.md`](20-partitioned-cursor-paging/10-performance-and-observability-final-gate.md) | DMS-1385–DMS-1391 | E12, E13 | Narrow reused fixture set, final matrix, plans, and thresholds |
+| DMS-1393 | [`12-bounded-cursor-and-partition-telemetry.md`](20-partitioned-cursor-paging/12-bounded-cursor-and-partition-telemetry.md) | DMS-1386, DMS-1387 | E12 | Bounded production paging/partition telemetry and privacy tests |
+
+### E21 — DMS Storage Reduction
+
+Epic: `21-storage-reduction/EPIC.md`
+
+DMS-1402 is the umbrella for the high-impact storage-reduction work identified by DMS-1398. The
+natural-key/`dms.ReferentialIdentity` removal workstream is filed as DMS-1443 through DMS-1456 and
+mirrored under [`21-storage-reduction/`](21-storage-reduction/). The E21 epic retains T1–T14 as
+stable rollout aliases and records the complete graph. Jira carries the same direct `blocks` links.
+The other DMS-1398 implementation stories have not yet been mirrored locally, so this index does not
+invent identifiers or dependency edges for them.
+
+| Jira | Story file | Direct prerequisites | Scope |
+|---|---|---|---|
+| DMS-1443 | [`01-sql-server-identity-collation-contract.md`](21-storage-reduction/01-sql-server-identity-collation-contract.md) | — | SQL Server identity collation and runtime equality contract |
+| DMS-1444 | [`02-document-resource-invariant-and-abstract-resource-key.md`](21-storage-reduction/02-document-resource-invariant-and-abstract-resource-key.md) | DMS-1443 | Document/resource invariant and abstract `ResourceKeyId` |
+| DMS-1445 | [`03-natural-key-probe-metadata.md`](21-storage-reduction/03-natural-key-probe-metadata.md) | DMS-1444 | Compiled natural-key probe metadata |
+| DMS-1446 | [`04-probe-based-duplicate-identity-and-constraint-diagnostics.md`](21-storage-reduction/04-probe-based-duplicate-identity-and-constraint-diagnostics.md) | DMS-1445 | Probe-based duplicate-identity and constraint diagnostics |
+| DMS-1447 | [`05-postgresql-17-and-descriptor-collation-upgrade.md`](21-storage-reduction/05-postgresql-17-and-descriptor-collation-upgrade.md) | — | PostgreSQL floor and descriptor-collation upgrade contract |
+| DMS-1448 | [`06-descriptor-validation-index-and-fk-foundations.md`](21-storage-reduction/06-descriptor-validation-index-and-fk-foundations.md) | DMS-1443, DMS-1444, DMS-1447 | Descriptor validation, index, and FK foundations |
+| DMS-1449 | [`07-natural-key-sql-builders-and-cardinality-contracts.md`](21-storage-reduction/07-natural-key-sql-builders-and-cardinality-contracts.md) | DMS-1445, DMS-1448 | Natural-key SQL builders and cardinality contracts |
+| DMS-1450 | [`08-natural-key-resolver-internal-seam.md`](21-storage-reduction/08-natural-key-resolver-internal-seam.md) | DMS-1449 | Natural-key resolver behind an internal seam |
+| DMS-1451 | [`09-natural-key-resolver-and-core-contract-cutover.md`](21-storage-reduction/09-natural-key-resolver-and-core-contract-cutover.md) | DMS-1446, DMS-1450 | Resolver, Core contract, and raw descriptor URI cutover |
+| DMS-1452 | [`10-post-upsert-natural-key-cutover-and-stored-identity-rebind.md`](21-storage-reduction/10-post-upsert-natural-key-cutover-and-stored-identity-rebind.md) | DMS-1451 | POST upsert cutover and SQL Server stored-identity rebind |
+| DMS-1453 | [`11-collection-duplicate-detection-and-conflict-fallback.md`](21-storage-reduction/11-collection-duplicate-detection-and-conflict-fallback.md) | DMS-1451 | Extended collection duplicate detection and generic conflict fallback |
+| DMS-1454 | [`12-descriptor-write-cutover-and-uuidv5-cleanup.md`](21-storage-reduction/12-descriptor-write-cutover-and-uuidv5-cleanup.md) | DMS-1452, DMS-1453 | Descriptor write cutover and Core UUIDv5 cleanup |
+| DMS-1455 | [`13-change-query-descriptor-identity-cutover.md`](21-storage-reduction/13-change-query-descriptor-identity-cutover.md) | DMS-1445, DMS-1448, DMS-1454 | Change Query descriptor identity cutover |
+| DMS-1456 | [`14-remove-referential-identity-infrastructure.md`](21-storage-reduction/14-remove-referential-identity-infrastructure.md) | DMS-1454, DMS-1455 | Final ReferentialIdentity removal |
 
 ---
 

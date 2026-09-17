@@ -48,12 +48,20 @@ internal class DeleteByIdHandler(ILogger _logger, ResiliencePipeline _resilience
                     )
                     {
                         AuthorizationContext = RelationalAuthorizationContext.Create(
-                            requestInfo.ClientAuthorizations
+                            requestInfo.ClientAuthorizations,
+                            requestInfo.ApplicationContext?.CreatorOwnershipTokenId,
+                            requestInfo.ApplicationContext?.OwnershipTokenIds
                         ),
                         AuthorizationStrategyEvaluators = requestInfo.AuthorizationStrategyEvaluators,
                     }
                 ),
-            requestInfo
+            requestInfo,
+            // A delete is a write, so the resilience context must not be abandonable: a delete
+            // abandoned mid-retry can leave the document in place while the client believes it is
+            // gone. Passed explicitly rather than relying on the default, matching UpsertHandler and
+            // UpdateByIdHandler, so all three write handlers keep the durability choice visible at
+            // the call site and none of them changes behaviour if that default is ever flipped.
+            CancellationToken.None
         );
         _logger.LogDebug(
             "Document store DeleteDocumentById returned {DeleteResult}- {TraceId}",
@@ -92,6 +100,24 @@ internal class DeleteByIdHandler(ILogger _logger, ResiliencePipeline _resilience
                 Headers: [],
                 ContentType: "application/problem+json"
             ),
+            DeleteFailureCustomViewNotAuthorized notAuthorized => new FrontendResponse(
+                StatusCode: 403,
+                Body: CustomViewAuthorizationFailureResponse.ForFailure(
+                    notAuthorized.CustomViewFailure,
+                    requestInfo.FrontendRequest.TraceId
+                ),
+                Headers: [],
+                ContentType: "application/problem+json"
+            ),
+            DeleteFailureOwnershipNotAuthorized notAuthorized => new FrontendResponse(
+                StatusCode: 403,
+                Body: OwnershipAuthorizationFailureResponse.ForFailure(
+                    notAuthorized.OwnershipFailure,
+                    requestInfo.FrontendRequest.TraceId
+                ),
+                Headers: [],
+                ContentType: "application/problem+json"
+            ),
             DeleteFailureNotImplemented failure => new FrontendResponse(
                 StatusCode: 501,
                 Body: ToJsonError(failure.FailureMessage, requestInfo.FrontendRequest.TraceId),
@@ -116,17 +142,18 @@ internal class DeleteByIdHandler(ILogger _logger, ResiliencePipeline _resilience
             DeleteFailureWriteConflict => new FrontendResponse(
                 StatusCode: 500,
                 Body: FailureResponse.ForSystemError(requestInfo.FrontendRequest.TraceId),
-                Headers: []
+                Headers: [],
+                ContentType: "application/problem+json"
             ),
             DeleteFailureETagMisMatch mismatch => new FrontendResponse(
                 StatusCode: 412,
                 Body: FailureResponse.ForETagMisMatch(mismatch.Reason, requestInfo.FrontendRequest.TraceId),
                 Headers: []
             ),
-            UnknownFailure failure => new(
-                StatusCode: 500,
-                Body: ToJsonError(failure.FailureMessage, requestInfo.FrontendRequest.TraceId),
-                Headers: []
+            UnknownFailure failure => CreateUnknownFailureResponse(
+                _logger,
+                requestInfo,
+                failure.FailureMessage
             ),
             _ => new(
                 StatusCode: 500,

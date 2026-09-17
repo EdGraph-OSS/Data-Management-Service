@@ -21,7 +21,15 @@ param(
     # other phases. The Configuration Service uses the selected engine and shares the DMS
     # database in the default local topology.
     [ValidateSet("postgresql", "mssql")]
-    [string]$DatabaseEngine = "postgresql"
+    [string]$DatabaseEngine = "postgresql",
+
+    # Declares that the stack this phase configures was started with -SeparateConfigDatabase, so
+    # the Configuration Service owns the dedicated edfi_configurationservice database and the DMS
+    # datastore registered below must not land in it. Topology is DECLARED, never inferred from a
+    # database-name spelling: pass the same switch the start invocation used. The start script's
+    # -InfraOnly guidance prints it for you when it applies. Omit it for the default shared
+    # topology, where the datastore and the Configuration Service share one database by design.
+    [Switch]$SeparateConfigDatabase
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,6 +37,11 @@ Set-StrictMode -Version Latest
 
 Import-Module "$PSScriptRoot/bootstrap-manifest.psm1" -Force -Global
 Import-Module "$PSScriptRoot/env-utility.psm1" -Force -Global
+# Shared Compose-equivalent resolver: env reads below honour Docker Compose interpolation
+# precedence (an ambient process/shell value wins over the env file, ${VAR} references are
+# followed, single-quoted values stay literal), so the data store registered in CMS carries
+# exactly the credentials, names, and tenant the running containers received.
+Import-Module "$PSScriptRoot/database-safety.psm1" -Force
 Import-Module "$PSScriptRoot/../Dms-Management.psm1" -Force
 
 if (-not (Get-Command Format-LogSafeText -ErrorAction SilentlyContinue)) {
@@ -75,7 +88,9 @@ function Get-EnvValueOrDefault {
         $DefaultValue = ""
     )
 
-    return Get-EnvValue -EnvValues $EnvValues -Name $Name -DefaultValue $DefaultValue
+    # Compose-equivalent read: the process/shell environment wins over the env file, matching the
+    # values Docker Compose interpolates into the running containers.
+    return Get-ComposeResolvedEnvValue -EnvironmentValues $EnvValues -Name $Name -DefaultValue $DefaultValue
 }
 
 function Get-DataStoreContexts {
@@ -138,7 +153,7 @@ function Resolve-CmsReadOnlyAccessFromEnv {
     .SYNOPSIS
     Builds the optional CMSReadOnlyAccess block included in the configure result. Returns
     $null when none of CONFIG_SERVICE_CLIENT_ID, CONFIG_SERVICE_CLIENT_SCOPE, or
-    CONFIG_SERVICE_CLIENT_SECRET are explicitly present in the env file. Per
+    CONFIG_SERVICE_CLIENT_SECRET are present in the effective environment. Per
     command-boundaries.md Section 3.4, "may include" means "include when actually populated"; a
     default-derived client id alone does not satisfy that contract. The client id/scope/secret
     come from the local environment file (start-local-dms.ps1's provider-specific local
@@ -170,16 +185,17 @@ function Resolve-CmsReadOnlyAccessFromEnv {
 function Test-CmsReadOnlyAccessEnvPresent {
     <#
     .SYNOPSIS
-    Returns $true when the env file explicitly supplies at least one of the three
-    CONFIG_SERVICE_CLIENT_* keys with a non-blank value. Used to gate the optional
-    CMSReadOnlyAccess block so defaults alone do not advertise the block as available.
+    Returns $true when the effective environment (env file or ambient process environment, with
+    Compose precedence) supplies at least one of the three CONFIG_SERVICE_CLIENT_* keys with a
+    non-blank value. Used to gate the optional CMSReadOnlyAccess block so defaults alone do not
+    advertise the block as available.
     #>
     param(
         [hashtable]$EnvValues
     )
 
     foreach ($name in @("CONFIG_SERVICE_CLIENT_ID", "CONFIG_SERVICE_CLIENT_SCOPE", "CONFIG_SERVICE_CLIENT_SECRET")) {
-        if ($EnvValues.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace([string]$EnvValues[$name])) {
+        if (-not [string]::IsNullOrWhiteSpace((Get-ComposeResolvedEnvValue -EnvironmentValues $EnvValues -Name $name))) {
             return $true
         }
     }
@@ -259,7 +275,10 @@ function Invoke-ConfigureLocalDataStore {
 
         [ValidateSet("postgresql", "mssql")]
         [string]
-        $DatabaseEngine = "postgresql"
+        $DatabaseEngine = "postgresql",
+
+        [Switch]
+        $SeparateConfigDatabase
     )
 
     $resolvedEnvironmentFile = Resolve-ConfigureEnvironmentFile -Path $EnvironmentFile
@@ -269,6 +288,21 @@ function Invoke-ConfigureLocalDataStore {
     # composed via DMS_DATASTORE=mssql and returns the file unchanged, avoiding a
     # derived-of-derived file).
     $resolvedEnvironmentFile = Resolve-DatabaseEngineEnvironmentFile -DatabaseEngine $DatabaseEngine -BaseEnvironmentFile $resolvedEnvironmentFile -DockerComposeRoot $PSScriptRoot
+    if ($SeparateConfigDatabase) {
+        # The separate-topology continuation runs against the operator's ORIGINAL -EnvironmentFile,
+        # whose topology marker and CMS seam belong to the derived file the start phase wrote - not
+        # to the file in hand. Re-running the start scripts' own second composition step, in the
+        # same order and after the same engine overlay, reproduces that same derived artifact
+        # (a deterministic .derived/<name>.topology path, recomputed idempotently from the switch),
+        # so the datastore guard below asks the live authority about the environment the running
+        # stack actually received. Shared mode never calls this, so its effective file - and every
+        # value read from it - is unchanged.
+        $resolvedEnvironmentFile = Resolve-CmsDatabaseTopologyEnvironmentFile `
+            -BaseEnvironmentFile $resolvedEnvironmentFile `
+            -DatabaseEngine $DatabaseEngine `
+            -SeparateConfigDatabase `
+            -DockerComposeRoot $PSScriptRoot
+    }
     $envValues = ReadValuesFromEnvFile -EnvironmentFile $resolvedEnvironmentFile
     $cmsUrl = Resolve-CmsBaseUrl -EnvValues $envValues
     $tenant = Get-EnvValueOrDefault -EnvValues $envValues -Name "CONFIG_SERVICE_TENANT"
@@ -283,34 +317,9 @@ function Invoke-ConfigureLocalDataStore {
         throw "Parameter -SchoolYearRange requires CONFIG_SERVICE_TENANT to be set in the environment file when DMS_CONFIG_MULTI_TENANCY=true."
     }
 
-    # DMS-1151: bootstrap admin token acquisition. Add-CmsClient is idempotent (existing
-    # client ids return a warning and continue) and is the only documented /connect/register
-    # side effect for the configure/provision phases. Client id/secret are resolved through
-    # the shared -EnvironmentFile helper so this phase and provision-dms-schema.ps1 agree on
-    # the admin client (DMS_BOOTSTRAP_ADMIN_CLIENT_ID / DMS_BOOTSTRAP_ADMIN_CLIENT_SECRET).
-    $bootstrapAdmin = Resolve-BootstrapAdminClient -EnvValues $envValues
-    Write-Information "Acquiring CMS bootstrap admin token for data store configuration." -InformationAction Continue
-    Add-CmsClient `
-        -CmsUrl $cmsUrl `
-        -ClientId $bootstrapAdmin.ClientId `
-        -ClientSecret $bootstrapAdmin.ClientSecret `
-        -DisplayName "Data Store Setup Administrator"
-
-    $configToken = Get-CmsToken `
-        -CmsUrl $cmsUrl `
-        -ClientId $bootstrapAdmin.ClientId `
-        -ClientSecret $bootstrapAdmin.ClientSecret
-
-    if ($multiTenancyEnabled -and -not [string]::IsNullOrWhiteSpace($tenant)) {
-        Write-Information "Ensuring local CMS tenant exists: $(Format-LogSafeText $tenant)." -InformationAction Continue
-        try {
-            Add-Tenant -CmsUrl $cmsUrl -AccessToken $configToken -TenantName $tenant | Out-Null
-        }
-        catch {
-            Write-Warning "Tenant creation was skipped or already satisfied for '$(Format-LogSafeText $tenant)'. $(Format-LogSafeText ($_.Exception.Message))"
-        }
-    }
-
+    # Datastore values are resolved BEFORE any CMS call, not just before the registration that
+    # consumes them: the separate-topology guard below judges the exact name this run will
+    # register, and it has to be able to refuse while CMS is still untouched.
     $postgresPassword = Get-EnvValueOrDefault -EnvValues $envValues -Name "POSTGRES_PASSWORD"
     $postgresDbName =
         if ([string]::IsNullOrWhiteSpace($DataStoreDatabaseName)) {
@@ -347,6 +356,92 @@ function Invoke-ConfigureLocalDataStore {
             -DatabaseName $mssqlDbName
     }
 
+    # Separate-topology guard for the manual configure phase. This phase registers the DMS
+    # datastore AFTER the start phase's live topology check has already run, so without a check
+    # here the documented `-InfraOnly -SeparateConfigDatabase` continuation can point the datastore
+    # at the dedicated Configuration Service database, and later provisioning deploys the DMS
+    # schema into it. It runs after the parameter-shape rules above - an invalid shape must keep
+    # reporting its own established diagnostic - and before Add-CmsClient, so a refused run leaves
+    # no CMS state behind at all: no bootstrap admin client, no tenant, no data store.
+    #
+    # Gated on a registration actually happening, because that is the limit of what this phase can
+    # judge - NOT because the other shape is harmless. -NoDataStore selects an EXISTING data store
+    # and registers no name, so the candidate resolved above is not what provisioning will target:
+    # the selected record's own STORED connection string is, and this phase never sees it decrypted.
+    # Judging the candidate here would be false assurance, so the reused target is judged where it
+    # first exists - provision-dms-schema.ps1's -SeparateConfigDatabase guard, in front of
+    # SchemaTools. -SchoolYearRange, by contrast, IS judged here: Add-DmsSchoolYearInstances forwards
+    # this same resolved name and connection string verbatim to every per-year Add-DataStore - only
+    # the data store's display name and route context carry the year - so the single candidate
+    # resolved above is exactly what every year registers.
+    if ($SeparateConfigDatabase -and -not $NoDataStore) {
+        if ($DatabaseEngine -eq "mssql") {
+            # SQL Server renders no offline verdict: database names inherit the INSTANCE collation
+            # and the equivalence class differs between instances, so the running server - already
+            # up by this phase - is asked, through the same authority both start scripts use and
+            # against the effective file resolved above. The registered candidate travels as the
+            # value a provider RECEIVES (Get-RegisteredDatastoreDatabaseValue), never the raw
+            # parameter text, and only when an explicit override supplies it: with no override the
+            # registered name IS the effective MSSQL_DB_NAME, which the authority resolves and
+            # checks itself, reporting it under that key rather than under a parameter this run
+            # never received.
+            $registeredDatastoreDatabaseValue = ""
+            if (-not [string]::IsNullOrWhiteSpace($DataStoreDatabaseName)) {
+                $registeredDatastoreDatabaseValue = Get-RegisteredDatastoreDatabaseValue -DatastoreDatabaseName $DataStoreDatabaseName
+            }
+            Assert-MssqlTopologyPhysicalConsistency `
+                -EnvironmentFile $resolvedEnvironmentFile `
+                -ContainerName "dms-mssql" `
+                -SaPassword $mssqlPassword `
+                -RegisteredDatastoreDatabaseName $registeredDatastoreDatabaseValue
+        }
+        else {
+            # PostgreSQL's registration transport does have a sound offline verdict, and its own
+            # predicate already models it: the name is serialized into the datastore connection
+            # string, parsed back by the provider, and created with a QUOTED identifier, so only a
+            # name that parses back AS the reserved name collides. This is the predicate the
+            # published start script's fail-fast boundary uses - deliberately not the rule that
+            # governs POSTGRES_DB_NAME's own initialization path, where postgresql-init.sh hands the
+            # name to createdb and only the exact reserved literal collides. The two now agree except
+            # for a bare trailing line feed, which this transport can collapse and createdb preserves.
+            if (Test-RegisteredDatastoreNameCollidesWithReservedCmsDatabase -DatabaseEngine "postgresql" -DatastoreDatabaseName $postgresDbName) {
+                $datastoreNameSource =
+                    if ([string]::IsNullOrWhiteSpace($DataStoreDatabaseName)) { "POSTGRES_DB_NAME" }
+                    else { "-DataStoreDatabaseName" }
+                # Names the source key and the reserved literal only - never the caller's own value.
+                throw "The DMS datastore database name resolved from '$datastoreNameSource' must be provably distinct from 'edfi_configurationservice' with -SeparateConfigDatabase: that is the dedicated Configuration Service database, and registering the datastore against it would reintroduce the shared topology the switch opts out of. On PostgreSQL the name is compared as the provider parses it - SchemaTools creates it with a quoted identifier, so nothing folds; only a name that parses back to that reserved name collides, and the measured non-exact case is a trailing line feed, which connection-string parsing removes. The resolved value is withheld."
+            }
+        }
+    }
+
+    # DMS-1151: bootstrap admin token acquisition. Add-CmsClient is idempotent (existing
+    # client ids return a warning and continue) and is the only documented /connect/register
+    # side effect for the configure/provision phases. Client id/secret are resolved through
+    # the shared -EnvironmentFile helper so this phase and provision-dms-schema.ps1 agree on
+    # the admin client (DMS_BOOTSTRAP_ADMIN_CLIENT_ID / DMS_BOOTSTRAP_ADMIN_CLIENT_SECRET).
+    $bootstrapAdmin = Resolve-BootstrapAdminClient -EnvValues $envValues
+    Write-Information "Acquiring CMS bootstrap admin token for data store configuration." -InformationAction Continue
+    Add-CmsClient `
+        -CmsUrl $cmsUrl `
+        -ClientId $bootstrapAdmin.ClientId `
+        -ClientSecret $bootstrapAdmin.ClientSecret `
+        -DisplayName "Data Store Setup Administrator"
+
+    $configToken = Get-CmsToken `
+        -CmsUrl $cmsUrl `
+        -ClientId $bootstrapAdmin.ClientId `
+        -ClientSecret $bootstrapAdmin.ClientSecret
+
+    if ($multiTenancyEnabled -and -not [string]::IsNullOrWhiteSpace($tenant)) {
+        Write-Information "Ensuring local CMS tenant exists: $(Format-LogSafeText $tenant)." -InformationAction Continue
+        try {
+            Add-Tenant -CmsUrl $cmsUrl -AccessToken $configToken -TenantName $tenant | Out-Null
+        }
+        catch {
+            Write-Warning "Tenant creation was skipped or already satisfied for '$(Format-LogSafeText $tenant)'. $(Format-LogSafeText ($_.Exception.Message))"
+        }
+    }
+
     if ($NoDataStore) {
         Write-Information "Selecting existing route-unqualified data store from CMS." -InformationAction Continue
         $dataStores = @(Get-DataStore -CmsUrl $cmsUrl -AccessToken $configToken -Tenant $tenant)
@@ -374,6 +469,7 @@ function Invoke-ConfigureLocalDataStore {
             -PostgresCredential $postgresCredential `
             -PostgresDbName $postgresDbName `
             -ConnectionString $dataStoreConnectionString `
+            -DatabaseEngine $DatabaseEngine `
             -Tenant $tenant
 
         $dataStoreIds = @($dataStores | ForEach-Object { [long]$_.DataStoreId })
@@ -409,6 +505,7 @@ function Invoke-ConfigureLocalDataStore {
         -PostgresCredential $postgresCredential `
         -PostgresDbName $postgresDbName `
         -ConnectionString $dataStoreConnectionString `
+        -DatabaseEngine $DatabaseEngine `
         -Name "Local Development Data Store" `
         -DataStoreType "Development" `
         -Tenant $tenant
@@ -434,4 +531,5 @@ Invoke-ConfigureLocalDataStore `
     -SchoolYearRange $SchoolYearRange `
     -DataStoreDatabaseName $DataStoreDatabaseName `
     -AddSmokeTestCredentials:$AddSmokeTestCredentials `
-    -DatabaseEngine $DatabaseEngine
+    -DatabaseEngine $DatabaseEngine `
+    -SeparateConfigDatabase:$SeparateConfigDatabase

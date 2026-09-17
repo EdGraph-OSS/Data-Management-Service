@@ -20,6 +20,7 @@ using EdFi.DataManagementService.Core.Validation;
 using FakeItEasy;
 using FluentAssertions;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -117,7 +118,7 @@ public class ParsePathMiddlewareTests
         services.AddTransient<ResolveDataStoreMiddleware>();
 
         var dataStoreProvider = A.Fake<IDataStoreProvider>();
-        A.CallTo(() => dataStoreProvider.RefreshInstancesIfExpiredAsync(A<string?>._))
+        A.CallTo(() => dataStoreProvider.RefreshInstancesIfExpiredAsync(A<string?>._, A<CancellationToken>._))
             .Returns(Task.CompletedTask);
         A.CallTo(() => dataStoreProvider.GetById(1, A<string?>.Ignored))
             .Returns(
@@ -142,6 +143,8 @@ public class ParsePathMiddlewareTests
 
         services.AddSingleton(appSettingsOptions);
         services.AddSingleton(fingerprintReader);
+        services.TryAddSingleton(TimeProvider.System);
+        services.TryAddSingleton(new CacheSettings());
         services.AddSingleton<DatabaseFingerprintProvider>();
         services.AddTransient<ValidateDatabaseFingerprintMiddleware>();
         services.AddTransient<ILogger<ValidateDatabaseFingerprintMiddleware>>(_ =>
@@ -150,6 +153,7 @@ public class ParsePathMiddlewareTests
 
         TestHelper.AddResourceKeyValidationServices(services);
         TestHelper.AddMappingSetResolutionServices(services);
+        TestHelper.AddCollectionPagingTelemetry(services);
 
         services.AddSingleton<IProfileService>(A.Fake<IProfileService>());
         services.AddTransient<ProfileResolutionMiddleware>();
@@ -176,7 +180,8 @@ public class ParsePathMiddlewareTests
             serviceProvider.GetRequiredService<IServiceScopeFactory>(),
             A.Fake<CachedClaimSetProvider>(),
             A.Fake<IResourceDependencyGraphMLFactory>(),
-            A.Fake<IProfileService>()
+            A.Fake<IProfileService>(),
+            new CircuitBreakerSettings()
         );
     }
 
@@ -313,7 +318,7 @@ public class ParsePathMiddlewareTests
 
             _requestInfo?.PathComponents.ProjectEndpointName.Value.Should().Be("ed-fi");
             _requestInfo?.PathComponents.EndpointName.Value.Should().Be("endpointName");
-            _requestInfo?.PathComponents.HasDocumentUuidSegment.Should().BeFalse();
+            _requestInfo?.PathComponents.Operation.Should().BeOfType<ResourcePathOperation.Collection>();
         }
     }
 
@@ -354,7 +359,7 @@ public class ParsePathMiddlewareTests
             _requestInfo?.PathComponents.ProjectEndpointName.Value.Should().Be("ed-fi");
             _requestInfo?.PathComponents.EndpointName.Value.Should().Be("endpointName");
             _requestInfo?.PathComponents.DocumentUuid.Value.Should().Be(documentUuid);
-            _requestInfo?.PathComponents.HasDocumentUuidSegment.Should().BeTrue();
+            _requestInfo?.PathComponents.Operation.Should().BeOfType<ResourcePathOperation.ById>();
         }
     }
 
@@ -405,6 +410,54 @@ public class ParsePathMiddlewareTests
 
     [TestFixture]
     [Parallelizable]
+    public class Given_A_Path_Naming_The_Partitions_Operation : ParsePathMiddlewareTests
+    {
+        [TestCase("partitions")]
+        [TestCase("PARTITIONS")]
+        [TestCase("Partitions")]
+        public async Task It_records_the_partitions_operation_and_continues(string segment)
+        {
+            FrontendRequest frontendRequest = new(
+                Body: "{}",
+                Form: null,
+                Headers: [],
+                Path: $"/ed-fi/endpointName/{segment}",
+                QueryParameters: [],
+                TraceId: new TraceId(""),
+                RouteQualifiers: []
+            );
+            RequestInfo requestInfo = new(frontendRequest, RequestMethod.GET, No.ServiceProvider);
+            var reachedNext = false;
+
+            await Middleware()
+                .Execute(
+                    requestInfo,
+                    () =>
+                    {
+                        reachedNext = true;
+                        return Task.CompletedTask;
+                    }
+                );
+
+            requestInfo.PathComponents.Operation.Should().BeOfType<ResourcePathOperation.Partitions>();
+            requestInfo.PathComponents.EndpointName.Value.Should().Be("endpointName");
+            reachedNext
+                .Should()
+                .BeTrue(
+                    "a recognized partitions operation continues into the pipeline dispatch selected "
+                        + "for it rather than being answered here"
+                );
+            requestInfo
+                .FrontendResponse.Should()
+                .Be(
+                    No.FrontendResponse,
+                    "the invalid-identifier response is reserved for an unrecognized third segment"
+                );
+        }
+    }
+
+    [TestFixture]
+    [Parallelizable]
     public class Given_A_Post_With_ResourceId : ParsePathMiddlewareTests
     {
         private RequestInfo _requestInfo = No.RequestInfo();
@@ -434,7 +487,7 @@ public class ParsePathMiddlewareTests
         [Test]
         public void It_marks_the_path_as_an_item_route()
         {
-            _requestInfo.PathComponents.HasDocumentUuidSegment.Should().BeTrue();
+            _requestInfo.PathComponents.Operation.Should().BeOfType<ResourcePathOperation.ById>();
         }
     }
 
@@ -469,7 +522,7 @@ public class ParsePathMiddlewareTests
         [Test]
         public void It_marks_the_path_as_a_collection_route()
         {
-            _requestInfo.PathComponents.HasDocumentUuidSegment.Should().BeFalse();
+            _requestInfo.PathComponents.Operation.Should().BeOfType<ResourcePathOperation.Collection>();
         }
     }
 
@@ -504,7 +557,7 @@ public class ParsePathMiddlewareTests
         [Test]
         public void It_marks_the_path_as_a_collection_route()
         {
-            _requestInfo.PathComponents.HasDocumentUuidSegment.Should().BeFalse();
+            _requestInfo.PathComponents.Operation.Should().BeOfType<ResourcePathOperation.Collection>();
         }
     }
 
@@ -535,7 +588,8 @@ public class ParsePathMiddlewareTests
         [Test]
         public void It_does_not_read_the_database_fingerprint()
         {
-            A.CallTo(() => _fingerprintReader.ReadFingerprintAsync(A<string>._)).MustNotHaveHappened();
+            A.CallTo(() => _fingerprintReader.ReadFingerprintAsync(A<EffectiveDataStoreTarget>._))
+                .MustNotHaveHappened();
         }
     }
 
@@ -566,7 +620,8 @@ public class ParsePathMiddlewareTests
         [Test]
         public void It_does_not_read_the_database_fingerprint()
         {
-            A.CallTo(() => _fingerprintReader.ReadFingerprintAsync(A<string>._)).MustNotHaveHappened();
+            A.CallTo(() => _fingerprintReader.ReadFingerprintAsync(A<EffectiveDataStoreTarget>._))
+                .MustNotHaveHappened();
         }
     }
 }

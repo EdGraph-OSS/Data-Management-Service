@@ -686,7 +686,9 @@ public sealed record DocumentReferenceBinding(
     DbTableName Table,
     DbColumnName FkColumn,
     QualifiedResourceName TargetResource,
-    IReadOnlyList<ReferenceIdentityBinding> IdentityBindings
+    IReadOnlyList<ReferenceIdentityBinding> IdentityBindings,
+    bool IsRequired = false,
+    bool IsRoleNamed = false
 );
 
 /// <summary>
@@ -726,12 +728,16 @@ public sealed record ReferenceIdentityBinding
 /// <param name="Table">The table that stores the descriptor FK column.</param>
 /// <param name="FkColumn">The descriptor FK column name.</param>
 /// <param name="DescriptorResource">The descriptor resource type expected at this path.</param>
+/// <param name="IsRequired">Indicates whether the descriptor path is required by the API schema.</param>
+/// <param name="IsRoleNamed">Indicates whether this descriptor is reached through a role-named reference mapping.</param>
 public sealed record DescriptorEdgeSource(
     bool IsIdentityComponent,
     JsonPathExpression DescriptorValuePath,
     DbTableName Table,
     DbColumnName FkColumn,
-    QualifiedResourceName DescriptorResource
+    QualifiedResourceName DescriptorResource,
+    bool IsRequired = false,
+    bool IsRoleNamed = false
 );
 
 /// <summary>
@@ -840,6 +846,13 @@ public enum TrackedChangeSystemColumnRole
     /// <c>ChangeVersion</c> — the bumped <c>dms.Document.ContentVersion</c> at the tracked event.
     /// </summary>
     ChangeVersion,
+
+    /// <summary>
+    /// <c>DocumentId</c> — the tracked document's <c>dms.Document.DocumentId</c>, read from the row being
+    /// deleted or changed. Carries no <c>Old</c>/<c>New</c> prefix because a document's DocumentId never
+    /// changes. Serves the zero-hop self person path and the custom view-based tombstone probe.
+    /// </summary>
+    DocumentId,
 
     /// <summary>
     /// <c>CreatedAt</c> — the tracked row insert timestamp.

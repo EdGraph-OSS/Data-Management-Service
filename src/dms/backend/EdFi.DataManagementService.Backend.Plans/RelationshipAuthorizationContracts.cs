@@ -85,6 +85,12 @@ public sealed record SupportedRelationshipAuthorizationStrategy(
     IReadOnlyList<RelationshipAuthorizationStrategySubjectEligibility> EligibleSubjects
 );
 
+public sealed record SupportedCustomViewAuthorizationStrategy(
+    ConfiguredAuthorizationStrategy ConfiguredStrategy,
+    int AuthorizationLocalOrder,
+    QualifiedResourceName BasisResource
+);
+
 public sealed record KnownButNotEnabledRelationshipAuthorizationStrategy(
     RelationshipAuthorizationStrategyKind Kind,
     ConfiguredAuthorizationStrategy ConfiguredStrategy,
@@ -95,6 +101,7 @@ public sealed record KnownButNotEnabledRelationshipAuthorizationStrategy(
 public sealed record RelationshipAuthorizationClassification(
     RelationshipAuthorizationClassificationOutcome Outcome,
     IReadOnlyList<SupportedRelationshipAuthorizationStrategy> SupportedStrategies,
+    IReadOnlyList<SupportedCustomViewAuthorizationStrategy> SupportedCustomViewStrategies,
     IReadOnlyList<ConfiguredAuthorizationStrategy> NoFurtherAuthorizationRequiredStrategies,
     IReadOnlyList<KnownButNotEnabledRelationshipAuthorizationStrategy> KnownButNotEnabledStrategies,
     IReadOnlyList<RelationshipAuthorizationFailureMetadata> SecurityConfigurationFailures
@@ -357,6 +364,15 @@ public enum RelationshipAuthorizationFailureKind
     StoredValueNull,
     ProposedValueMissing,
     MissingPeopleAuthViewAssociations,
+    NoCustomViewJoinPath,
+
+    /// <summary>
+    /// ReadChanges only: the subject-to-basis path resolves, but its first hop is neither an identifying
+    /// reference nor a securable element of the subject, so the tombstone stores none of the basis key
+    /// values the live seek needs. The DMS counterpart of the ODS "Non-identifying properties"
+    /// <c>SecurityConfigurationException</c>, widened by the securable allowance.
+    /// </summary>
+    CustomViewBasisNotIdentifyingOrSecurable,
 }
 
 public sealed record RelationshipAuthorizationFailureLocation(

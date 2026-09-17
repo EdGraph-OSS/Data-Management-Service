@@ -7,19 +7,23 @@ using System.Text.Json.Nodes;
 using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Core.ApiSchema;
 using EdFi.DataManagementService.Core.Configuration;
+using EdFi.DataManagementService.Core.DocumentCache;
 using EdFi.DataManagementService.Core.External.Backend;
 using EdFi.DataManagementService.Core.External.Interface;
 using EdFi.DataManagementService.Core.Handler;
+using EdFi.DataManagementService.Core.Management;
 using EdFi.DataManagementService.Core.Middleware;
 using EdFi.DataManagementService.Core.Profile;
 using EdFi.DataManagementService.Core.ResourceLoadOrder;
 using EdFi.DataManagementService.Core.Security;
 using EdFi.DataManagementService.Core.Startup;
+using EdFi.DataManagementService.Core.Telemetry;
 using EdFi.DataManagementService.Core.Validation;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Protocols;
 using Microsoft.IdentityModel.Protocols.OpenIdConnect;
 using Polly;
@@ -46,6 +50,26 @@ public static class DmsCoreServiceExtensions
         bool maskRequestBodyInLogs
     )
     {
+        DeadlockRetrySettings retrySettings = new();
+        deadlockRetryConfiguration.Bind(retrySettings);
+        ValidateDeadlockRetrySettings(retrySettings);
+
+        // Bound once and registered so the pipeline that opens the circuit and the middleware that
+        // reports it as a retriable 503 quote the same break duration.
+        CircuitBreakerSettings breakerSettings = new();
+        circuitBreakerConfiguration.Bind(breakerSettings);
+        breakerSettings.Validate();
+        foreach (string tuningWarning in breakerSettings.GetTuningWarnings())
+        {
+            logger.Warning("Circuit breaker configuration: {TuningWarning}", tuningWarning);
+        }
+
+        services.AddSingleton(breakerSettings);
+
+        // The two validation caches read the clock to expire derivative verdicts. TryAdd so a test or
+        // a caller that has already supplied a controlled clock keeps theirs.
+        services.TryAddSingleton(TimeProvider.System);
+
         services
             // API Schema services
             .AddSingleton<IApiSchemaValidator, ApiSchemaValidator>()
@@ -59,6 +83,7 @@ public static class DmsCoreServiceExtensions
             )
             .AddSingleton<EffectiveSchemaSetBuilder>()
             .AddSingleton<IEffectiveSchemaSetProvider, EffectiveSchemaSetProvider>()
+            .AddSingleton<IEffectiveSchemaBootstrapper, EffectiveSchemaBootstrapper>()
             // Startup orchestration
             .AddSingleton<DmsStartupOrchestrator>()
             .AddSingleton<IDmsStartupTask, ValidateDatabaseFingerprintReaderRegistrationTask>()
@@ -91,12 +116,19 @@ public static class DmsCoreServiceExtensions
             .AddSingleton<IResourceLoadOrderTransformer, PersonAuthorizationLoadOrderTransformer>()
             .AddSingleton<ResourceLoadOrderCalculator>()
             .AddResiliencePipeline("backendResiliencePipeline", backendResiliencePipeline)
+            .AddSingleton(retrySettings)
             .AddScoped<IDataStoreSelection, DataStoreSelection>()
             .AddScoped<IApplicationContextProvider, CachedApplicationContextProvider>()
             .AddSingleton<IConfigurationServiceApplicationProvider, ConfigurationServiceApplicationProvider>()
             .AddSingleton<IDatabaseFingerprintReader, MissingDatabaseFingerprintReader>()
+            // Both validation caches read the clock for derivative expiry and read CacheSettings for
+            // the bounded TTL. CacheSettings is registered by AddDmsConfigurationServiceDataStoreProvider,
+            // which every composition path calls; because these are resolved lazily rather than at
+            // registration, the order of the two calls does not matter.
             .AddSingleton<DatabaseFingerprintProvider>()
             .AddSingleton<ResolveDataStoreMiddleware>()
+            // SelectEffectiveDataStoreTargetMiddleware is not registered: the pipeline steps construct
+            // it themselves, because its routing policy differs per pipeline.
             .AddSingleton<ValidateDatabaseFingerprintMiddleware>()
             // Resource key validation
             .AddSingleton<IResourceKeyRowReader, MissingResourceKeyRowReader>()
@@ -113,19 +145,14 @@ public static class DmsCoreServiceExtensions
             .AddTransient<ProfileWritePipelineMiddleware>()
             .AddSingleton<ITokenInfoRelationalMappingSetResolver, TokenInfoRelationalMappingSetResolver>()
             .AddSingleton<GetTokenInfoHandler>()
-            .AddSingleton<AvailableChangeVersionsHandler>();
+            .AddSingleton<AvailableChangeVersionsHandler>()
+            // Collection-read observability
+            .AddSingleton<ICollectionPagingTelemetry, CollectionPagingTelemetry>();
 
         return services;
 
         void backendResiliencePipeline(ResiliencePipelineBuilder builder)
         {
-            CircuitBreakerSettings breakerSettings = new();
-            circuitBreakerConfiguration.Bind(breakerSettings);
-
-            DeadlockRetrySettings retrySettings = new();
-            deadlockRetryConfiguration.Bind(retrySettings);
-            ValidateDeadlockRetrySettings(retrySettings);
-
             var loggerFactory = LoggerFactory.Create(loggingBuilder => loggingBuilder.AddSerilog(logger));
             var cbFailureLogger = loggerFactory.CreateLogger("CircuitBreakerFailureDetection");
             var cbLogger = loggerFactory.CreateLogger("CircuitBreaker");
@@ -145,10 +172,12 @@ public static class DmsCoreServiceExtensions
                             getSuccess.LastModifiedDate,
                             getSuccess.LastModifiedTraceId
                         ),
-                        QueryResult.QuerySuccess querySuccess => new QueryResult.QuerySuccess(
-                            new JsonArray("REDACTED"),
-                            querySuccess.TotalCount
-                        ),
+                        // Copied rather than rebuilt, so a member added to the result later cannot be
+                        // dropped from the logged copy by omission here.
+                        QueryResult.QuerySuccess querySuccess => querySuccess with
+                        {
+                            EdfiDocs = new JsonArray("REDACTED"),
+                        },
                         _ => result,
                     };
                 };
@@ -162,15 +191,7 @@ public static class DmsCoreServiceExtensions
                 BreakDuration = TimeSpan.FromSeconds(breakerSettings.BreakDurationSeconds),
                 ShouldHandle = new PredicateBuilder().HandleResult(result =>
                 {
-                    bool shouldHandle = result switch
-                    {
-                        DeleteResult.UnknownFailure => true,
-                        GetResult.UnknownFailure => true,
-                        QueryResult.UnknownFailure => true,
-                        UpdateResult.UnknownFailure => true,
-                        UpsertResult.UnknownFailure => true,
-                        _ => false,
-                    };
+                    bool shouldHandle = Utility.IsUnknownFailureResult(result);
 
                     if (shouldHandle)
                     {
@@ -231,6 +252,223 @@ public static class DmsCoreServiceExtensions
     }
 
     /// <summary>
+    /// Adds the shared DocumentCache option binding and validation used by hosted DMS and tools.
+    /// </summary>
+    public static IServiceCollection AddDmsDocumentCacheOptions(
+        this IServiceCollection services,
+        IConfiguration configuration
+    )
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        if (
+            !services.Any(descriptor =>
+                descriptor.ServiceType == typeof(IConfigureOptions<DocumentCacheOptions>)
+            )
+        )
+        {
+            services
+                .AddOptions<DocumentCacheOptions>()
+                .Bind(configuration.GetSection(DocumentCacheOptions.SectionName))
+                .ValidateOnStart();
+        }
+
+        services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<
+                IValidateOptions<DocumentCacheOptions>,
+                DocumentCacheOptionsValidator
+            >()
+        );
+
+        return services;
+    }
+
+    /// <summary>
+    /// Adds the shared CMS-backed data store provider and connection-string provider used by DMS
+    /// runtime services and non-web tools.
+    /// </summary>
+    public static IServiceCollection AddDmsConfigurationServiceDataStoreProvider(
+        this IServiceCollection services,
+        IConfiguration configuration
+    )
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        IConfigurationSection configurationServiceSettings = configuration.GetSection(
+            "ConfigurationServiceSettings"
+        );
+        Uri configurationServiceBaseAddress = ValidateConfigurationServiceBaseAddress(
+            configurationServiceSettings
+        );
+
+        services.AddHybridCache();
+        if (!services.Any(descriptor => descriptor.ServiceType == typeof(IConfigureOptions<CacheSettings>)))
+        {
+            services
+                .AddOptions<CacheSettings>()
+                .Bind(configuration.GetSection("CacheSettings"))
+                .ValidateOnStart();
+        }
+
+        services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<IValidateOptions<CacheSettings>, CacheSettingsValidator>()
+        );
+        services.TryAddSingleton(serviceProvider =>
+        {
+            CacheSettings cacheSettings = serviceProvider.GetRequiredService<IOptions<CacheSettings>>().Value;
+
+            // Read the raw value as well as the bound one. Binding leaves the property at its default
+            // when the setting is absent, so the bound value alone cannot tell an absent setting from
+            // one an operator explicitly set to the same number - and only one of those is worth a
+            // warning.
+            // Only null is checked, not blank: options binding already rejects a present-but-empty
+            // value for an int property, as it does for every other expiration in this section, so a
+            // blank one never reaches this line.
+            string? rawExpiration = configuration.GetSection("CacheSettings")[
+                "DerivativeValidationCacheExpirationSeconds"
+            ];
+            (int effectiveSeconds, string? warning) = DerivativeValidationCacheExpiration.Resolve(
+                rawExpiration is null ? null : cacheSettings.DerivativeValidationCacheExpirationSeconds
+            );
+
+            cacheSettings.DerivativeValidationCacheExpirationSeconds = effectiveSeconds;
+
+            if (warning is not null)
+            {
+                serviceProvider
+                    .GetRequiredService<ILoggerFactory>()
+                    .CreateLogger(typeof(DerivativeValidationCacheExpiration))
+                    .LogWarning("{Warning}", warning);
+            }
+
+            return cacheSettings;
+        });
+
+        services.AddTransient<ConfigurationServiceResponseHandler>();
+        services
+            .AddHttpClient<ConfigurationServiceApiClient>(client =>
+            {
+                client.BaseAddress = configurationServiceBaseAddress;
+                client.DefaultRequestHeaders.Add("Accept", "application/json");
+                client.DefaultRequestHeaders.Add("Accept", "application/x-www-form-urlencoded");
+            })
+            .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler())
+            .AddHttpMessageHandler<ConfigurationServiceResponseHandler>();
+
+        services.TryAddSingleton(
+            new ConfigurationServiceContext(
+                configurationServiceSettings["ClientId"] ?? string.Empty,
+                configurationServiceSettings["ClientSecret"] ?? string.Empty,
+                configurationServiceSettings["Scope"] ?? string.Empty
+            )
+        );
+        services.TryAddSingleton<IConnectionStringDecryptionService>(
+            new ConnectionStringDecryptionService(
+                configurationServiceSettings["EncryptionKey"] ?? string.Empty
+            )
+        );
+        services.TryAddSingleton<ConfigurationServiceDataStoreProvider>();
+        services.TryAddSingleton<IDataStoreProvider>(serviceProvider =>
+            serviceProvider.GetRequiredService<ConfigurationServiceDataStoreProvider>()
+        );
+        services.TryAddSingleton<IConnectionStringProvider, DmsConnectionStringProvider>();
+        services.TryAddSingleton<IConfigurationServiceTokenHandler, ConfigurationServiceTokenHandler>();
+
+        return services;
+    }
+
+    private static Uri ValidateConfigurationServiceBaseAddress(
+        IConfigurationSection configurationServiceSettings
+    )
+    {
+        string? baseUrl = configurationServiceSettings["BaseUrl"];
+        if (string.IsNullOrWhiteSpace(baseUrl))
+        {
+            throw new InvalidOperationException(
+                "ConfigurationServiceSettings:BaseUrl must be an absolute HTTP or HTTPS URI."
+            );
+        }
+
+        if (
+            !Uri.TryCreate(baseUrl.Trim(), UriKind.Absolute, out Uri? parsedBaseUri)
+            || string.IsNullOrWhiteSpace(parsedBaseUri.Host)
+        )
+        {
+            throw new InvalidOperationException(
+                "ConfigurationServiceSettings:BaseUrl must be an absolute HTTP or HTTPS URI."
+            );
+        }
+
+        if (
+            !string.Equals(parsedBaseUri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(parsedBaseUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+        )
+        {
+            throw new InvalidOperationException(
+                "ConfigurationServiceSettings:BaseUrl must be an absolute HTTP or HTTPS URI."
+            );
+        }
+
+        return new Uri($"{parsedBaseUri.AbsoluteUri.TrimEnd('/')}/");
+    }
+
+    /// <summary>
+    /// Adds shared DocumentCache target resolution services without registering any background
+    /// projector host.
+    /// </summary>
+    public static IServiceCollection AddDmsDocumentCacheTargetRegistry(
+        this IServiceCollection services,
+        IConfiguration configuration
+    )
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        services.AddDmsDocumentCacheOptions(configuration);
+        services.TryAddSingleton(TimeProvider.System);
+        services.AddSingleton<DocumentCacheProcessProviderToken>(_ =>
+        {
+            string? datastore = configuration.GetSection("AppSettings:Datastore").Value;
+            if (
+                !DocumentCacheProcessProviderToken.TryCreate(
+                    datastore,
+                    out DocumentCacheProcessProviderToken? providerToken
+                )
+            )
+            {
+                throw new InvalidOperationException(
+                    "Unable to normalize AppSettings:Datastore for DocumentCache target resolution."
+                );
+            }
+
+            return providerToken!;
+        });
+        services.AddSingleton<IDocumentCacheTargetContextBuilder, DocumentCacheTargetContextBuilder>();
+        services.AddSingleton<IDocumentCacheTargetRegistry>(serviceProvider =>
+        {
+            IDataStoreProvider dataStoreProvider =
+                serviceProvider.GetService<ConfigurationServiceDataStoreProvider>()
+                ?? serviceProvider.GetRequiredService<IDataStoreProvider>();
+
+            return new DocumentCacheTargetRegistry(
+                dataStoreProvider,
+                serviceProvider.GetRequiredService<IDocumentCacheTargetContextBuilder>(),
+                serviceProvider.GetRequiredService<IOptions<DocumentCacheOptions>>(),
+                serviceProvider.GetRequiredService<TimeProvider>(),
+                serviceProvider.GetRequiredService<ILogger<DocumentCacheTargetRegistry>>()
+            );
+        });
+        services.AddSingleton<
+            IDocumentCacheDiagnosticSnapshotProvider,
+            DocumentCacheDiagnosticSnapshotProvider
+        >();
+
+        return services;
+    }
+
+    /// <summary>
     /// Adds JWT authentication services to the DMS Core
     /// </summary>
     public static IServiceCollection AddJwtAuthentication(
@@ -276,6 +514,14 @@ public static class DmsCoreServiceExtensions
         });
 
         services.AddSingleton<IJwtValidationService, JwtValidationService>();
+        services.AddSingleton<
+            IDocumentCacheStatusAuthorizationService,
+            DocumentCacheStatusAuthorizationService
+        >();
+        services.AddSingleton<
+            IManagementEndpointAuthorizationService,
+            ManagementEndpointAuthorizationService
+        >();
         services.AddTransient<JwtAuthenticationMiddleware>();
         services.AddTransient<JwtRoleAuthenticationMiddleware>();
 
@@ -284,14 +530,39 @@ public static class DmsCoreServiceExtensions
 
     internal static void ValidateDeadlockRetrySettings(DeadlockRetrySettings settings)
     {
-        if (settings.MaxRetryAttempts < 0)
-        {
-            throw new InvalidOperationException("DeadlockRetry:MaxRetryAttempts must be >= 0");
-        }
+        ArgumentNullException.ThrowIfNull(settings);
 
-        if (settings.BaseDelayMilliseconds < 1)
-        {
-            throw new InvalidOperationException("DeadlockRetry:BaseDelayMilliseconds must be >= 1");
-        }
+        settings.Validate();
+    }
+
+    /// <summary>
+    /// Registers <see cref="CustomValidatorRegistrationGuard"/> so it runs during startup task
+    /// execution and can see every ICustomResourceValidator descriptor a plugin registers, whether
+    /// that registration runs before or after this call.
+    /// </summary>
+    public static IServiceCollection AddCustomValidationGuard(this IServiceCollection services)
+    {
+        // The sibling registration guards use AddSingleton<IDmsStartupTask, T>(), which resolves its
+        // constructor arguments from the container. That will not work here: the guard needs the live
+        // IServiceCollection itself, and IServiceCollection cannot be resolved from DI because it is
+        // never registered as a service - see the comment below. So this registers through the
+        // factory overload instead, closing over the `services` parameter directly. The closure is
+        // the only path by which the guard can see the collection; do not "tidy" this back to the
+        // two-generic-argument form the sibling guards use.
+        services.AddSingleton<IDmsStartupTask>(sp => new CustomValidatorRegistrationGuard(
+            services,
+            sp,
+            sp.GetRequiredService<IEffectiveApiSchemaProvider>(),
+            sp.GetRequiredService<ILogger<CustomValidatorRegistrationGuard>>()
+        ));
+
+        // Deliberately not done: services.AddSingleton<IServiceCollection>(services).
+        // IServiceCollection lives in the Microsoft.Extensions.DependencyInjection namespace, which
+        // the plugin spine permits a plugin to register into. A guard that resolved
+        // IServiceCollection from DI would read whichever registration won the race, not necessarily
+        // this one. The closure above cannot be displaced that way, so the collection must reach the
+        // guard only through it.
+
+        return services;
     }
 }

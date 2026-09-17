@@ -344,21 +344,17 @@ Feature: Applications endpoints
                    "dataStoreIds": [{dataStoreId}]
                   }
                   """
-             Then it should respond with 400
+             Then it should respond with 409
               And the response body is
                   """
                   {
-                    "detail": "Data validation failed. See 'validationErrors' for details.",
-                    "type": "urn:ed-fi:api:bad-request:data",
-                    "title": "Data Validation Failed",
-                    "status": 400,
+                    "detail": "Reference 'VendorId' does not exist.",
+                    "type": "urn:ed-fi:api:conflict:unresolved-reference",
+                    "title": "Unresolved Reference",
+                    "status": 409,
                     "correlationId": "0HN8RI9E3O45G:00000004",
-                    "validationErrors": {
-                    "VendorId": [
-                      "Reference 'VendorId' does not exist."
-                    ]
-                  },
-                  "errors": []
+                    "validationErrors": {},
+                    "errors": []
                   }
                   """
 
@@ -710,21 +706,17 @@ Feature: Applications endpoints
                    "profileIds": [9999]
                   }
                   """
-             Then it should respond with 400
+             Then it should respond with 409
               And the response body is
                   """
                   {
-                    "detail": "Data validation failed. See 'validationErrors' for details.",
-                    "type": "urn:ed-fi:api:bad-request:data",
-                    "title": "Data Validation Failed",
-                    "status": 400,
+                    "detail": "Profile does not exist.",
+                    "type": "urn:ed-fi:api:conflict:unresolved-reference",
+                    "title": "Unresolved Reference",
+                    "status": 409,
                     "correlationId": "0HN8RI9E3O45G:00000004",
-                    "validationErrors": {
-                    "ProfileId": [
-                      "Profile does not exist."
-                    ]
-                  },
-                  "errors": []
+                    "validationErrors": {},
+                    "errors": []
                   }
                   """
 
@@ -896,5 +888,88 @@ Feature: Applications endpoints
                      "errors": [
                         "invalid_client. Invalid client or Invalid client credentials"
                         ]
+                  }
+                  """
+
+        Scenario: 28 Verify PUT request with mismatched IDs
+             When a POST request is made to "/v3/applications" with
+                  """
+                  {
+                   "vendorId": {vendorId},
+                   "applicationName": "Mismatch Test Application",
+                   "claimSetName": "ClaimScenario28",
+                   "dataStoreIds": [{dataStoreId}]
+                  }
+                  """
+             Then it should respond with 201
+             When a PUT request is made to "/v3/applications/{applicationId}" with
+                  """
+                  {
+                      "id": 999999,
+                      "vendorId": {vendorId},
+                      "applicationName": "Mismatch Test Application",
+                      "claimSetName": "ClaimScenario28",
+                      "dataStoreIds": [{dataStoreId}]
+                  }
+                  """
+             Then it should respond with 400
+              And the response body is
+                  """
+                    {
+                        "detail": "Data validation failed. See 'validationErrors' for details.",
+                        "type": "urn:ed-fi:api:bad-request:data",
+                        "title": "Data Validation Failed",
+                        "status": 400,
+                        "validationErrors": {
+                            "Id": [
+                                "Request body id must match the id in the url."
+                            ]
+                        },
+                        "errors": []
+                    }
+                  """
+
+        Scenario: 29 Ensure clients can POST an application with no dataStoreIds
+             When a POST request is made to "/v3/applications" with
+                  """
+                  {
+                   "vendorId": {vendorId},
+                   "applicationName": "Identity Only Application 29",
+                   "claimSetName": "ClaimScenario29",
+                   "dataStoreIds": []
+                  }
+                  """
+             Then it should respond with 201
+              And the response body has key and secret
+              And the response body credentials are captured as "identityOnlyApplication"
+             When a GET request is made to "/v3/applications/{applicationId}"
+             Then it should respond with 200
+              And the response body is
+                  """
+                  {
+                    "id": {applicationId},
+                    "applicationName": "Identity Only Application 29",
+                    "vendorId": {vendorId},
+                    "claimSetName": "ClaimScenario29",
+                    "educationOrganizationIds": [],
+                    "dataStoreIds": [],
+                    "profileIds": [],
+                    "enabled": true
+                  }
+                  """
+             When a GET request is made to "/v3/apiClients/{identityOnlyApplicationKey}"
+             Then it should respond with 200
+              And the response body is
+                  """
+                  {
+                    "id": {id},
+                    "applicationId": {applicationId},
+                    "clientId": "{identityOnlyApplicationKey}",
+                    "clientUuid": "{clientUuid}",
+                    "name": "Identity Only Application 29",
+                    "isApproved": true,
+                    "creatorOwnershipTokenId": null,
+                    "ownershipTokenIds": [],
+                    "dataStoreIds": []
                   }
                   """

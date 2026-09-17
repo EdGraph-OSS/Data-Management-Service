@@ -4,25 +4,24 @@
 // See the LICENSE and NOTICES files in the project root for more information.
 
 using EdFi.DataManagementService.Backend.External.Plans;
+using EdFi.DataManagementService.Core.External.Model;
 
 namespace EdFi.DataManagementService.Backend.External;
 
 /// <summary>
-/// One row of document metadata from <c>dms.Document</c> joined to the page keyset.
+/// One row of document metadata from <c>dms.Document</c>, selected for the page being hydrated.
 /// </summary>
 /// <param name="DocumentId">The internal document identity.</param>
 /// <param name="DocumentUuid">The public document UUID exposed as <c>id</c> in API responses.</param>
 /// <param name="ContentVersion">Stored content-change version stamp.</param>
-/// <param name="IdentityVersion">Stored identity-change version stamp.</param>
 /// <param name="ContentLastModifiedAt">Timestamp of the last content change.</param>
-/// <param name="IdentityLastModifiedAt">Timestamp of the last identity change.</param>
+/// <param name="ResourceKeyId">Stored resource identity.</param>
 public sealed record DocumentMetadataRow(
     long DocumentId,
     Guid DocumentUuid,
     long ContentVersion,
-    long IdentityVersion,
     DateTimeOffset ContentLastModifiedAt,
-    DateTimeOffset IdentityLastModifiedAt
+    short ResourceKeyId
 );
 
 /// <summary>
@@ -76,7 +75,8 @@ public sealed record HydratedDocumentReferenceLookup(IReadOnlyList<DocumentRefer
 /// Optional total row count when requested by the caller (e.g., <c>totalCount=true</c>).
 /// </param>
 /// <param name="DocumentMetadata">
-/// Document metadata rows from <c>dms.Document</c> for the page, ordered by <c>DocumentId</c>.
+/// Document metadata rows from <c>dms.Document</c> for the page, ordered by selected-page
+/// ordinal when supplied by the keyset, otherwise by <c>DocumentId</c>.
 /// </param>
 /// <param name="TableRowsInDependencyOrder">
 /// Per-table hydrated rows in deterministic dependency order (root table first, then children).
@@ -98,10 +98,29 @@ public sealed record HydratedPage(
     /// reconstitution.
     /// </summary>
     public HydratedDocumentReferenceLookup? DocumentReferenceLookup { get; init; }
+
+    /// <summary>
+    /// The maximum continuation-anchor value in the selected page keyset, or <see langword="null"/>
+    /// when page selection was skipped or selected no keys — including authorization, preprocessing,
+    /// and planner early-empty paths, and zero-size pages.
+    /// </summary>
+    /// <remarks>
+    /// Its units follow the keyset's anchor: <c>ContentVersion</c> for a max-bearing change-version
+    /// window against any data source, and for any windowed shape served from a frozen snapshot;
+    /// <c>DocumentId</c> otherwise. Deliberately independent of the
+    /// hydrated body: every selected row may be deleted before hydration completes, so this can be
+    /// non-null while the body is empty. A body-derived boundary would stall a cursor walk on the last
+    /// surviving document, or stop it entirely on an empty body. Populated from the keys the query
+    /// keyset materialization returned; always null for a <see cref="PageKeysetSpec.Single"/> keyset,
+    /// which performs no page selection because its single id comes from the caller.
+    /// </remarks>
+    public long? HighestSelectedAnchor { get; init; }
 }
 
 /// <summary>
-/// Discriminated union specifying how the page keyset is materialized for hydration.
+/// Discriminated union specifying which documents a hydration batch returns, and where their ids come
+/// from. Whether those ids are materialized into a keyset table or filtered on directly is a separate
+/// decision made when the batch is built.
 /// </summary>
 public abstract record PageKeysetSpec
 {
@@ -114,14 +133,42 @@ public abstract record PageKeysetSpec
     public sealed record Single(long DocumentId) : PageKeysetSpec;
 
     /// <summary>
+    /// GET by already-selected page: the keyset is the authorized page of <c>DocumentId</c>s selected
+    /// before response-body hydration.
+    /// </summary>
+    /// <param name="DocumentIds">The selected document ids to hydrate.</param>
+    public sealed record SelectedPage(IReadOnlyList<long> DocumentIds) : PageKeysetSpec
+    {
+        public IReadOnlyList<long> DocumentIds { get; init; } =
+            DocumentIds ?? throw new ArgumentNullException(nameof(DocumentIds));
+    }
+
+    /// <summary>
     /// GET by query: the keyset comes from a compiled page-selection SQL plan.
     /// </summary>
     /// <param name="Plan">The compiled page document-id SQL plan.</param>
     /// <param name="ParameterValues">
     /// Parameter values keyed by bare parameter name (without <c>@</c>).
     /// </param>
+    /// <param name="OrderingMode">
+    /// The anchor <paramref name="Plan" /> was compiled against, and therefore the column whose
+    /// selected maximum continues this page. Under a <c>ContentVersion</c> anchor the materialized
+    /// keyset carries that column alongside <c>DocumentId</c> and returns both, because the anchor has
+    /// to leave selection with the ids: a page whose rows are all deleted before hydration still has to
+    /// report where it ended, and by then there is nothing left to look the anchor up from.
+    /// <para>
+    /// Required rather than defaulted, for the same reason the request records that carry the anchor
+    /// down to here require it — and more sharply, because this is the value the batch builder and both
+    /// keyset readers actually branch on. A keyset left on the default while its plan was compiled for
+    /// <c>ContentVersion</c> still emits valid SQL: the insert simply selects one of the two columns the
+    /// page-selection relation projects, the returning clause hands back <c>DocumentId</c>s, and the
+    /// reader takes their maximum. Core then stamps that <c>DocumentId</c> with a <c>ContentVersion</c>
+    /// marker, and the client walks on a token that skips rows with nothing having failed anywhere.
+    /// </para>
+    /// </param>
     public sealed record Query(
         PageDocumentIdSqlPlan Plan,
-        IReadOnlyDictionary<string, object?> ParameterValues
+        IReadOnlyDictionary<string, object?> ParameterValues,
+        PageOrderingMode OrderingMode
     ) : PageKeysetSpec;
 }

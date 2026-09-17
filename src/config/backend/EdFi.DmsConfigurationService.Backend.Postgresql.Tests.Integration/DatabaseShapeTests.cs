@@ -17,6 +17,7 @@ public class Given_CMS_PostgreSQL_database_shape
     [
         "ApiClient",
         "ApiClientDataStore",
+        "ApiClientOwnershipToken",
         "Application",
         "ApplicationEducationOrganization",
         "ApplicationProfile",
@@ -34,6 +35,7 @@ public class Given_CMS_PostgreSQL_database_shape
         "OpenIddictRole",
         "OpenIddictScope",
         "OpenIddictToken",
+        "OwnershipToken",
         "Profile",
         "ResourceClaim",
         "Tenant",
@@ -93,6 +95,14 @@ public class Given_CMS_PostgreSQL_database_shape
             false
         ),
         new("UX_OpenIddictApplication_ClientId", "OpenIddictApplication", "u", ["ClientId"], false),
+        new(
+            "UX_DataStoreDerivative_DataStoreId_DerivativeType",
+            "DataStoreDerivative",
+            "u",
+            ["DataStoreId", "DerivativeType"],
+            false
+        ),
+        new("CK_DataStoreDerivative_DerivativeType", "DataStoreDerivative", "c", ["DerivativeType"], false),
     ];
 
     private static readonly string[] ExpectedNonUniqueLookupIndexes =
@@ -102,13 +112,61 @@ public class Given_CMS_PostgreSQL_database_shape
         "IX_AuthorizationStrategy_TenantId",
         "IX_ResourceClaim_TenantId",
         "IX_DataStore_TenantId",
-        "IX_DataStoreDerivative_DataStoreId",
         "IX_OpenIddictToken_ApplicationId",
         "IX_OpenIddictToken_Subject",
         "IX_OpenIddictToken_ReferenceId",
         "IX_OpenIddictToken_ExpirationDate",
     ];
 
+    /// <summary>
+    /// The only dmscs columns that may remain bigint after DMS-1337 narrowed the 11 spec-named
+    /// resource identifiers to int. Asserted as an exact set, so both a regression of an in-scope
+    /// column back to BIGINT and an unintended new BIGINT column fail the test.
+    /// EducationOrganizationId is an Ed-Fi education organization id, not a CMS resource id, and the
+    /// draft Management API v3 spec declares it int64. Tenant.Id has no Admin API counterpart and
+    /// ClaimsHierarchy.Id is an internal concurrency token; both are out of scope, as are the
+    /// TenantId foreign keys that reference Tenant.Id.
+    /// </summary>
+    private static readonly (string TableName, string ColumnName)[] ExpectedBigintColumns =
+    [
+        ("ApplicationEducationOrganization", "EducationOrganizationId"),
+        ("AuthorizationStrategy", "TenantId"),
+        ("ClaimSet", "TenantId"),
+        ("ClaimsHierarchy", "Id"),
+        ("DataStore", "TenantId"),
+        ("OwnershipToken", "TenantId"),
+        ("ResourceClaim", "TenantId"),
+        ("Tenant", "Id"),
+        ("Vendor", "TenantId"),
+    ];
+
+    /// <summary>
+    /// The 10 persisted in-scope tables whose identity/primary-key column must report integer.
+    /// Of the 11 spec-named resources only 10 are persisted: actions has no table, because
+    /// ClaimSetRepository.GetActions() returns a hard-coded Action[] - see ExpectedTableNames,
+    /// which contains no Action entry. Action.Id is already int and is covered by the model
+    /// identifier contract test instead, since it reaches neither the database nor OpenAPI.
+    /// </summary>
+    private static readonly string[] InScopeIdentityTables =
+    [
+        "ApiClient",
+        "Application",
+        "AuthorizationStrategy",
+        "ClaimSet",
+        "DataStore",
+        "DataStoreContext",
+        "DataStoreDerivative",
+        "Profile",
+        "ResourceClaim",
+        "Vendor",
+    ];
+
+    /// <summary>
+    /// Indexes that earlier scripts created and a later upgrade removed. IX_DataStoreDerivative_DataStoreId
+    /// is redundant with the backing index of UX_DataStoreDerivative_DataStoreId_DerivativeType, whose
+    /// leading key is the same column, so the unique constraint serves the parent lookup and the
+    /// child-side foreign-key maintenance on its own.
+    /// </summary>
     private static readonly string[] RemovedRedundantIndexNames =
     [
         "idx_Company",
@@ -116,6 +174,7 @@ public class Given_CMS_PostgreSQL_database_shape
         "idx_vendor_applicationname",
         "idx_datastore_context_unique",
         "ix_profile_name",
+        "IX_DataStoreDerivative_DataStoreId",
     ];
 
     private string _databaseName = string.Empty;
@@ -201,6 +260,41 @@ public class Given_CMS_PostgreSQL_database_shape
             actualColumnNames
                 .Should()
                 .NotContain(expectedColumnNames.Select(column => column.ToLowerInvariant()));
+        }
+    }
+
+    [Test]
+    public void It_should_declare_only_the_allowlisted_bigint_columns()
+    {
+        (string TableName, string ColumnName)[] actualBigintColumns = _columns
+            .Where(column => column.DataType == "bigint")
+            .Select(column => (column.TableName, column.ColumnName))
+            .OrderBy(column => column.TableName, StringComparer.Ordinal)
+            .ThenBy(column => column.ColumnName, StringComparer.Ordinal)
+            .ToArray();
+
+        actualBigintColumns
+            .Should()
+            .BeEquivalentTo(
+                ExpectedBigintColumns,
+                "the 11 spec-named resource identifiers are int32 and only education-organization, "
+                    + "tenant and claims-hierarchy columns may remain bigint"
+            );
+    }
+
+    [Test]
+    public void It_should_declare_in_scope_identity_columns_as_integer()
+    {
+        foreach (string tableName in InScopeIdentityTables)
+        {
+            ColumnShape idColumn = _columns
+                .Should()
+                .ContainSingle(column => column.TableName == tableName && column.ColumnName == "Id")
+                .Which;
+
+            idColumn
+                .DataType.Should()
+                .Be("integer", $"{tableName}.Id is a spec-named resource identifier declared as int32");
         }
     }
 
@@ -380,7 +474,8 @@ public class Given_CMS_PostgreSQL_database_shape
 
     private const string ColumnsSql = """
         SELECT table_name AS TableName,
-               column_name AS ColumnName
+               column_name AS ColumnName,
+               data_type AS DataType
         FROM information_schema.columns
         WHERE table_schema = 'dmscs'
         ORDER BY table_name, ordinal_position;
@@ -439,7 +534,7 @@ public class Given_CMS_PostgreSQL_database_shape
         bool NullsNotDistinct
     );
 
-    private sealed record ColumnShape(string TableName, string ColumnName);
+    private sealed record ColumnShape(string TableName, string ColumnName, string DataType);
 
     private sealed record ConstraintShape(
         string Name,

@@ -69,6 +69,18 @@ public abstract class DdlEmissionGoldenTestBase
         if (dialect == SqlDialect.Mssql)
         {
             AssertMssqlBatchBoundaries(ddl);
+
+            // change-queries.md invariant 7. Asserted here and not only in
+            // DdlGoldenFixtureTestBase because these fixtures are hand-authored
+            // DerivedRelationalModelSet builders: they construct DbTableModel.Key directly instead
+            // of deriving it from an ApiSchema, so this is the emission path that can actually
+            // produce a mirror target whose key has moved off the joined column. An unsatisfiable
+            // hint regenerates its golden cleanly and only fails at write time, with error 8622 -
+            // and a missing hint regenerates cleanly and never fails at all.
+            MssqlForceSeekInvariant.AssertMirrorStampsAreHintedAndSeekable(
+                ddl,
+                $"ddl-emission fixture '{fixtureName}' (mssql)"
+            );
         }
 
         Directory.CreateDirectory(Path.GetDirectoryName(actualPath)!);
@@ -719,6 +731,94 @@ public class Given_DdlEmitter_With_AuthEdOrgHierarchy_For_Mssql : DdlEmissionGol
                 "DELETE trigger for hierarchical entity should be created"
             );
     }
+
+    /// <summary>
+    /// Every branch of the hierarchical UPDATE body already requires a denormalized parent id to
+    /// have changed, so a firing that wrote none can produce no tuple - but it would still resolve
+    /// both steps' joins against the shared auth hierarchy table to discover that, taking update
+    /// locks on rows it will never modify. The stamping trigger's mirror UPDATE on this same table
+    /// is a real UPDATE, so nested triggers re-fire this trigger on every insert and every stamp of
+    /// an EducationOrganization, which is what makes skipping it load-bearing rather than an
+    /// optimization. Same mechanism as change-queries.md invariant 6.
+    ///
+    /// <para>Asserted here rather than left to the golden because the golden regenerates cleanly in
+    /// both directions: dropping the gate reinstates the contention while every existing auth test
+    /// still passes, since none of them fire this trigger without writing a parent id.</para>
+    ///
+    /// <para>This fixture's LocalEducationAgency declares a single parent FK, so the disjunction's
+    /// <c>OR</c> separator is not exercised here. It is covered at deployment by
+    /// <c>MssqlAuthEdOrgHierarchyTriggerTests</c>, whose reparenting cases run against a
+    /// LocalEducationAgency with three parent FKs and would not compile if it were malformed.</para>
+    /// </summary>
+    [Test]
+    public void It_should_gate_the_hierarchical_update_trigger_on_its_parent_id_columns()
+    {
+        var triggerBody = ExtractMssqlTriggerBody("TR_LocalEducationAgency_AuthHierarchy_Update");
+
+        var gateStart = triggerBody.IndexOf(
+            "IF UPDATE([StateEducationAgency_EducationOrganizationId])",
+            StringComparison.Ordinal
+        );
+        var deleteStepStart = triggerBody.IndexOf("DELETE tbd", StringComparison.Ordinal);
+        var insertStepStart = triggerBody.IndexOf("MERGE INTO", StringComparison.Ordinal);
+
+        gateStart
+            .Should()
+            .BeGreaterThan(
+                0,
+                "the hierarchical UPDATE trigger must be gated on the parent id columns its own "
+                    + "predicates read, so a stamp-only re-firing skips it outright"
+            );
+
+        // Both steps inside the gate's block, not merely after the IF: without BEGIN / END, T-SQL
+        // binds a bare IF to the first statement only, leaving the MERGE running on every firing
+        // while the DELETE stays gated. There is no nested BEGIN / END in this body, so the first
+        // END after the block opens is the gate's.
+        var blockStart = triggerBody.IndexOf("BEGIN", gateStart, StringComparison.Ordinal);
+
+        // Ranged rather than BeLessThan: a missing BEGIN yields -1, which is less than every other
+        // index here and would satisfy the weaker form. Asserted before blockEnd is read so an
+        // absent BEGIN reports itself instead of throwing out of the IndexOf below.
+        blockStart
+            .Should()
+            .BeInRange(gateStart, deleteStepStart, "the gate must open a BEGIN block before the DELETE step");
+
+        var blockEnd = triggerBody.IndexOf("END", blockStart, StringComparison.Ordinal);
+
+        insertStepStart
+            .Should()
+            .BeLessThan(blockEnd, "the MERGE step must sit inside the gate's block, not after its END");
+
+        // The gate must not widen past the columns the predicates use. EducationOrganizationId is
+        // the identity, not a parent id, and every branch joins inserted to deleted on it unchanged,
+        // so admitting a firing that only rewrote it would admit one that can produce no tuple.
+        triggerBody
+            .Should()
+            .NotContain("UPDATE([EducationOrganizationId])", "the gate ranges over parent id columns only");
+    }
+
+    /// <summary>
+    /// The emitted body of one SQL Server trigger, from its CREATE through the text before the next
+    /// one. Scoped so an assertion cannot be satisfied by a neighbouring trigger's text.
+    /// </summary>
+    private string ExtractMssqlTriggerBody(string triggerName)
+    {
+        var triggerStart = _ddlContent.IndexOf(
+            $"CREATE OR ALTER TRIGGER [edfi].[{triggerName}]",
+            StringComparison.Ordinal
+        );
+        triggerStart.Should().BeGreaterThanOrEqualTo(0, $"the DDL must emit {triggerName}");
+
+        var nextTriggerStart = _ddlContent.IndexOf(
+            "CREATE OR ALTER TRIGGER",
+            triggerStart + 1,
+            StringComparison.Ordinal
+        );
+
+        return nextTriggerStart < 0
+            ? _ddlContent[triggerStart..]
+            : _ddlContent[triggerStart..nextTriggerStart];
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -905,9 +1005,13 @@ public class Given_DdlEmitter_With_AuthPeopleViews_For_Pgsql : DdlEmissionGolden
     }
 
     [Test]
-    public void It_should_use_select_distinct()
+    public void It_should_not_use_select_distinct()
     {
-        _ddlContent.Should().Contain("SELECT DISTINCT", "People auth views should use SELECT DISTINCT");
+        // DMS-1329: consumers probe the views with IN/EXISTS, so dedup is unnecessary and
+        // SELECT DISTINCT blocks PostgreSQL from flattening the view into the probing query.
+        _ddlContent
+            .Should()
+            .NotContain("SELECT DISTINCT", "People auth views must not use SELECT DISTINCT");
     }
 }
 
@@ -982,6 +1086,16 @@ public class Given_DdlEmitter_With_AuthPeopleViews_For_Mssql : DdlEmissionGolden
     public void It_should_emit_go_batch_separators()
     {
         _ddlContent.Should().Contain("GO\n", "MSSQL should emit GO batch separators before views");
+    }
+
+    [Test]
+    public void It_should_not_use_select_distinct()
+    {
+        // DMS-1329: consumers probe the views with IN/EXISTS, so dedup is unnecessary; the
+        // definitions are shared with PostgreSQL, so both dialects must drop it together.
+        _ddlContent
+            .Should()
+            .NotContain("SELECT DISTINCT", "People auth views must not use SELECT DISTINCT");
     }
 }
 
@@ -3489,6 +3603,13 @@ internal static class AuthPeopleViewsFixture
                     new RelationalScalarType(ScalarKind.Int64),
                     IsNullable: false,
                     IsPrimaryKey: true
+                ),
+                new TrackedChangeSystemColumnInfo(
+                    TrackedChangeSystemColumnRole.DocumentId,
+                    new DbColumnName("DocumentId"),
+                    new RelationalScalarType(ScalarKind.Int64),
+                    IsNullable: false,
+                    IsPrimaryKey: false
                 ),
                 new TrackedChangeSystemColumnInfo(
                     TrackedChangeSystemColumnRole.CreatedAt,

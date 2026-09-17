@@ -3,9 +3,12 @@
 // The Ed-Fi Alliance licenses this file to you under the Apache License, Version 2.0.
 // See the LICENSE and NOTICES files in the project root for more information.
 
+using EdFi.DataManagementService.Backend.Ddl;
 using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Backend.External.Plans;
 using EdFi.DataManagementService.Backend.Plans;
+using EdFi.DataManagementService.Backend.Tests.Common;
+using EdFi.DataManagementService.Core.External.Model;
 using EdFi.DataManagementService.Core.External.Security;
 using FluentAssertions;
 using NUnit.Framework;
@@ -167,85 +170,46 @@ public class Given_PageDocumentIdSqlCompiler
     }
 
     [Test]
-    public void It_should_join_descriptor_table_when_any_predicate_targets_descriptor_column()
+    public void It_should_reject_namespace_checks_that_target_the_shared_descriptor_table_from_a_document_root()
     {
-        var plan = _compiler.Compile(
-            CreateDescriptorSpec(
-                [
-                    new QueryValuePredicate(
-                        new QueryPredicateTarget.DescriptorColumn(new DbColumnName("Namespace")),
-                        QueryComparisonOperator.Equal,
-                        "namespace"
-                    ),
-                    new QueryValuePredicate(
-                        new DbColumnName("ResourceKeyId"),
-                        QueryComparisonOperator.Equal,
-                        "resourceKeyId"
-                    ),
-                ],
-                includeTotalCountSql: true
-            )
-        );
-
-        const string ExpectedDescriptorJoin =
-            "INNER JOIN \"dms\".\"Descriptor\" d ON d.\"DocumentId\" = r.\"DocumentId\"";
-        const string ExpectedDescriptorPredicate = "d.\"Namespace\" = @namespace";
-
-        plan.PageDocumentIdSql.Should().Contain(ExpectedDescriptorJoin);
-        plan.PageDocumentIdSql.Should().Contain(ExpectedDescriptorPredicate);
-        plan.TotalCountSql.Should().NotBeNull();
-        plan.TotalCountSql.Should().Contain(ExpectedDescriptorJoin);
-        plan.TotalCountSql.Should().Contain(ExpectedDescriptorPredicate);
-    }
-
-    [Test]
-    public void It_should_join_descriptor_table_when_any_namespace_check_targets_descriptor_table()
-    {
+        // Descriptor queries root on dms.Descriptor, so a dms.Descriptor namespace check paired
+        // with a dms.Document root has no production planner. The compiler must fail closed
+        // rather than silently binding the check to a table that is not in the query.
         var documentTable = new DbTableName(new DbSchemaName("dms"), "Document");
         var descriptorTable = new DbTableName(new DbSchemaName("dms"), "Descriptor");
         var namespaceColumn = new DbColumnName("Namespace");
-        var plan = _compiler.Compile(
-            new PageDocumentIdQuerySpec(
-                RootTable: documentTable,
-                Predicates: [],
-                UnifiedAliasMappingsByColumn: new Dictionary<DbColumnName, ColumnStorage.UnifiedAlias>(),
-                IncludeTotalCountSql: true,
-                Authorization: new PageDocumentIdAuthorizationSpec(
-                    Strategies: [],
-                    NamespaceChecks:
-                    [
-                        new NamespaceAuthorizationCheckSpec(
-                            0,
-                            NamespaceAuthorizationCheckValueSource.Stored,
-                            documentTable,
-                            namespaceColumn
-                        ),
-                        new NamespaceAuthorizationCheckSpec(
-                            1,
-                            NamespaceAuthorizationCheckValueSource.Stored,
-                            descriptorTable,
-                            namespaceColumn
-                        ),
-                    ],
-                    NamespacePrefixParameterization: NamespacePrefixParameterizationFactory.Create(
-                        SqlDialect.Pgsql,
-                        ["uri://ed-fi.org/"],
-                        "namespacePrefixes"
-                    )
+        var spec = new PageDocumentIdQuerySpec(
+            RootTable: documentTable,
+            Predicates: [],
+            UnifiedAliasMappingsByColumn: new Dictionary<DbColumnName, ColumnStorage.UnifiedAlias>(),
+            Mode: new PageCandidateMode.Traditional(IncludeTotalCountSql: true),
+            Authorization: new PageDocumentIdAuthorizationSpec(
+                Strategies: [],
+                NamespaceChecks:
+                [
+                    new NamespaceAuthorizationCheckSpec(
+                        0,
+                        NamespaceAuthorizationCheckValueSource.Stored,
+                        descriptorTable,
+                        namespaceColumn
+                    ),
+                ],
+                NamespacePrefixParameterization: NamespacePrefixParameterizationFactory.Create(
+                    SqlDialect.Pgsql,
+                    ["uri://ed-fi.org/"],
+                    "namespacePrefixes"
                 )
             )
         );
 
-        const string ExpectedDescriptorJoin =
-            "INNER JOIN \"dms\".\"Descriptor\" d ON d.\"DocumentId\" = r.\"DocumentId\"";
-        const string ExpectedNamespaceAuthorizationGroup =
-            "(r.\"Namespace\" IS NOT NULL AND r.\"Namespace\" LIKE ANY(@namespacePrefixes) AND d.\"Namespace\" IS NOT NULL AND d.\"Namespace\" LIKE ANY(@namespacePrefixes))";
+        var act = () => _compiler.Compile(spec);
 
-        plan.PageDocumentIdSql.Should().Contain(ExpectedDescriptorJoin);
-        plan.PageDocumentIdSql.Should().Contain(ExpectedNamespaceAuthorizationGroup);
-        plan.TotalCountSql.Should().NotBeNull();
-        plan.TotalCountSql.Should().Contain(ExpectedDescriptorJoin);
-        plan.TotalCountSql.Should().Contain(ExpectedNamespaceAuthorizationGroup);
+        act.Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage(
+                $"Namespace authorization check spec table '{descriptorTable}' does not match query root table '{documentTable}'. "
+                    + "Namespace authorization SQL emission supports only concrete root-table columns."
+            );
     }
 
     [Test]
@@ -278,7 +242,7 @@ public class Given_PageDocumentIdSqlCompiler
                     RootTable: documentTable,
                     Predicates: [],
                     UnifiedAliasMappingsByColumn: new Dictionary<DbColumnName, ColumnStorage.UnifiedAlias>(),
-                    IncludeTotalCountSql: true,
+                    Mode: new PageCandidateMode.Traditional(IncludeTotalCountSql: true),
                     Authorization: authorization
                 )
             );
@@ -286,7 +250,7 @@ public class Given_PageDocumentIdSqlCompiler
         act.Should()
             .Throw<InvalidOperationException>()
             .WithMessage(
-                $"Namespace authorization check spec table '{unrelatedTable}' does not match query root table '{documentTable}'. Namespace authorization SQL emission supports only concrete root-table columns (or the shared dms.Descriptor join for descriptor queries)."
+                $"Namespace authorization check spec table '{unrelatedTable}' does not match query root table '{documentTable}'. Namespace authorization SQL emission supports only concrete root-table columns."
             );
     }
 
@@ -773,7 +737,7 @@ public class Given_PageDocumentIdSqlCompiler
         secondException.ParamName.Should().Be("Predicates");
         secondException
             .Message.Should()
-            .Contain("Filter parameter name 'OffSet' collides with paging parameter name 'offset'");
+            .Contain("Filter parameter name 'OffSet' collides with candidate mode parameter name 'offset'");
     }
 
     [Test]
@@ -973,125 +937,6 @@ public class Given_PageDocumentIdSqlCompiler
 
         plan.PageDocumentIdSql.Should()
             .Contain("r.[NameOfInstitution] COLLATE Latin1_General_100_BIN2 = @nameOfInstitution");
-    }
-
-    [TestCase("Namespace", ScalarKind.String)]
-    [TestCase("CodeValue", ScalarKind.String)]
-    [TestCase("ShortDescription", ScalarKind.String)]
-    [TestCase("Description", ScalarKind.String)]
-    [TestCase("EffectiveBeginDate", ScalarKind.Date)]
-    [TestCase("EffectiveEndDate", ScalarKind.Date)]
-    public void It_should_target_descriptor_query_fields_against_the_shared_descriptor_table(
-        string columnName,
-        ScalarKind scalarKind
-    )
-    {
-        var plan = _compiler.Compile(
-            CreateDescriptorSpec([
-                new QueryValuePredicate(
-                    new DbColumnName("ResourceKeyId"),
-                    QueryComparisonOperator.Equal,
-                    "resourceKeyId"
-                ),
-                new QueryValuePredicate(
-                    new QueryPredicateTarget.DescriptorColumn(new DbColumnName(columnName)),
-                    QueryComparisonOperator.Equal,
-                    "field",
-                    scalarKind
-                ),
-            ])
-        );
-
-        plan.PageDocumentIdSql.Should().Contain("FROM \"dms\".\"Document\" r");
-        plan.PageDocumentIdSql.Should()
-            .Contain("INNER JOIN \"dms\".\"Descriptor\" d ON d.\"DocumentId\" = r.\"DocumentId\"");
-        plan.PageDocumentIdSql.Should().Contain("r.\"ResourceKeyId\" = @resourceKeyId");
-        plan.PageDocumentIdSql.Should().Contain($"d.\"{columnName}\" = @field");
-        plan.PageDocumentIdSql.Should().NotContain("SchoolTypeDescriptor");
-    }
-
-    [Test]
-    public void It_should_not_join_the_shared_descriptor_table_when_descriptor_page_filters_only_target_document_columns()
-    {
-        var plan = _compiler.Compile(
-            CreateDescriptorSpec([
-                new QueryValuePredicate(
-                    new DbColumnName("DocumentUuid"),
-                    QueryComparisonOperator.Equal,
-                    "id"
-                ),
-                new QueryValuePredicate(
-                    new DbColumnName("ResourceKeyId"),
-                    QueryComparisonOperator.Equal,
-                    "resourceKeyId"
-                ),
-            ])
-        );
-
-        plan.PageDocumentIdSql.Should().Contain("FROM \"dms\".\"Document\" r");
-        plan.PageDocumentIdSql.Should().Contain("r.\"DocumentUuid\" = @id");
-        plan.PageDocumentIdSql.Should().Contain("r.\"ResourceKeyId\" = @resourceKeyId");
-        plan.PageDocumentIdSql.Should().NotContain("\"dms\".\"Descriptor\"");
-    }
-
-    [Test]
-    public void It_should_apply_binary_string_equality_to_mssql_descriptor_string_predicates()
-    {
-        var compiler = new PageDocumentIdSqlCompiler(SqlDialect.Mssql);
-        var plan = compiler.Compile(
-            CreateDescriptorSpec(
-                [
-                    new QueryValuePredicate(
-                        new DbColumnName("ResourceKeyId"),
-                        QueryComparisonOperator.Equal,
-                        "resourceKeyId"
-                    ),
-                    new QueryValuePredicate(
-                        new QueryPredicateTarget.DescriptorColumn(new DbColumnName("Namespace")),
-                        QueryComparisonOperator.Equal,
-                        "namespace",
-                        ScalarKind.String
-                    ),
-                ],
-                includeTotalCountSql: true
-            )
-        );
-
-        plan.PageDocumentIdSql.Should().Contain("d.[Namespace] COLLATE Latin1_General_100_BIN2 = @namespace");
-        plan.TotalCountSql.Should().Contain("d.[Namespace] COLLATE Latin1_General_100_BIN2 = @namespace");
-    }
-
-    [TestCase(SqlDialect.Pgsql, "\"dms\".\"Document\" r")]
-    [TestCase(SqlDialect.Mssql, "[dms].[Document] r")]
-    public void It_should_emit_descriptor_total_count_sql_without_optional_joins_when_only_resource_key_discrimination_is_required(
-        SqlDialect dialect,
-        string expectedDocumentFromFragment
-    )
-    {
-        var compiler = new PageDocumentIdSqlCompiler(dialect);
-        var plan = compiler.Compile(
-            CreateDescriptorSpec(
-                [
-                    new QueryValuePredicate(
-                        new DbColumnName("ResourceKeyId"),
-                        QueryComparisonOperator.Equal,
-                        "resourceKeyId"
-                    ),
-                ],
-                includeTotalCountSql: true
-            )
-        );
-
-        plan.TotalCountSql.Should().NotBeNull();
-        plan.TotalCountSql.Should().Contain($"FROM {expectedDocumentFromFragment}");
-        plan.TotalCountSql.Should().Contain("ResourceKeyId");
-        plan.TotalCountSql.Should().NotContain("Descriptor");
-        plan.TotalCountSql.Should().NotContain("doc.");
-        plan.TotalCountSql.Should().NotContain("@offset");
-        plan.TotalCountSql.Should().NotContain("@limit");
-        plan.TotalCountParametersInOrder!.Value.Select(parameter => parameter.ParameterName)
-            .Should()
-            .Equal("resourceKeyId");
     }
 
     [Test]
@@ -1460,42 +1305,42 @@ public class Given_PageDocumentIdSqlCompiler
         RelationshipAuthorizationPersonAuthViewKind.Student,
         RelationshipAuthorizationPersonKind.Student,
         "Student_DocumentId",
-        "r.\"DocumentId\" IN (SELECT t0.\"DocumentId\" FROM \"edfi\".\"StudentSchoolAssociation\" t0 WHERE t0.\"Student_DocumentId\" IN (SELECT t1.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t1 WHERE t1.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
+        "r.\"Student_DocumentId\" IN (SELECT t0.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t0 WHERE t0.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
     )]
     [TestCase(
         SqlDialect.Pgsql,
         RelationshipAuthorizationPersonAuthViewKind.Contact,
         RelationshipAuthorizationPersonKind.Contact,
         "Contact_DocumentId",
-        "r.\"DocumentId\" IN (SELECT t0.\"DocumentId\" FROM \"edfi\".\"StudentSchoolAssociation\" t0 WHERE t0.\"Contact_DocumentId\" IN (SELECT t1.\"Contact_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToContactDocumentId\" t1 WHERE t1.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
+        "r.\"Contact_DocumentId\" IN (SELECT t0.\"Contact_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToContactDocumentId\" t0 WHERE t0.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
     )]
     [TestCase(
         SqlDialect.Pgsql,
         RelationshipAuthorizationPersonAuthViewKind.Staff,
         RelationshipAuthorizationPersonKind.Staff,
         "Staff_DocumentId",
-        "r.\"DocumentId\" IN (SELECT t0.\"DocumentId\" FROM \"edfi\".\"StudentSchoolAssociation\" t0 WHERE t0.\"Staff_DocumentId\" IN (SELECT t1.\"Staff_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStaffDocumentId\" t1 WHERE t1.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
+        "r.\"Staff_DocumentId\" IN (SELECT t0.\"Staff_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStaffDocumentId\" t0 WHERE t0.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
     )]
     [TestCase(
         SqlDialect.Mssql,
         RelationshipAuthorizationPersonAuthViewKind.Student,
         RelationshipAuthorizationPersonKind.Student,
         "Student_DocumentId",
-        "r.[DocumentId] IN (SELECT t0.[DocumentId] FROM [edfi].[StudentSchoolAssociation] t0 WHERE t0.[Student_DocumentId] IN (SELECT t1.[Student_DocumentId] FROM [auth].[EducationOrganizationIdToStudentDocumentId] t1 WHERE t1.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
+        "r.[Student_DocumentId] IN (SELECT t0.[Student_DocumentId] FROM [auth].[EducationOrganizationIdToStudentDocumentId] t0 WHERE t0.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
     )]
     [TestCase(
         SqlDialect.Mssql,
         RelationshipAuthorizationPersonAuthViewKind.Contact,
         RelationshipAuthorizationPersonKind.Contact,
         "Contact_DocumentId",
-        "r.[DocumentId] IN (SELECT t0.[DocumentId] FROM [edfi].[StudentSchoolAssociation] t0 WHERE t0.[Contact_DocumentId] IN (SELECT t1.[Contact_DocumentId] FROM [auth].[EducationOrganizationIdToContactDocumentId] t1 WHERE t1.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
+        "r.[Contact_DocumentId] IN (SELECT t0.[Contact_DocumentId] FROM [auth].[EducationOrganizationIdToContactDocumentId] t0 WHERE t0.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
     )]
     [TestCase(
         SqlDialect.Mssql,
         RelationshipAuthorizationPersonAuthViewKind.Staff,
         RelationshipAuthorizationPersonKind.Staff,
         "Staff_DocumentId",
-        "r.[DocumentId] IN (SELECT t0.[DocumentId] FROM [edfi].[StudentSchoolAssociation] t0 WHERE t0.[Staff_DocumentId] IN (SELECT t1.[Staff_DocumentId] FROM [auth].[EducationOrganizationIdToStaffDocumentId] t1 WHERE t1.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
+        "r.[Staff_DocumentId] IN (SELECT t0.[Staff_DocumentId] FROM [auth].[EducationOrganizationIdToStaffDocumentId] t0 WHERE t0.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
     )]
     public void It_should_emit_direct_root_column_people_authorization_sql_for_page_and_total_count_queries(
         SqlDialect dialect,
@@ -1668,7 +1513,7 @@ public class Given_PageDocumentIdSqlCompiler
     }
 
     [Test]
-    public void It_should_close_direct_people_authorization_membership_and_root_subqueries()
+    public void It_should_close_direct_people_authorization_membership_subquery_and_enclosing_groups()
     {
         var plan = _compiler.Compile(
             CreateSpec(
@@ -1691,7 +1536,7 @@ public class Given_PageDocumentIdSqlCompiler
         );
 
         const string ExpectedPeoplePredicate =
-            "r.\"DocumentId\" IN (SELECT t0.\"DocumentId\" FROM \"edfi\".\"StudentSchoolAssociation\" t0 WHERE t0.\"Student_DocumentId\" IN (SELECT t1.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t1 WHERE t1.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds)))))";
+            "r.\"Student_DocumentId\" IN (SELECT t0.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t0 WHERE t0.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))))";
 
         plan.PageDocumentIdSql.Should().Contain(ExpectedPeoplePredicate);
         plan.TotalCountSql.Should().NotBeNull();
@@ -1722,7 +1567,7 @@ public class Given_PageDocumentIdSqlCompiler
         );
 
         const string ExpectedPeopleClaimFilter =
-            "WHERE t1.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds)";
+            "WHERE t0.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds)";
 
         plan.PageDocumentIdSql.Should().Contain(ExpectedPeopleClaimFilter);
         plan.TotalCountSql.Should().NotBeNull();
@@ -1767,14 +1612,14 @@ public class Given_PageDocumentIdSqlCompiler
 
         plan.PageDocumentIdSql.Should()
             .Contain(
-                "WHERE t1.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0, @ClaimEducationOrganizationIds_1"
+                "WHERE t0.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0, @ClaimEducationOrganizationIds_1"
             );
         plan.PageDocumentIdSql.Should().Contain("@ClaimEducationOrganizationIds_1998");
         plan.PageDocumentIdSql.Should().NotContain("SELECT [Id] FROM @ClaimEducationOrganizationIds");
         plan.TotalCountSql.Should().NotBeNull();
         plan.TotalCountSql.Should()
             .Contain(
-                "WHERE t1.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0, @ClaimEducationOrganizationIds_1"
+                "WHERE t0.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0, @ClaimEducationOrganizationIds_1"
             );
         plan.TotalCountSql.Should().Contain("@ClaimEducationOrganizationIds_1998");
         plan.TotalCountSql.Should().NotContain("SELECT [Id] FROM @ClaimEducationOrganizationIds");
@@ -1824,7 +1669,7 @@ public class Given_PageDocumentIdSqlCompiler
         );
 
         const string ExpectedPeopleClaimFilter =
-            "WHERE t1.[SourceEducationOrganizationId] IN (SELECT [Id] FROM @ClaimEducationOrganizationIds)";
+            "WHERE t0.[SourceEducationOrganizationId] IN (SELECT [Id] FROM @ClaimEducationOrganizationIds)";
 
         plan.PageDocumentIdSql.Should().Contain(ExpectedPeopleClaimFilter);
         plan.PageDocumentIdSql.Should().NotContain("@ClaimEducationOrganizationIds_0");
@@ -1890,18 +1735,55 @@ public class Given_PageDocumentIdSqlCompiler
 
     [TestCase(
         SqlDialect.Pgsql,
-        "r.\"DocumentId\" IN (SELECT t0.\"DocumentId\" FROM \"edfi\".\"Student\" t0 WHERE t0.\"DocumentId\" IN (SELECT t1.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t1 WHERE t1.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
+        RelationshipAuthorizationPersonAuthViewKind.Student,
+        RelationshipAuthorizationPersonKind.Student,
+        "Student",
+        "r.\"DocumentId\" IN (SELECT t0.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t0 WHERE t0.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
+    )]
+    [TestCase(
+        SqlDialect.Pgsql,
+        RelationshipAuthorizationPersonAuthViewKind.Staff,
+        RelationshipAuthorizationPersonKind.Staff,
+        "Staff",
+        "r.\"DocumentId\" IN (SELECT t0.\"Staff_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStaffDocumentId\" t0 WHERE t0.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
+    )]
+    [TestCase(
+        SqlDialect.Pgsql,
+        RelationshipAuthorizationPersonAuthViewKind.Contact,
+        RelationshipAuthorizationPersonKind.Contact,
+        "Contact",
+        "r.\"DocumentId\" IN (SELECT t0.\"Contact_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToContactDocumentId\" t0 WHERE t0.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
     )]
     [TestCase(
         SqlDialect.Mssql,
-        "r.[DocumentId] IN (SELECT t0.[DocumentId] FROM [edfi].[Student] t0 WHERE t0.[DocumentId] IN (SELECT t1.[Student_DocumentId] FROM [auth].[EducationOrganizationIdToStudentDocumentId] t1 WHERE t1.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
+        RelationshipAuthorizationPersonAuthViewKind.Student,
+        RelationshipAuthorizationPersonKind.Student,
+        "Student",
+        "r.[DocumentId] IN (SELECT t0.[Student_DocumentId] FROM [auth].[EducationOrganizationIdToStudentDocumentId] t0 WHERE t0.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
     )]
-    public void It_should_emit_student_self_authorization_sql_from_root_document_id_without_unique_id_or_usi(
+    [TestCase(
+        SqlDialect.Mssql,
+        RelationshipAuthorizationPersonAuthViewKind.Staff,
+        RelationshipAuthorizationPersonKind.Staff,
+        "Staff",
+        "r.[DocumentId] IN (SELECT t0.[Staff_DocumentId] FROM [auth].[EducationOrganizationIdToStaffDocumentId] t0 WHERE t0.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
+    )]
+    [TestCase(
+        SqlDialect.Mssql,
+        RelationshipAuthorizationPersonAuthViewKind.Contact,
+        RelationshipAuthorizationPersonKind.Contact,
+        "Contact",
+        "r.[DocumentId] IN (SELECT t0.[Contact_DocumentId] FROM [auth].[EducationOrganizationIdToContactDocumentId] t0 WHERE t0.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
+    )]
+    public void It_should_emit_self_authorization_sql_from_root_document_id_without_unique_id_or_usi(
         SqlDialect dialect,
+        RelationshipAuthorizationPersonAuthViewKind authViewKind,
+        RelationshipAuthorizationPersonKind personKind,
+        string rootTableName,
         string expectedPredicateFragment
     )
     {
-        var rootTable = new DbTableName(new DbSchemaName("edfi"), "Student");
+        var rootTable = new DbTableName(new DbSchemaName("edfi"), rootTableName);
         var compiler = new PageDocumentIdSqlCompiler(dialect);
         var plan = compiler.Compile(
             CreateSpec(
@@ -1911,10 +1793,10 @@ public class Given_PageDocumentIdSqlCompiler
                 authorization: CreateAuthorizationSpec(
                     dialect,
                     CreateAuthorizationStrategy(
-                        AuthorizationStrategyNameConstants.RelationshipsWithStudentsOnly,
+                        AuthorizationStrategyNameConstants.RelationshipsWithPeopleOnly,
                         CreatePersonAuthorizationSubject(
-                            RelationshipAuthorizationPersonAuthViewKind.Student,
-                            RelationshipAuthorizationPersonKind.Student,
+                            authViewKind,
+                            personKind,
                             new DbColumnName("DocumentId"),
                             RelationshipAuthorizationPersonSubjectPathKind.SelfRootDocumentId,
                             rootTable
@@ -1934,11 +1816,11 @@ public class Given_PageDocumentIdSqlCompiler
 
     [TestCase(
         SqlDialect.Pgsql,
-        "r.\"DocumentId\" IN (SELECT t0.\"DocumentId\" FROM \"edfi\".\"CourseTranscript\" t0 JOIN \"edfi\".\"StudentAcademicRecord\" t1 ON t1.\"DocumentId\" = t0.\"StudentAcademicRecord_DocumentId\" WHERE t1.\"Student_DocumentId\" IN (SELECT t2.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t2 WHERE t2.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
+        "r.\"StudentAcademicRecord_DocumentId\" IN (SELECT t0.\"DocumentId\" FROM \"edfi\".\"StudentAcademicRecord\" t0 WHERE t0.\"Student_DocumentId\" IN (SELECT t1.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t1 WHERE t1.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
     )]
     [TestCase(
         SqlDialect.Mssql,
-        "r.[DocumentId] IN (SELECT t0.[DocumentId] FROM [edfi].[CourseTranscript] t0 JOIN [edfi].[StudentAcademicRecord] t1 ON t1.[DocumentId] = t0.[StudentAcademicRecord_DocumentId] WHERE t1.[Student_DocumentId] IN (SELECT t2.[Student_DocumentId] FROM [auth].[EducationOrganizationIdToStudentDocumentId] t2 WHERE t2.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
+        "r.[StudentAcademicRecord_DocumentId] IN (SELECT t0.[DocumentId] FROM [edfi].[StudentAcademicRecord] t0 WHERE t0.[Student_DocumentId] IN (SELECT t1.[Student_DocumentId] FROM [auth].[EducationOrganizationIdToStudentDocumentId] t1 WHERE t1.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
     )]
     public void It_should_emit_transitive_student_authorization_sql_with_ordered_path_joins_for_page_and_total_count_queries(
         SqlDialect dialect,
@@ -2033,11 +1915,177 @@ public class Given_PageDocumentIdSqlCompiler
         );
 
         const string ExpectedPeoplePredicate =
-            "r.\"DocumentId\" IN (SELECT t0.\"DocumentId\" FROM \"edfi\".\"CourseTranscript\" t0 JOIN \"edfi\".\"StudentAcademicRecord\" t1 ON t1.\"DocumentId\" = t0.\"StudentAcademicRecord_DocumentId\" WHERE t1.\"Student_DocumentId\" IN (SELECT t2.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t2 WHERE t2.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds)))))";
+            "r.\"StudentAcademicRecord_DocumentId\" IN (SELECT t0.\"DocumentId\" FROM \"edfi\".\"StudentAcademicRecord\" t0 WHERE t0.\"Student_DocumentId\" IN (SELECT t1.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t1 WHERE t1.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds)))))";
 
         plan.PageDocumentIdSql.Should().Contain(ExpectedPeoplePredicate);
         plan.TotalCountSql.Should().NotBeNull();
         plan.TotalCountSql.Should().Contain(ExpectedPeoplePredicate);
+    }
+
+    /// <summary>
+    /// The deepest transitive path in DS 5.2, taken verbatim from
+    /// Fixtures/authoritative/ds-5.2/expected/multi-hop-person-auth-paths-pgsql.json. Three hops is where the
+    /// intermediate join loop actually runs: the anchor and the first hop open the subquery, one JOIN carries
+    /// the middle hop, and the terminal step supplies the person column.
+    /// </summary>
+    /// <remarks>
+    /// This is the only place that shape is exercised anywhere in the branch. The integration differential's
+    /// transitive specs — Grade and CourseTranscript — are both two-hop, and at two hops
+    /// <c>AppendRootDocumentIdInTransitivePersonAuthViewSql</c>'s loop range is empty, so the JOIN-emitting body
+    /// never executes against a database. The expected fragment below is therefore checked twice: once against a
+    /// hand-authored literal, and once against the differential emitter, whose own <c>AppendPathJoins</c> body
+    /// <em>is</em> executed at two hops through the Legacy arm and proved row-equivalent to production. Neither
+    /// witness is the only one.
+    /// </remarks>
+    [TestCase(
+        SqlDialect.Pgsql,
+        "r.\"StudentAssessmentRegistration_DocumentId\" IN (SELECT t0.\"DocumentId\" FROM \"edfi\".\"StudentAssessmentRegistration\" t0 JOIN \"edfi\".\"StudentEducationOrganizationAssociation\" t1 ON t1.\"DocumentId\" = t0.\"StudentEducationOrganizationAssociation_DocumentId\" WHERE t1.\"Student_DocumentId\" IN (SELECT t2.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t2 WHERE t2.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
+    )]
+    [TestCase(
+        SqlDialect.Mssql,
+        "r.[StudentAssessmentRegistration_DocumentId] IN (SELECT t0.[DocumentId] FROM [edfi].[StudentAssessmentRegistration] t0 JOIN [edfi].[StudentEducationOrganizationAssociation] t1 ON t1.[DocumentId] = t0.[StudentEducationOrganizationAssociation_DocumentId] WHERE t1.[Student_DocumentId] IN (SELECT t2.[Student_DocumentId] FROM [auth].[EducationOrganizationIdToStudentDocumentId] t2 WHERE t2.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
+    )]
+    public void It_should_emit_three_hop_transitive_student_authorization_sql_with_ordered_path_joins(
+        SqlDialect dialect,
+        string expectedPredicateFragment
+    )
+    {
+        var rootTable = new DbTableName(
+            new DbSchemaName("edfi"),
+            "StudentAssessmentRegistrationBatteryPartAssociation"
+        );
+        var spec = CreateSpec(
+            [],
+            [],
+            includeTotalCountSql: true,
+            authorization: CreateAuthorizationSpec(
+                dialect,
+                CreateAuthorizationStrategy(
+                    AuthorizationStrategyNameConstants.RelationshipsWithStudentsOnly,
+                    CreateThreeHopStudentPersonAuthorizationSubject(rootTable)
+                )
+            ),
+            rootTable: rootTable
+        );
+        var plan = new PageDocumentIdSqlCompiler(dialect).Compile(spec);
+
+        plan.PageDocumentIdSql.Should().Contain(expectedPredicateFragment);
+        plan.TotalCountSql.Should().NotBeNull();
+        plan.TotalCountSql.Should().Contain(expectedPredicateFragment);
+
+        // The independent witness for the JOIN-emitting loop body, per this test's remarks. Both emitters
+        // allocate t0/t1/t2 in the same order for a single-person-subject spec, so the predicates are directly
+        // comparable — and unlike the literal above, this one carries the predicate's closing paren.
+        var emittedPredicate = RelationshipAuthorizationDifferentialSqlEmitter.EmitAuthorizationPredicate(
+            spec,
+            dialect,
+            RelationshipAuthorizationPredicateShape.Anchored
+        );
+
+        plan.PageDocumentIdSql.Should()
+            .Contain(
+                emittedPredicate,
+                "the three-hop predicate the compiler emits must agree with the differential emitter's, which is "
+                    + "the arm the executed row-set equivalence proof pins to production"
+            );
+        plan.TotalCountSql.Should().Contain(emittedPredicate);
+
+        var quotedRootRelation = SqlDialectFactory.Create(dialect).QualifyTable(rootTable);
+
+        CountOrdinalOccurrences(plan.PageDocumentIdSql, quotedRootRelation).Should().Be(1);
+        CountOrdinalOccurrences(plan.TotalCountSql!, quotedRootRelation).Should().Be(1);
+    }
+
+    [Test]
+    public void It_should_reject_transitive_people_authorization_path_step_missing_a_target_table()
+    {
+        var rootTable = new DbTableName(new DbSchemaName("edfi"), "CourseTranscript");
+        var studentAcademicRecordTable = new DbTableName(new DbSchemaName("edfi"), "StudentAcademicRecord");
+        var studentTable = new DbTableName(new DbSchemaName("edfi"), "Student");
+
+        Action act = () =>
+            _compiler.Compile(
+                CreateSpec(
+                    [],
+                    [],
+                    authorization: CreateAuthorizationSpec(
+                        SqlDialect.Pgsql,
+                        CreateAuthorizationStrategy(
+                            AuthorizationStrategyNameConstants.RelationshipsWithStudentsOnly,
+                            CreateTransitivePersonAuthorizationSubject(
+                                RelationshipAuthorizationPersonAuthViewKind.Student,
+                                RelationshipAuthorizationPersonKind.Student,
+                                rootTable,
+                                [
+                                    new ColumnPathStep(
+                                        rootTable,
+                                        new DbColumnName("StudentAcademicRecord_DocumentId"),
+                                        null,
+                                        new DbColumnName("DocumentId")
+                                    ),
+                                    new ColumnPathStep(
+                                        studentAcademicRecordTable,
+                                        new DbColumnName("Student_DocumentId"),
+                                        studentTable,
+                                        new DbColumnName("DocumentId")
+                                    ),
+                                ]
+                            )
+                        )
+                    ),
+                    rootTable: rootTable
+                )
+            );
+
+        act.Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage("Transitive People authorization path step 0 is missing a target table.");
+    }
+
+    [Test]
+    public void It_should_reject_transitive_people_authorization_path_step_missing_a_target_column()
+    {
+        var rootTable = new DbTableName(new DbSchemaName("edfi"), "CourseTranscript");
+        var studentAcademicRecordTable = new DbTableName(new DbSchemaName("edfi"), "StudentAcademicRecord");
+        var studentTable = new DbTableName(new DbSchemaName("edfi"), "Student");
+
+        Action act = () =>
+            _compiler.Compile(
+                CreateSpec(
+                    [],
+                    [],
+                    authorization: CreateAuthorizationSpec(
+                        SqlDialect.Pgsql,
+                        CreateAuthorizationStrategy(
+                            AuthorizationStrategyNameConstants.RelationshipsWithStudentsOnly,
+                            CreateTransitivePersonAuthorizationSubject(
+                                RelationshipAuthorizationPersonAuthViewKind.Student,
+                                RelationshipAuthorizationPersonKind.Student,
+                                rootTable,
+                                [
+                                    new ColumnPathStep(
+                                        rootTable,
+                                        new DbColumnName("StudentAcademicRecord_DocumentId"),
+                                        studentAcademicRecordTable,
+                                        null
+                                    ),
+                                    new ColumnPathStep(
+                                        studentAcademicRecordTable,
+                                        new DbColumnName("Student_DocumentId"),
+                                        studentTable,
+                                        new DbColumnName("DocumentId")
+                                    ),
+                                ]
+                            )
+                        )
+                    ),
+                    rootTable: rootTable
+                )
+            );
+
+        act.Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage("Transitive People authorization path step 0 is missing a target column.");
     }
 
     [Test]
@@ -2091,11 +2139,11 @@ public class Given_PageDocumentIdSqlCompiler
 
     [TestCase(
         SqlDialect.Pgsql,
-        "r.\"DocumentId\" IN (SELECT t0.\"DocumentId\" FROM \"edfi\".\"CourseTranscript\" t0 JOIN \"edfi\".\"StudentAcademicRecord\" t1 ON t1.\"DocumentId\" = t0.\"StudentAcademicRecord_DocumentId\" WHERE t1.\"Contact_DocumentId\" IN (SELECT t2.\"Contact_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToContactDocumentId\" t2 WHERE t2.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
+        "r.\"StudentAcademicRecord_DocumentId\" IN (SELECT t0.\"DocumentId\" FROM \"edfi\".\"StudentAcademicRecord\" t0 WHERE t0.\"Contact_DocumentId\" IN (SELECT t1.\"Contact_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToContactDocumentId\" t1 WHERE t1.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
     )]
     [TestCase(
         SqlDialect.Mssql,
-        "r.[DocumentId] IN (SELECT t0.[DocumentId] FROM [edfi].[CourseTranscript] t0 JOIN [edfi].[StudentAcademicRecord] t1 ON t1.[DocumentId] = t0.[StudentAcademicRecord_DocumentId] WHERE t1.[Contact_DocumentId] IN (SELECT t2.[Contact_DocumentId] FROM [auth].[EducationOrganizationIdToContactDocumentId] t2 WHERE t2.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
+        "r.[StudentAcademicRecord_DocumentId] IN (SELECT t0.[DocumentId] FROM [edfi].[StudentAcademicRecord] t0 WHERE t0.[Contact_DocumentId] IN (SELECT t1.[Contact_DocumentId] FROM [auth].[EducationOrganizationIdToContactDocumentId] t1 WHERE t1.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
     )]
     public void It_should_emit_transitive_contact_authorization_sql_with_ordered_path_joins_for_page_and_total_count_queries(
         SqlDialect dialect,
@@ -2151,11 +2199,11 @@ public class Given_PageDocumentIdSqlCompiler
 
     [TestCase(
         SqlDialect.Pgsql,
-        "r.\"DocumentId\" IN (SELECT t0.\"DocumentId\" FROM \"edfi\".\"StudentSchoolAssociation\" t0 WHERE t0.\"Student_DocumentId\" IN (SELECT t1.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentIdThroughResponsibility\" t1 WHERE t1.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
+        "r.\"Student_DocumentId\" IN (SELECT t0.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentIdThroughResponsibility\" t0 WHERE t0.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
     )]
     [TestCase(
         SqlDialect.Mssql,
-        "r.[DocumentId] IN (SELECT t0.[DocumentId] FROM [edfi].[StudentSchoolAssociation] t0 WHERE t0.[Student_DocumentId] IN (SELECT t1.[Student_DocumentId] FROM [auth].[EducationOrganizationIdToStudentDocumentIdThroughResponsibility] t1 WHERE t1.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
+        "r.[Student_DocumentId] IN (SELECT t0.[Student_DocumentId] FROM [auth].[EducationOrganizationIdToStudentDocumentIdThroughResponsibility] t0 WHERE t0.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
     )]
     public void It_should_emit_students_only_through_responsibility_authorization_sql_for_page_and_total_count_queries(
         SqlDialect dialect,
@@ -2192,11 +2240,11 @@ public class Given_PageDocumentIdSqlCompiler
 
     [TestCase(
         SqlDialect.Pgsql,
-        "r.\"SchoolId\" IN (SELECT t0.\"TargetEducationOrganizationId\" FROM \"auth\".\"EducationOrganizationIdToEducationOrganizationId\" t0 WHERE t0.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds)) AND r.\"DocumentId\" IN (SELECT t1.\"DocumentId\" FROM \"edfi\".\"StudentSchoolAssociation\" t1 WHERE t1.\"Student_DocumentId\" IN (SELECT t2.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t2 WHERE t2.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
+        "r.\"SchoolId\" IN (SELECT t0.\"TargetEducationOrganizationId\" FROM \"auth\".\"EducationOrganizationIdToEducationOrganizationId\" t0 WHERE t0.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds)) AND r.\"Student_DocumentId\" IN (SELECT t1.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t1 WHERE t1.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
     )]
     [TestCase(
         SqlDialect.Mssql,
-        "r.[SchoolId] IN (SELECT t0.[TargetEducationOrganizationId] FROM [auth].[EducationOrganizationIdToEducationOrganizationId] t0 WHERE t0.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0)) AND r.[DocumentId] IN (SELECT t1.[DocumentId] FROM [edfi].[StudentSchoolAssociation] t1 WHERE t1.[Student_DocumentId] IN (SELECT t2.[Student_DocumentId] FROM [auth].[EducationOrganizationIdToStudentDocumentId] t2 WHERE t2.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
+        "r.[SchoolId] IN (SELECT t0.[TargetEducationOrganizationId] FROM [auth].[EducationOrganizationIdToEducationOrganizationId] t0 WHERE t0.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0)) AND r.[Student_DocumentId] IN (SELECT t1.[Student_DocumentId] FROM [auth].[EducationOrganizationIdToStudentDocumentId] t1 WHERE t1.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
     )]
     public void It_should_and_edorg_and_people_subjects_inside_one_mixed_relationship_strategy(
         SqlDialect dialect,
@@ -2237,13 +2285,13 @@ public class Given_PageDocumentIdSqlCompiler
         SqlDialect.Pgsql,
         "FROM \"edfi\".\"StudentSchoolAssociation\"",
         "r.\"SchoolId\" IN (SELECT t0.\"TargetEducationOrganizationId\" FROM \"auth\".\"EducationOrganizationIdToEducationOrganizationId\" t0 WHERE t0.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))",
-        "r.\"DocumentId\" IN (SELECT t1.\"DocumentId\" FROM \"edfi\".\"StudentSchoolAssociation\" t1 WHERE t1.\"Student_DocumentId\" IN (SELECT t2.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t2 WHERE t2.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
+        "r.\"Student_DocumentId\" IN (SELECT t1.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t1 WHERE t1.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
     )]
     [TestCase(
         SqlDialect.Mssql,
         "FROM [edfi].[StudentSchoolAssociation]",
         "r.[SchoolId] IN (SELECT t0.[TargetEducationOrganizationId] FROM [auth].[EducationOrganizationIdToEducationOrganizationId] t0 WHERE t0.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))",
-        "r.[DocumentId] IN (SELECT t1.[DocumentId] FROM [edfi].[StudentSchoolAssociation] t1 WHERE t1.[Student_DocumentId] IN (SELECT t2.[Student_DocumentId] FROM [auth].[EducationOrganizationIdToStudentDocumentId] t2 WHERE t2.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
+        "r.[Student_DocumentId] IN (SELECT t1.[Student_DocumentId] FROM [auth].[EducationOrganizationIdToStudentDocumentId] t1 WHERE t1.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
     )]
     public void It_should_or_edorg_only_and_people_involved_strategies_without_outer_authorization_joins(
         SqlDialect dialect,
@@ -2282,13 +2330,360 @@ public class Given_PageDocumentIdSqlCompiler
         plan.PageDocumentIdSql.Should().Contain(" OR ");
         plan.PageDocumentIdSql.Should().NotContain("JOIN \"auth\"");
         plan.PageDocumentIdSql.Should().NotContain("JOIN [auth]");
-        CountOrdinalOccurrences(plan.PageDocumentIdSql, expectedRootTableFromFragment).Should().Be(2);
+
+        // Once, not twice: the person predicate anchors on the root row's own reference column, so it no
+        // longer reopens the root table in a primary-key self-join alongside the outer FROM.
+        CountOrdinalOccurrences(plan.PageDocumentIdSql, expectedRootTableFromFragment).Should().Be(1);
 
         plan.TotalCountSql.Should().NotBeNull();
         plan.TotalCountSql.Should().Contain(expectedEdOrgPredicateFragment);
         plan.TotalCountSql.Should().Contain(expectedPeoplePredicateFragment);
         plan.TotalCountSql.Should().Contain(" OR ");
-        CountOrdinalOccurrences(plan.TotalCountSql!, expectedRootTableFromFragment).Should().Be(2);
+        CountOrdinalOccurrences(plan.TotalCountSql!, expectedRootTableFromFragment).Should().Be(1);
+    }
+
+    /// <summary>
+    /// AC1's permanent regression gate. The authorization predicate must anchor on a column of the root row,
+    /// never on a primary-key self-join of the root table, so the root relation appears exactly once in the
+    /// emitted SQL. This holds at any row count, which is what makes it the gate rather than the integration
+    /// evidence. Scoped to person subjects: the custom-view multi-step branch deliberately keeps its self-join
+    /// and is covered by its own fixture.
+    /// </summary>
+    [TestCase(SqlDialect.Pgsql, RelationshipAuthorizationPersonSubjectPathKind.SelfRootDocumentId)]
+    [TestCase(SqlDialect.Pgsql, RelationshipAuthorizationPersonSubjectPathKind.DirectRootColumn)]
+    [TestCase(SqlDialect.Pgsql, RelationshipAuthorizationPersonSubjectPathKind.TransitiveJoinPath)]
+    [TestCase(SqlDialect.Mssql, RelationshipAuthorizationPersonSubjectPathKind.SelfRootDocumentId)]
+    [TestCase(SqlDialect.Mssql, RelationshipAuthorizationPersonSubjectPathKind.DirectRootColumn)]
+    [TestCase(SqlDialect.Mssql, RelationshipAuthorizationPersonSubjectPathKind.TransitiveJoinPath)]
+    public void It_should_reference_the_root_relation_exactly_once_for_every_person_path_kind(
+        SqlDialect dialect,
+        RelationshipAuthorizationPersonSubjectPathKind pathKind
+    )
+    {
+        var (rootTable, subject) = CreatePersonAuthorizationSubjectForPathKind(pathKind);
+        var plan = CompilePersonAuthorizationPlan(dialect, rootTable, subject);
+
+        // Built with the same dialect the compiler writes through, so the expected token cannot drift from the
+        // emitted one. It carries its closing delimiter, which is what keeps "edfi"."StudentSchoolAssociation"
+        // from matching inside a longer name such as "edfi"."StudentSchoolAssociationProgram".
+        var quotedRootRelation = SqlDialectFactory.Create(dialect).QualifyTable(rootTable);
+
+        CountOrdinalOccurrences(plan.PageDocumentIdSql, quotedRootRelation).Should().Be(1);
+        plan.TotalCountSql.Should().NotBeNull();
+        CountOrdinalOccurrences(plan.TotalCountSql!, quotedRootRelation).Should().Be(1);
+    }
+
+    /// <summary>
+    /// AC5. Both SQL strings delegate to the same WHERE-clause emitter, so their authorization predicates are
+    /// identical by construction — this asserts it instead of assuming it, which is what turns the shared
+    /// delegation into a checked contract.
+    /// </summary>
+    [TestCase(SqlDialect.Pgsql, RelationshipAuthorizationPersonSubjectPathKind.SelfRootDocumentId)]
+    [TestCase(SqlDialect.Pgsql, RelationshipAuthorizationPersonSubjectPathKind.DirectRootColumn)]
+    [TestCase(SqlDialect.Pgsql, RelationshipAuthorizationPersonSubjectPathKind.TransitiveJoinPath)]
+    [TestCase(SqlDialect.Mssql, RelationshipAuthorizationPersonSubjectPathKind.SelfRootDocumentId)]
+    [TestCase(SqlDialect.Mssql, RelationshipAuthorizationPersonSubjectPathKind.DirectRootColumn)]
+    [TestCase(SqlDialect.Mssql, RelationshipAuthorizationPersonSubjectPathKind.TransitiveJoinPath)]
+    public void It_should_emit_identical_authorization_predicates_in_page_and_total_count_sql(
+        SqlDialect dialect,
+        RelationshipAuthorizationPersonSubjectPathKind pathKind
+    )
+    {
+        var (rootTable, subject) = CreatePersonAuthorizationSubjectForPathKind(pathKind);
+        var plan = CompilePersonAuthorizationPlan(dialect, rootTable, subject);
+
+        plan.TotalCountSql.Should().NotBeNull();
+        ExtractAuthorizationPredicate(plan.TotalCountSql!)
+            .Should()
+            .Be(ExtractAuthorizationPredicate(plan.PageDocumentIdSql));
+    }
+
+    /// <summary>
+    /// A cursor page whose person subject anchors on the ordering column repeats the cursor bounds inside
+    /// the auth-view membership subquery. Bounding only the root row lets PostgreSQL merge-join an unbounded
+    /// auth-view scan and walk every authorized row below the anchor before its first match, so page cost
+    /// grows with cursor depth; the inner bound gives that scan an index condition on both providers.
+    /// </summary>
+    [TestCase(
+        SqlDialect.Pgsql,
+        "r.\"DocumentId\" IN (SELECT t0.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t0 WHERE t0.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds) AND t0.\"Student_DocumentId\" >= @cursorMin AND t0.\"Student_DocumentId\" <= @cursorMax)"
+    )]
+    [TestCase(
+        SqlDialect.Mssql,
+        "r.[DocumentId] IN (SELECT t0.[Student_DocumentId] FROM [auth].[EducationOrganizationIdToStudentDocumentId] t0 WHERE t0.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0) AND t0.[Student_DocumentId] >= @cursorMin AND t0.[Student_DocumentId] <= @cursorMax)"
+    )]
+    public void It_should_bound_a_self_anchored_person_auth_view_subquery_by_the_cursor_anchor(
+        SqlDialect dialect,
+        string expectedAuthorizationFragment
+    )
+    {
+        var (rootTable, subject) = CreatePersonAuthorizationSubjectForPathKind(
+            RelationshipAuthorizationPersonSubjectPathKind.SelfRootDocumentId
+        );
+        var plan = CompilePersonAuthorizationCursorPlan(
+            dialect,
+            rootTable,
+            subject,
+            new PageCandidateMode.Cursor()
+        );
+
+        plan.PageDocumentIdSql.Should().Contain(expectedAuthorizationFragment);
+    }
+
+    /// <summary>
+    /// The inner bound is only correct when the subject anchors on the ordering column itself. A reference
+    /// anchor (<c>Student_DocumentId</c> on StudentSchoolAssociation) ranges over a different key space than
+    /// the root <c>DocumentId</c> cursor, so its subquery must stay exactly as traditional paging emits it.
+    /// </summary>
+    [TestCase(SqlDialect.Pgsql)]
+    [TestCase(SqlDialect.Mssql)]
+    public void It_should_leave_a_reference_anchored_person_auth_view_subquery_unbounded_in_cursor_mode(
+        SqlDialect dialect
+    )
+    {
+        var (rootTable, subject) = CreatePersonAuthorizationSubjectForPathKind(
+            RelationshipAuthorizationPersonSubjectPathKind.DirectRootColumn
+        );
+        var traditionalPlan = CompilePersonAuthorizationPlan(dialect, rootTable, subject);
+        var cursorPlan = CompilePersonAuthorizationCursorPlan(
+            dialect,
+            rootTable,
+            subject,
+            new PageCandidateMode.Cursor()
+        );
+
+        ExtractAuthorizationPredicate(cursorPlan.PageDocumentIdSql)
+            .Should()
+            .Be(ExtractAuthorizationPredicate(traditionalPlan.PageDocumentIdSql));
+    }
+
+    /// <summary>
+    /// A <c>ContentVersion</c> cursor bounds a column the auth view does not expose, so a self-anchored
+    /// subject keeps the traditional subquery: pushing a <c>ContentVersion</c> range onto
+    /// <c>Student_DocumentId</c> would authorize the wrong rows.
+    /// </summary>
+    [TestCase(SqlDialect.Pgsql)]
+    [TestCase(SqlDialect.Mssql)]
+    public void It_should_leave_the_person_auth_view_subquery_unbounded_when_the_cursor_orders_by_content_version(
+        SqlDialect dialect
+    )
+    {
+        var (rootTable, subject) = CreatePersonAuthorizationSubjectForPathKind(
+            RelationshipAuthorizationPersonSubjectPathKind.SelfRootDocumentId
+        );
+        var traditionalPlan = CompilePersonAuthorizationPlan(dialect, rootTable, subject);
+        var cursorPlan = CompilePersonAuthorizationCursorPlan(
+            dialect,
+            rootTable,
+            subject,
+            new PageCandidateMode.Cursor(OrderingMode: PageOrderingMode.ContentVersion)
+        );
+
+        ExtractAuthorizationPredicate(cursorPlan.PageDocumentIdSql)
+            .Should()
+            .Be(ExtractAuthorizationPredicate(traditionalPlan.PageDocumentIdSql));
+    }
+
+    [TestCase(
+        SqlDialect.Pgsql,
+        "r.\"Student_DocumentId\" IN (SELECT t0.\"Student_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToStudentDocumentId\" t0 WHERE t0.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds)) AND r.\"Contact_DocumentId\" IN (SELECT t1.\"Contact_DocumentId\" FROM \"auth\".\"EducationOrganizationIdToContactDocumentId\" t1 WHERE t1.\"SourceEducationOrganizationId\" = ANY(@ClaimEducationOrganizationIds))"
+    )]
+    [TestCase(
+        SqlDialect.Mssql,
+        "r.[Student_DocumentId] IN (SELECT t0.[Student_DocumentId] FROM [auth].[EducationOrganizationIdToStudentDocumentId] t0 WHERE t0.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0)) AND r.[Contact_DocumentId] IN (SELECT t1.[Contact_DocumentId] FROM [auth].[EducationOrganizationIdToContactDocumentId] t1 WHERE t1.[SourceEducationOrganizationId] IN (@ClaimEducationOrganizationIds_0))"
+    )]
+    public void It_should_and_multiple_person_subjects_within_one_authorization_strategy(
+        SqlDialect dialect,
+        string expectedAuthorizationFragment
+    )
+    {
+        var rootTable = new DbTableName(new DbSchemaName("edfi"), "StudentSchoolAssociation");
+        var compiler = new PageDocumentIdSqlCompiler(dialect);
+        var plan = compiler.Compile(
+            CreateSpec(
+                [],
+                [],
+                includeTotalCountSql: true,
+                authorization: CreateAuthorizationSpec(
+                    dialect,
+                    CreateAuthorizationStrategy(
+                        AuthorizationStrategyNameConstants.RelationshipsWithPeopleOnly,
+                        CreatePersonAuthorizationSubject(
+                            RelationshipAuthorizationPersonAuthViewKind.Student,
+                            RelationshipAuthorizationPersonKind.Student,
+                            new DbColumnName("Student_DocumentId"),
+                            RelationshipAuthorizationPersonSubjectPathKind.DirectRootColumn,
+                            rootTable
+                        ),
+                        CreatePersonAuthorizationSubject(
+                            RelationshipAuthorizationPersonAuthViewKind.Contact,
+                            RelationshipAuthorizationPersonKind.Contact,
+                            new DbColumnName("Contact_DocumentId"),
+                            RelationshipAuthorizationPersonSubjectPathKind.DirectRootColumn,
+                            rootTable
+                        )
+                    )
+                ),
+                rootTable: rootTable
+            )
+        );
+
+        plan.PageDocumentIdSql.Should().Contain(expectedAuthorizationFragment);
+        plan.TotalCountSql.Should().NotBeNull();
+        plan.TotalCountSql.Should().Contain(expectedAuthorizationFragment);
+
+        // Two anchored person subjects still read the root relation once, not once per subject.
+        var quotedRootRelation = SqlDialectFactory.Create(dialect).QualifyTable(rootTable);
+
+        CountOrdinalOccurrences(plan.PageDocumentIdSql, quotedRootRelation).Should().Be(1);
+        CountOrdinalOccurrences(plan.TotalCountSql!, quotedRootRelation).Should().Be(1);
+    }
+
+    [TestCase(SqlDialect.Pgsql, "r.\"SchoolId\" = @schoolId")]
+    [TestCase(SqlDialect.Mssql, "r.[SchoolId] = @schoolId")]
+    public void It_should_anchor_person_authorization_alongside_value_predicates(
+        SqlDialect dialect,
+        string expectedValuePredicate
+    )
+    {
+        var (rootTable, subject) = CreatePersonAuthorizationSubjectForPathKind(
+            RelationshipAuthorizationPersonSubjectPathKind.DirectRootColumn
+        );
+        var compiler = new PageDocumentIdSqlCompiler(dialect);
+        var plan = compiler.Compile(
+            CreateSpec(
+                [
+                    new QueryValuePredicate(
+                        new DbColumnName("SchoolId"),
+                        QueryComparisonOperator.Equal,
+                        "schoolId"
+                    ),
+                ],
+                [],
+                includeTotalCountSql: true,
+                authorization: CreateAuthorizationSpec(
+                    dialect,
+                    CreateAuthorizationStrategy(
+                        AuthorizationStrategyNameConstants.RelationshipsWithPeopleOnly,
+                        subject
+                    )
+                ),
+                rootTable: rootTable
+            )
+        );
+
+        plan.PageDocumentIdSql.Should().Contain(expectedValuePredicate);
+        plan.TotalCountSql.Should().NotBeNull();
+        plan.TotalCountSql.Should().Contain(expectedValuePredicate);
+
+        // The value predicate shifts the authorization group to the second WHERE slot; the predicate text and
+        // the single root-relation reference are unaffected by that composition.
+        ExtractAuthorizationPredicate(plan.TotalCountSql!)
+            .Should()
+            .Be(ExtractAuthorizationPredicate(plan.PageDocumentIdSql));
+
+        var quotedRootRelation = SqlDialectFactory.Create(dialect).QualifyTable(rootTable);
+
+        CountOrdinalOccurrences(plan.PageDocumentIdSql, quotedRootRelation).Should().Be(1);
+        CountOrdinalOccurrences(plan.TotalCountSql!, quotedRootRelation).Should().Be(1);
+    }
+
+    [TestCase(
+        SqlDialect.Pgsql,
+        "INNER JOIN \"dms\".\"Document\" doc ON doc.\"DocumentId\" = r.\"DocumentId\"",
+        "doc.\"DocumentUuid\" = @documentUuid"
+    )]
+    [TestCase(
+        SqlDialect.Mssql,
+        "INNER JOIN [dms].[Document] doc ON doc.[DocumentId] = r.[DocumentId]",
+        "doc.[DocumentUuid] = @documentUuid"
+    )]
+    public void It_should_anchor_person_authorization_alongside_the_document_uuid_join(
+        SqlDialect dialect,
+        string expectedDocumentJoin,
+        string expectedDocumentUuidPredicate
+    )
+    {
+        var (rootTable, subject) = CreatePersonAuthorizationSubjectForPathKind(
+            RelationshipAuthorizationPersonSubjectPathKind.DirectRootColumn
+        );
+        var compiler = new PageDocumentIdSqlCompiler(dialect);
+        var plan = compiler.Compile(
+            CreateSpec(
+                [
+                    new QueryValuePredicate(
+                        new QueryPredicateTarget.DocumentUuid(),
+                        QueryComparisonOperator.Equal,
+                        "documentUuid"
+                    ),
+                ],
+                [],
+                includeTotalCountSql: true,
+                authorization: CreateAuthorizationSpec(
+                    dialect,
+                    CreateAuthorizationStrategy(
+                        AuthorizationStrategyNameConstants.RelationshipsWithPeopleOnly,
+                        subject
+                    )
+                ),
+                rootTable: rootTable
+            )
+        );
+
+        plan.PageDocumentIdSql.Should().Contain(expectedDocumentJoin);
+        plan.PageDocumentIdSql.Should().Contain(expectedDocumentUuidPredicate);
+        plan.TotalCountSql.Should().NotBeNull();
+        plan.TotalCountSql.Should().Contain(expectedDocumentJoin);
+
+        // The ?id= join adds dms.Document, never a second read of the root relation.
+        var quotedRootRelation = SqlDialectFactory.Create(dialect).QualifyTable(rootTable);
+
+        CountOrdinalOccurrences(plan.PageDocumentIdSql, quotedRootRelation).Should().Be(1);
+        CountOrdinalOccurrences(plan.TotalCountSql!, quotedRootRelation).Should().Be(1);
+    }
+
+    /// <summary>
+    /// Change queries route through this compiler via <see cref="PageOrderingMode.ContentVersion"/>, so they
+    /// inherit the anchored predicate rather than needing their own emitter.
+    /// </summary>
+    [TestCase(SqlDialect.Pgsql, "ORDER BY r.\"ContentVersion\" ASC")]
+    [TestCase(SqlDialect.Mssql, "ORDER BY r.[ContentVersion] ASC")]
+    public void It_should_anchor_person_authorization_for_content_version_ordered_change_queries(
+        SqlDialect dialect,
+        string expectedOrderBy
+    )
+    {
+        var (rootTable, subject) = CreatePersonAuthorizationSubjectForPathKind(
+            RelationshipAuthorizationPersonSubjectPathKind.TransitiveJoinPath
+        );
+        var compiler = new PageDocumentIdSqlCompiler(dialect);
+        var plan = compiler.Compile(
+            CreateSpec(
+                [],
+                [],
+                includeTotalCountSql: true,
+                authorization: CreateAuthorizationSpec(
+                    dialect,
+                    CreateAuthorizationStrategy(
+                        AuthorizationStrategyNameConstants.RelationshipsWithStudentsOnly,
+                        subject
+                    )
+                ),
+                rootTable: rootTable,
+                orderingMode: PageOrderingMode.ContentVersion
+            )
+        );
+
+        plan.PageDocumentIdSql.Should().Contain(expectedOrderBy);
+        plan.TotalCountSql.Should().NotBeNull();
+        ExtractAuthorizationPredicate(plan.TotalCountSql!)
+            .Should()
+            .Be(ExtractAuthorizationPredicate(plan.PageDocumentIdSql));
+
+        var quotedRootRelation = SqlDialectFactory.Create(dialect).QualifyTable(rootTable);
+
+        CountOrdinalOccurrences(plan.PageDocumentIdSql, quotedRootRelation).Should().Be(1);
+        CountOrdinalOccurrences(plan.TotalCountSql!, quotedRootRelation).Should().Be(1);
     }
 
     [TestCase(SqlDialect.Pgsql)]
@@ -2706,7 +3101,7 @@ public class Given_PageDocumentIdSqlCompiler
             .Throw<ArgumentException>()
             .WithParameterName("Predicates")
             .WithMessage(
-                "Filter parameter name 'OffSet' collides with paging parameter name 'offset' (case-insensitive). Rename the filter parameter or change OffsetParameterName.*"
+                "Filter parameter name 'OffSet' collides with candidate mode parameter name 'offset' (case-insensitive). Rename the filter parameter or change OffsetParameterName.*"
             );
     }
 
@@ -2731,7 +3126,7 @@ public class Given_PageDocumentIdSqlCompiler
             .Throw<ArgumentException>()
             .WithParameterName("Predicates")
             .WithMessage(
-                "Filter parameter name 'LiMit' collides with paging parameter name 'limit' (case-insensitive). Rename the filter parameter or change LimitParameterName.*"
+                "Filter parameter name 'LiMit' collides with candidate mode parameter name 'limit' (case-insensitive). Rename the filter parameter or change LimitParameterName.*"
             );
     }
 
@@ -2743,9 +3138,9 @@ public class Given_PageDocumentIdSqlCompiler
 
         act.Should()
             .Throw<ArgumentException>()
-            .WithParameterName("OffsetParameterName")
+            .WithParameterName("Mode")
             .WithMessage(
-                "Paging parameter names must be distinct (case-insensitive). OffsetParameterName='page', LimitParameterName='page'. Rename either OffsetParameterName or LimitParameterName.*"
+                "Candidate mode parameter names must be distinct (case-insensitive). OffsetParameterName='page', LimitParameterName='page'. Rename either OffsetParameterName or LimitParameterName.*"
             );
     }
 
@@ -2759,10 +3154,91 @@ public class Given_PageDocumentIdSqlCompiler
 
         act.Should()
             .Throw<ArgumentException>()
-            .WithParameterName("OffsetParameterName")
+            .WithParameterName("Mode")
             .WithMessage(
-                "Paging parameter names must be distinct (case-insensitive). OffsetParameterName='OffSet', LimitParameterName='offset'. Rename either OffsetParameterName or LimitParameterName.*"
+                "Candidate mode parameter names must be distinct (case-insensitive). OffsetParameterName='OffSet', LimitParameterName='offset'. Rename either OffsetParameterName or LimitParameterName.*"
             );
+    }
+
+    [Test]
+    public void It_should_order_by_content_version_when_the_ordering_mode_is_content_version()
+    {
+        var plan = _compiler.Compile(
+            CreateSpec([], [], includeTotalCountSql: true, orderingMode: PageOrderingMode.ContentVersion)
+        );
+
+        plan.PageDocumentIdSql.Should().Contain("ORDER BY r.\"ContentVersion\" ASC");
+        plan.PageDocumentIdSql.Should().NotContain("ORDER BY r.\"DocumentId\"");
+        plan.TotalCountSql.Should().NotContain("ORDER BY");
+    }
+
+    [Test]
+    public void It_should_order_by_document_id_when_the_ordering_mode_is_omitted()
+    {
+        var plan = _compiler.Compile(CreateSpec([], []));
+
+        plan.PageDocumentIdSql.Should().Contain("ORDER BY r.\"DocumentId\" ASC");
+        plan.PageDocumentIdSql.Should().NotContain("ContentVersion");
+    }
+
+    [Test]
+    public void It_should_order_by_bracket_quoted_content_version_for_mssql()
+    {
+        var compiler = new PageDocumentIdSqlCompiler(SqlDialect.Mssql);
+        var plan = compiler.Compile(CreateSpec([], [], orderingMode: PageOrderingMode.ContentVersion));
+
+        plan.PageDocumentIdSql.Should().Contain("ORDER BY r.[ContentVersion] ASC");
+        plan.PageDocumentIdSql.Should().Contain("OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY");
+    }
+
+    /// <summary>
+    /// A ContentVersion-anchored traditional page projects both columns. DocumentId feeds the keyset
+    /// insert and every downstream hydration join; ContentVersion is the continuation anchor, and
+    /// hydration can only read columns this embedded selection SQL projects.
+    /// </summary>
+    [Test]
+    public void It_should_project_the_document_id_and_the_anchor_when_ordering_by_content_version()
+    {
+        var plan = _compiler.Compile(CreateSpec([], [], orderingMode: PageOrderingMode.ContentVersion));
+
+        plan.PageDocumentIdSql.Should().StartWith("SELECT r.\"DocumentId\", r.\"ContentVersion\"\n");
+    }
+
+    [Test]
+    public void It_should_project_the_document_id_and_the_anchor_for_mssql_when_ordering_by_content_version()
+    {
+        var compiler = new PageDocumentIdSqlCompiler(SqlDialect.Mssql);
+        var plan = compiler.Compile(CreateSpec([], [], orderingMode: PageOrderingMode.ContentVersion));
+
+        plan.PageDocumentIdSql.Should().StartWith("SELECT r.[DocumentId], r.[ContentVersion]\n");
+    }
+
+    /// <summary>
+    /// The total-count statement counts rows and projects none, so the anchor cannot reach its select
+    /// list. Pinned because the count and the page share every predicate and it would be easy to widen
+    /// both from one place.
+    /// </summary>
+    [Test]
+    public void It_should_not_project_the_anchor_in_total_count_sql()
+    {
+        var plan = _compiler.Compile(
+            CreateSpec([], [], includeTotalCountSql: true, orderingMode: PageOrderingMode.ContentVersion)
+        );
+
+        plan.TotalCountSql.Should().StartWith("SELECT COUNT(1)\n").And.NotContain("ContentVersion");
+    }
+
+    /// <summary>
+    /// The DocumentId-anchored projection is unchanged, which is what keeps every existing emitted-SQL
+    /// golden byte-identical.
+    /// </summary>
+    [Test]
+    public void It_should_project_the_document_id_alone_when_ordering_by_document_id()
+    {
+        _compiler
+            .Compile(CreateSpec([], []))
+            .PageDocumentIdSql.Should()
+            .StartWith("SELECT r.\"DocumentId\"\n");
     }
 
     private static PageDocumentIdQuerySpec CreateSpec(
@@ -2772,7 +3248,8 @@ public class Given_PageDocumentIdSqlCompiler
         string limitParameterName = "limit",
         bool includeTotalCountSql = false,
         PageDocumentIdAuthorizationSpec? authorization = null,
-        DbTableName? rootTable = null
+        DbTableName? rootTable = null,
+        PageOrderingMode orderingMode = PageOrderingMode.DocumentId
     )
     {
         var unifiedAliasMappingsByColumn = new Dictionary<DbColumnName, ColumnStorage.UnifiedAlias>();
@@ -2786,27 +3263,13 @@ public class Given_PageDocumentIdSqlCompiler
             RootTable: rootTable ?? new DbTableName(new DbSchemaName("edfi"), "StudentSchoolAssociation"),
             Predicates: predicates,
             UnifiedAliasMappingsByColumn: unifiedAliasMappingsByColumn,
-            OffsetParameterName: offsetParameterName,
-            LimitParameterName: limitParameterName,
-            IncludeTotalCountSql: includeTotalCountSql,
+            Mode: new PageCandidateMode.Traditional(
+                offsetParameterName,
+                limitParameterName,
+                includeTotalCountSql,
+                orderingMode
+            ),
             Authorization: authorization
-        );
-    }
-
-    private static PageDocumentIdQuerySpec CreateDescriptorSpec(
-        IReadOnlyList<QueryValuePredicate> predicates,
-        string offsetParameterName = "offset",
-        string limitParameterName = "limit",
-        bool includeTotalCountSql = false
-    )
-    {
-        return new PageDocumentIdQuerySpec(
-            RootTable: new DbTableName(new DbSchemaName("dms"), "Document"),
-            Predicates: predicates,
-            UnifiedAliasMappingsByColumn: new Dictionary<DbColumnName, ColumnStorage.UnifiedAlias>(),
-            OffsetParameterName: offsetParameterName,
-            LimitParameterName: limitParameterName,
-            IncludeTotalCountSql: includeTotalCountSql
         );
     }
 
@@ -3002,6 +3465,191 @@ public class Given_PageDocumentIdSqlCompiler
 
     private static int CountOrdinalOccurrences(string value, string text) =>
         value.Split(text, StringSplitOptions.None).Length - 1;
+
+    private static PageDocumentIdSqlPlan CompilePersonAuthorizationCursorPlan(
+        SqlDialect dialect,
+        DbTableName rootTable,
+        PageDocumentIdAuthorizationSubject subject,
+        PageCandidateMode.Cursor cursor
+    ) =>
+        new PageDocumentIdSqlCompiler(dialect).Compile(
+            new PageDocumentIdQuerySpec(
+                RootTable: rootTable,
+                Predicates: [],
+                UnifiedAliasMappingsByColumn: new Dictionary<DbColumnName, ColumnStorage.UnifiedAlias>(),
+                Mode: cursor,
+                Authorization: CreateAuthorizationSpec(
+                    dialect,
+                    CreateAuthorizationStrategy(
+                        AuthorizationStrategyNameConstants.RelationshipsWithPeopleOnly,
+                        subject
+                    )
+                )
+            )
+        );
+
+    private static PageDocumentIdSqlPlan CompilePersonAuthorizationPlan(
+        SqlDialect dialect,
+        DbTableName rootTable,
+        PageDocumentIdAuthorizationSubject subject
+    ) =>
+        new PageDocumentIdSqlCompiler(dialect).Compile(
+            CreateSpec(
+                [],
+                [],
+                includeTotalCountSql: true,
+                authorization: CreateAuthorizationSpec(
+                    dialect,
+                    CreateAuthorizationStrategy(
+                        AuthorizationStrategyNameConstants.RelationshipsWithPeopleOnly,
+                        subject
+                    )
+                ),
+                rootTable: rootTable
+            )
+        );
+
+    /// <summary>
+    /// One representative subject per person path kind, using real DS 5.2 table and column names: Student for
+    /// the self anchor, StudentSchoolAssociation for the direct reference anchor, and CourseTranscript for the
+    /// two-hop transitive anchor through StudentAcademicRecord.
+    /// </summary>
+    private static (
+        DbTableName RootTable,
+        PageDocumentIdAuthorizationSubject Subject
+    ) CreatePersonAuthorizationSubjectForPathKind(RelationshipAuthorizationPersonSubjectPathKind pathKind)
+    {
+        var studentTable = new DbTableName(new DbSchemaName("edfi"), "Student");
+        var studentSchoolAssociationTable = new DbTableName(
+            new DbSchemaName("edfi"),
+            "StudentSchoolAssociation"
+        );
+        var courseTranscriptTable = new DbTableName(new DbSchemaName("edfi"), "CourseTranscript");
+        var studentAcademicRecordTable = new DbTableName(new DbSchemaName("edfi"), "StudentAcademicRecord");
+        var documentIdColumn = new DbColumnName("DocumentId");
+
+        switch (pathKind)
+        {
+            case RelationshipAuthorizationPersonSubjectPathKind.SelfRootDocumentId:
+                return (
+                    studentTable,
+                    CreatePersonAuthorizationSubject(
+                        RelationshipAuthorizationPersonAuthViewKind.Student,
+                        RelationshipAuthorizationPersonKind.Student,
+                        documentIdColumn,
+                        pathKind,
+                        studentTable
+                    )
+                );
+            case RelationshipAuthorizationPersonSubjectPathKind.DirectRootColumn:
+                return (
+                    studentSchoolAssociationTable,
+                    CreatePersonAuthorizationSubject(
+                        RelationshipAuthorizationPersonAuthViewKind.Student,
+                        RelationshipAuthorizationPersonKind.Student,
+                        new DbColumnName("Student_DocumentId"),
+                        pathKind,
+                        studentSchoolAssociationTable
+                    )
+                );
+            case RelationshipAuthorizationPersonSubjectPathKind.TransitiveJoinPath:
+                return (
+                    courseTranscriptTable,
+                    CreateTransitivePersonAuthorizationSubject(
+                        RelationshipAuthorizationPersonAuthViewKind.Student,
+                        RelationshipAuthorizationPersonKind.Student,
+                        courseTranscriptTable,
+                        [
+                            new ColumnPathStep(
+                                courseTranscriptTable,
+                                new DbColumnName("StudentAcademicRecord_DocumentId"),
+                                studentAcademicRecordTable,
+                                documentIdColumn
+                            ),
+                            new ColumnPathStep(
+                                studentAcademicRecordTable,
+                                new DbColumnName("Student_DocumentId"),
+                                studentTable,
+                                documentIdColumn
+                            ),
+                        ]
+                    )
+                );
+            default:
+                throw new ArgumentOutOfRangeException(
+                    nameof(pathKind),
+                    pathKind,
+                    "Unsupported person path kind."
+                );
+        }
+    }
+
+    /// <summary>
+    /// The StudentAssessmentRegistrationBatteryPartAssociation path: the only three-hop person path in
+    /// DS 5.2, and the one shape where the intermediate join loop runs more than zero times.
+    /// </summary>
+    private static PageDocumentIdAuthorizationSubject CreateThreeHopStudentPersonAuthorizationSubject(
+        DbTableName rootTable
+    )
+    {
+        var studentAssessmentRegistrationTable = new DbTableName(
+            new DbSchemaName("edfi"),
+            "StudentAssessmentRegistration"
+        );
+        var studentEducationOrganizationAssociationTable = new DbTableName(
+            new DbSchemaName("edfi"),
+            "StudentEducationOrganizationAssociation"
+        );
+        var studentTable = new DbTableName(new DbSchemaName("edfi"), "Student");
+        var documentIdColumn = new DbColumnName("DocumentId");
+
+        return CreateTransitivePersonAuthorizationSubject(
+            RelationshipAuthorizationPersonAuthViewKind.Student,
+            RelationshipAuthorizationPersonKind.Student,
+            rootTable,
+            [
+                new ColumnPathStep(
+                    rootTable,
+                    new DbColumnName("StudentAssessmentRegistration_DocumentId"),
+                    studentAssessmentRegistrationTable,
+                    documentIdColumn
+                ),
+                new ColumnPathStep(
+                    studentAssessmentRegistrationTable,
+                    new DbColumnName("StudentEducationOrganizationAssociation_DocumentId"),
+                    studentEducationOrganizationAssociationTable,
+                    documentIdColumn
+                ),
+                new ColumnPathStep(
+                    studentEducationOrganizationAssociationTable,
+                    new DbColumnName("Student_DocumentId"),
+                    studentTable,
+                    documentIdColumn
+                ),
+            ]
+        );
+    }
+
+    /// <summary>
+    /// Returns the single WHERE predicate line carrying the authorization group. Only the shared leading
+    /// indentation is trimmed; the predicate text itself is returned verbatim, so callers compare it exactly.
+    /// </summary>
+    private static string ExtractAuthorizationPredicate(string sql)
+    {
+        var authorizationPredicates = sql.Split('\n')
+            .Select(line => line.Trim())
+            .Where(line =>
+                line.Contains("\"auth\".", StringComparison.Ordinal)
+                || line.Contains("[auth].", StringComparison.Ordinal)
+            )
+            .ToArray();
+
+        authorizationPredicates
+            .Should()
+            .HaveCount(1, "the authorization group is emitted as exactly one WHERE predicate");
+
+        return authorizationPredicates[0];
+    }
 
     private static void AssertFragmentAppearsBefore(string sql, string firstFragment, string secondFragment)
     {

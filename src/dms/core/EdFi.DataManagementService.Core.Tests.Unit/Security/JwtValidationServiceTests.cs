@@ -185,6 +185,73 @@ public class JwtValidationServiceTests
 
     [TestFixture]
     [Parallelizable]
+    public class Given_Caller_Request_Cancels_During_Metadata_Resolution : JwtValidationServiceTests
+    {
+        private Func<Task> _act = null!;
+        private CancellationTokenSource _cancellationSource = null!;
+
+        [SetUp]
+        public void Setup()
+        {
+            var (service, configurationManager, _, _, _, _) = CreateService();
+            _cancellationSource = new CancellationTokenSource();
+            _cancellationSource.Cancel();
+
+            A.CallTo(() => configurationManager.GetConfigurationAsync(A<CancellationToken>._))
+                .Returns(Task.FromCanceled<OpenIdConnectConfiguration>(_cancellationSource.Token));
+
+            _act = () =>
+                service.ValidateAndExtractClientAuthorizationsAsync(
+                    "not-read-after-cancellation",
+                    _cancellationSource.Token
+                );
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            _cancellationSource.Dispose();
+        }
+
+        [Test]
+        public async Task It_propagates_OperationCanceledException()
+        {
+            await _act.Should().ThrowAsync<OperationCanceledException>();
+        }
+    }
+
+    [TestFixture]
+    [Parallelizable]
+    public class Given_Metadata_Resolution_Throws_Cancellation_Without_Caller_Request_Cancellation
+        : JwtValidationServiceTests
+    {
+        private ClaimsPrincipal? _principal = null;
+        private ClientAuthorizations? _clientAuthorizations = null;
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var (service, configurationManager, _, _, _, _) = CreateService();
+
+            A.CallTo(() => configurationManager.GetConfigurationAsync(A<CancellationToken>._))
+                .Throws(new OperationCanceledException("metadata refresh aborted internally"));
+
+            (_principal, _clientAuthorizations) = await service.ValidateAndExtractClientAuthorizationsAsync(
+                "invalid-because-metadata-is-unavailable",
+                CancellationToken.None
+            );
+        }
+
+        [Test]
+        public void It_uses_the_existing_invalid_token_result()
+        {
+            _principal.Should().BeNull();
+            _clientAuthorizations.Should().BeNull();
+        }
+    }
+
+    [TestFixture]
+    [Parallelizable]
     public class Given_An_Expired_Token : JwtValidationServiceTests
     {
         private ClaimsPrincipal? _principal = null;
@@ -527,6 +594,94 @@ public class JwtValidationServiceTests
         public void It_reuses_the_cached_client_authorizations()
         {
             _secondClientAuthorizations.Should().BeSameAs(_firstClientAuthorizations);
+        }
+    }
+
+    [TestFixture]
+    [Parallelizable]
+    public class Given_A_Valid_Token_With_A_Default_Role_Claim_Validated_Repeatedly
+        : JwtValidationServiceTests
+    {
+        private JwtValidationService _service = null!;
+        private ClaimsPrincipal? _firstPrincipal = null;
+        private ClaimsPrincipal? _secondPrincipal = null;
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var fakeTimeProvider = new FakeTimeProvider(
+                new DateTimeOffset(2026, 1, 1, 12, 0, 0, TimeSpan.Zero)
+            );
+            var (service, configurationManager, options, _, tokenHandler, signingKey) = CreateService(
+                o =>
+                {
+                    o.ClockSkewSeconds = 0;
+                    o.ValidatedTokenCacheMaxEntries = 4;
+                    o.RoleClaimType = "role";
+                },
+                fakeTimeProvider
+            );
+            _service = service;
+            signingKey.KeyId = "key-1";
+
+            var oidcConfig = new OpenIdConnectConfiguration
+            {
+                Issuer = "https://keycloak.example.com/realms/edfi",
+            };
+            oidcConfig.SigningKeys.Add(signingKey);
+
+            A.CallTo(() => configurationManager.GetConfigurationAsync(A<CancellationToken>._))
+                .Returns(Task.FromResult(oidcConfig));
+
+            string token = CreateTestToken(
+                [new Claim("jti", "role-cache-token-id"), new Claim("role", "service")],
+                oidcConfig.Issuer,
+                options.Value.Audience,
+                signingKey,
+                tokenHandler,
+                nowUtc: fakeTimeProvider.GetUtcNow().UtcDateTime
+            );
+            string authorizationHeader = $"Bearer {token}";
+
+            (_firstPrincipal, _) = await service.ValidateAndExtractClientAuthorizationsAsync(
+                authorizationHeader,
+                "Bearer ".Length,
+                CancellationToken.None
+            );
+            (_secondPrincipal, _) = await service.ValidateAndExtractClientAuthorizationsAsync(
+                authorizationHeader,
+                "Bearer ".Length,
+                CancellationToken.None
+            );
+        }
+
+        [Test]
+        public void It_preserves_the_json_role_claim_type_on_initial_validation()
+        {
+            _firstPrincipal!.Claims.Should().ContainSingle(c => c.Type == "role" && c.Value == "service");
+            _firstPrincipal.Claims.Should().NotContain(c => c.Type == ClaimTypes.Role);
+            _firstPrincipal.IsInRole("service").Should().BeTrue();
+        }
+
+        [Test]
+        public void It_preserves_the_identity_role_claim_type_on_initial_validation()
+        {
+            _firstPrincipal!.Identities.Should().ContainSingle(identity => identity.RoleClaimType == "role");
+        }
+
+        [Test]
+        public void It_preserves_the_json_role_claim_type_on_cache_hit()
+        {
+            _secondPrincipal!.Claims.Should().ContainSingle(c => c.Type == "role" && c.Value == "service");
+            _secondPrincipal.Claims.Should().NotContain(c => c.Type == ClaimTypes.Role);
+            _secondPrincipal.IsInRole("service").Should().BeTrue();
+        }
+
+        [Test]
+        public void It_replays_the_cached_principal_from_the_validated_token_cache()
+        {
+            _service.ValidatedTokenCacheCount.Should().Be(1);
+            _secondPrincipal.Should().NotBeSameAs(_firstPrincipal);
         }
     }
 

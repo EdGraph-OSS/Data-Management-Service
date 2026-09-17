@@ -11,7 +11,6 @@ using EdFi.DmsConfigurationService.DataModel.Model.Vendor;
 using EdFi.DmsConfigurationService.Frontend.AspNetCore.Infrastructure;
 using EdFi.DmsConfigurationService.Frontend.AspNetCore.Infrastructure.Authorization;
 using EdFi.DmsConfigurationService.Frontend.AspNetCore.Models;
-using FluentValidation;
 using FluentValidation.Results;
 using Microsoft.OpenApi;
 
@@ -123,7 +122,7 @@ public class VendorModule : IEndpointModule
     }
 
     private static async Task<IResult> GetById(
-        long id,
+        int id,
         HttpContext httpContext,
         IVendorRepository repository,
         ILogger<VendorModule> logger
@@ -146,7 +145,7 @@ public class VendorModule : IEndpointModule
     }
 
     private static async Task<IResult> Update(
-        long id,
+        int id,
         VendorUpdateCommand command,
         VendorUpdateCommand.Validator validator,
         HttpContext httpContext,
@@ -155,14 +154,9 @@ public class VendorModule : IEndpointModule
         ILogger<ApplicationModule> logger
     )
     {
-        await validator.GuardAsync(command);
+        PutGuards.GuardRouteIdMatchesBodyId(id, command.Id);
 
-        if (command.Id != id)
-        {
-            throw new ValidationException(
-                new[] { new ValidationFailure("Id", "Request body id must match the id in the url.") }
-            );
-        }
+        await validator.GuardAsync(command);
 
         var vendorUpdateResult = await repository.UpdateVendor(command);
 
@@ -217,7 +211,7 @@ public class VendorModule : IEndpointModule
     }
 
     private static async Task<IResult> Delete(
-        long id,
+        int id,
         HttpContext httpContext,
         IVendorRepository repository,
         ILogger<VendorModule> logger
@@ -240,7 +234,7 @@ public class VendorModule : IEndpointModule
     }
 
     private static async Task<IResult> GetApplicationsByVendorId(
-        long id,
+        int id,
         IVendorRepository repository,
         HttpContext httpContext
     )

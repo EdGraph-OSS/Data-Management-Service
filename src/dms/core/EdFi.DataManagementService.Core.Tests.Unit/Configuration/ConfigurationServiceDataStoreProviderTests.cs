@@ -53,7 +53,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public async Task Setup()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             var handler = new TestHttpMessageHandler(HttpStatusCode.OK, "");
@@ -184,6 +186,270 @@ public class ConfigurationServiceDataStoreProviderTests
     }
 
     [TestFixture]
+    public class Given_DataStores_With_Relational_Provider_Metadata
+    {
+        private ConfigurationServiceDataStoreProvider? _provider;
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
+                .Returns("valid-token");
+
+            var handler = new TestHttpMessageHandler(HttpStatusCode.OK, "");
+            var dataStoresResponse = new object[]
+            {
+                new
+                {
+                    Id = 1L,
+                    DataStoreType = "OperatorCategory",
+                    Name = "Provider Token Instance",
+                    ConnectionString = EncryptToBase64("host=localhost;database=edfi;", TestEncryptionKey),
+                    ProviderToken = "POSTGRESQL",
+                    DataStoreContexts = Array.Empty<object>(),
+                },
+                new
+                {
+                    Id = 2L,
+                    DataStoreType = "OperatorCategory",
+                    Name = "Relational Provider Token Instance",
+                    ConnectionString = EncryptToBase64("host=localhost;database=edfi2;", TestEncryptionKey),
+                    RelationalProviderToken = "sqlserver",
+                    DataStoreContexts = Array.Empty<object>(),
+                },
+                new
+                {
+                    Id = 3L,
+                    DataStoreType = "OperatorCategory",
+                    Name = "Provider Alias Instance",
+                    ConnectionString = EncryptToBase64("host=localhost;database=edfi3;", TestEncryptionKey),
+                    Provider = "postgresql",
+                    DataStoreContexts = Array.Empty<object>(),
+                },
+                new
+                {
+                    Id = 4L,
+                    DataStoreType = "sqlserver",
+                    Name = "Missing Provider Instance",
+                    ConnectionString = EncryptToBase64("host=localhost;database=edfi4;", TestEncryptionKey),
+                    DataStoreContexts = Array.Empty<object>(),
+                },
+                new
+                {
+                    Id = 5L,
+                    DataStoreType = "OperatorCategory",
+                    Name = "Unknown Provider Instance",
+                    ConnectionString = EncryptToBase64("host=localhost;database=edfi5;", TestEncryptionKey),
+                    ProviderToken = "mysql",
+                    DataStoreContexts = Array.Empty<object>(),
+                },
+                new
+                {
+                    Id = 6L,
+                    DataStoreType = "OperatorCategory",
+                    Name = "Whitespace Provider Instance",
+                    ConnectionString = EncryptToBase64("host=localhost;database=edfi6;", TestEncryptionKey),
+                    ProviderToken = " postgresql ",
+                    DataStoreContexts = Array.Empty<object>(),
+                },
+                new
+                {
+                    Id = 7L,
+                    DataStoreType = "OperatorCategory",
+                    Name = "Blank Provider Instance",
+                    ConnectionString = EncryptToBase64("host=localhost;database=edfi7;", TestEncryptionKey),
+                    ProviderToken = "   ",
+                    DataStoreContexts = Array.Empty<object>(),
+                },
+                new
+                {
+                    Id = 8L,
+                    DataStoreType = "OperatorCategory",
+                    Name = "Blank Provider Token With Relational Provider Fallback Instance",
+                    ConnectionString = EncryptToBase64("host=localhost;database=edfi8;", TestEncryptionKey),
+                    ProviderToken = "   ",
+                    RelationalProviderToken = "sqlserver",
+                    DataStoreContexts = Array.Empty<object>(),
+                },
+                new
+                {
+                    Id = 9L,
+                    DataStoreType = "OperatorCategory",
+                    Name = "Blank Provider Tokens With Provider Fallback Instance",
+                    ConnectionString = EncryptToBase64("host=localhost;database=edfi9;", TestEncryptionKey),
+                    ProviderToken = "   ",
+                    RelationalProviderToken = "",
+                    Provider = "postgresql",
+                    DataStoreContexts = Array.Empty<object>(),
+                },
+                new
+                {
+                    Id = 10L,
+                    DataStoreType = "OperatorCategory",
+                    Name = "All Blank Provider Metadata Instance",
+                    ConnectionString = EncryptToBase64("host=localhost;database=edfi10;", TestEncryptionKey),
+                    ProviderToken = "   ",
+                    RelationalProviderToken = "",
+                    Provider = " \t ",
+                    DataStoreContexts = Array.Empty<object>(),
+                },
+                new
+                {
+                    Id = 11L,
+                    DataStoreType = "OperatorCategory",
+                    Name = "Unsupported First Nonblank Provider Metadata Instance",
+                    ConnectionString = EncryptToBase64("host=localhost;database=edfi11;", TestEncryptionKey),
+                    ProviderToken = "mysql",
+                    RelationalProviderToken = "postgresql",
+                    Provider = "sqlserver",
+                    DataStoreContexts = Array.Empty<object>(),
+                },
+            };
+
+            handler.SetResponse("v3/dataStores/", dataStoresResponse);
+
+            var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://api.example.com/") };
+            var apiClient = new ConfigurationServiceApiClient(httpClient);
+            var context = new ConfigurationServiceContext("clientId", "secret", "scope");
+
+            _provider = new ConfigurationServiceDataStoreProvider(
+                apiClient,
+                tokenHandler,
+                context,
+                NullLogger<ConfigurationServiceDataStoreProvider>.Instance,
+                new ConnectionStringDecryptionService(TestEncryptionKey)
+            );
+
+            await _provider.LoadDataStores();
+        }
+
+        [Test]
+        public void It_should_normalize_provider_token_metadata()
+        {
+            var instance = _provider!.GetById(1);
+
+            instance.Should().NotBeNull();
+            instance!
+                .RelationalProviderMetadataStatus.Should()
+                .Be(RelationalProviderMetadataStatus.Supported);
+            instance.RelationalProviderToken.Should().Be(RelationalProviderToken.Postgresql);
+            instance.RelationalProviderToken!.Value.Should().Be("postgresql");
+        }
+
+        [Test]
+        public void It_should_read_relational_provider_token_metadata()
+        {
+            var instance = _provider!.GetById(2);
+
+            instance.Should().NotBeNull();
+            instance!
+                .RelationalProviderMetadataStatus.Should()
+                .Be(RelationalProviderMetadataStatus.Supported);
+            instance.RelationalProviderToken.Should().Be(RelationalProviderToken.SqlServer);
+        }
+
+        [Test]
+        public void It_should_read_provider_metadata_alias()
+        {
+            var instance = _provider!.GetById(3);
+
+            instance.Should().NotBeNull();
+            instance!
+                .RelationalProviderMetadataStatus.Should()
+                .Be(RelationalProviderMetadataStatus.Supported);
+            instance.RelationalProviderToken.Should().Be(RelationalProviderToken.Postgresql);
+        }
+
+        [Test]
+        public void It_should_not_infer_provider_token_from_data_store_type()
+        {
+            var instance = _provider!.GetById(4);
+
+            instance.Should().NotBeNull();
+            instance!.DataStoreType.Should().Be("sqlserver");
+            instance.RelationalProviderMetadataStatus.Should().Be(RelationalProviderMetadataStatus.Missing);
+            instance.RelationalProviderToken.Should().BeNull();
+        }
+
+        [Test]
+        public void It_should_keep_unknown_provider_metadata_distinguishable()
+        {
+            var instance = _provider!.GetById(5);
+
+            instance.Should().NotBeNull();
+            instance!.RelationalProviderMetadataStatus.Should().Be(RelationalProviderMetadataStatus.Unknown);
+            instance.RelationalProviderToken.Should().BeNull();
+        }
+
+        [Test]
+        public void It_should_treat_whitespace_wrapped_provider_metadata_as_unknown()
+        {
+            var instance = _provider!.GetById(6);
+
+            instance.Should().NotBeNull();
+            instance!.RelationalProviderMetadataStatus.Should().Be(RelationalProviderMetadataStatus.Unknown);
+            instance.RelationalProviderToken.Should().BeNull();
+        }
+
+        [Test]
+        public void It_should_keep_blank_provider_metadata_distinguishable_as_missing()
+        {
+            var instance = _provider!.GetById(7);
+
+            instance.Should().NotBeNull();
+            instance!.RelationalProviderMetadataStatus.Should().Be(RelationalProviderMetadataStatus.Missing);
+            instance.RelationalProviderToken.Should().BeNull();
+        }
+
+        [Test]
+        public void It_should_use_relational_provider_token_when_provider_token_is_blank()
+        {
+            var instance = _provider!.GetById(8);
+
+            instance.Should().NotBeNull();
+            instance!
+                .RelationalProviderMetadataStatus.Should()
+                .Be(RelationalProviderMetadataStatus.Supported);
+            instance.RelationalProviderToken.Should().Be(RelationalProviderToken.SqlServer);
+        }
+
+        [Test]
+        public void It_should_use_provider_metadata_when_earlier_provider_fields_are_blank()
+        {
+            var instance = _provider!.GetById(9);
+
+            instance.Should().NotBeNull();
+            instance!
+                .RelationalProviderMetadataStatus.Should()
+                .Be(RelationalProviderMetadataStatus.Supported);
+            instance.RelationalProviderToken.Should().Be(RelationalProviderToken.Postgresql);
+        }
+
+        [Test]
+        public void It_should_treat_all_blank_provider_metadata_fields_as_missing()
+        {
+            var instance = _provider!.GetById(10);
+
+            instance.Should().NotBeNull();
+            instance!.RelationalProviderMetadataStatus.Should().Be(RelationalProviderMetadataStatus.Missing);
+            instance.RelationalProviderToken.Should().BeNull();
+        }
+
+        [Test]
+        public void It_should_not_use_later_provider_metadata_when_first_nonblank_value_is_unknown()
+        {
+            var instance = _provider!.GetById(11);
+
+            instance.Should().NotBeNull();
+            instance!.RelationalProviderMetadataStatus.Should().Be(RelationalProviderMetadataStatus.Unknown);
+            instance.RelationalProviderToken.Should().BeNull();
+        }
+    }
+
+    [TestFixture]
     public class Given_Empty_DataStores_From_ConfigService
     {
         private ConfigurationServiceDataStoreProvider? _provider;
@@ -193,7 +459,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public async Task Setup()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             var handler = new TestHttpMessageHandler(HttpStatusCode.OK, "[]");
@@ -239,7 +507,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public void It_should_throw_exception_on_unauthorized()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("invalid-token");
 
             var handler = new TestHttpMessageHandler(HttpStatusCode.Unauthorized, "");
@@ -262,7 +532,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public void It_should_throw_exception_on_server_error()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             var handler = new TestHttpMessageHandler(HttpStatusCode.InternalServerError, "");
@@ -291,7 +563,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public async Task Setup()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             var handler = new TestHttpMessageHandler(HttpStatusCode.OK, "");
@@ -383,6 +657,80 @@ public class ConfigurationServiceDataStoreProviderTests
     }
 
     [TestFixture]
+    public class Given_Relational_Provider_Metadata_Changes_Across_Refresh
+    {
+        private ConfigurationServiceDataStoreProvider? _provider;
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
+                .Returns("valid-token");
+
+            var handler = new TestHttpMessageHandler(HttpStatusCode.OK, "");
+            var firstResponse = new[]
+            {
+                new
+                {
+                    Id = 1L,
+                    DataStoreType = "OperatorCategory",
+                    Name = "Mutable Provider Instance",
+                    ConnectionString = EncryptToBase64("host=first;database=db1;", TestEncryptionKey),
+                    ProviderToken = "postgresql",
+                    DataStoreContexts = Array.Empty<object>(),
+                },
+            };
+            var secondResponse = new[]
+            {
+                new
+                {
+                    Id = 1L,
+                    DataStoreType = "OperatorCategory",
+                    Name = "Mutable Provider Instance",
+                    ConnectionString = EncryptToBase64("host=first;database=db1;", TestEncryptionKey),
+                    ProviderToken = "sqlserver",
+                    DataStoreContexts = Array.Empty<object>(),
+                },
+            };
+
+            handler.SetResponse("v3/dataStores/", firstResponse);
+
+            var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://api.example.com/") };
+            var apiClient = new ConfigurationServiceApiClient(httpClient);
+            var context = new ConfigurationServiceContext("clientId", "secret", "scope");
+
+            _provider = new ConfigurationServiceDataStoreProvider(
+                apiClient,
+                tokenHandler,
+                context,
+                NullLogger<ConfigurationServiceDataStoreProvider>.Instance,
+                new ConnectionStringDecryptionService(TestEncryptionKey)
+            );
+
+            await _provider.LoadDataStores();
+
+            handler.SetResponse("v3/dataStores/", secondResponse);
+
+            await _provider.LoadDataStores();
+        }
+
+        [Test]
+        public void It_should_replace_provider_metadata_for_the_same_data_store()
+        {
+            var instance = _provider!.GetById(1);
+
+            instance.Should().NotBeNull();
+            instance!
+                .RelationalProviderMetadataStatus.Should()
+                .Be(RelationalProviderMetadataStatus.Supported);
+            instance.RelationalProviderToken.Should().Be(RelationalProviderToken.SqlServer);
+        }
+    }
+
+    [TestFixture]
     public class Given_DataStores_With_Null_ConnectionStrings
     {
         private ConfigurationServiceDataStoreProvider? _provider;
@@ -392,7 +740,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public async Task Setup()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             var handler = new TestHttpMessageHandler(HttpStatusCode.OK, "");
@@ -461,7 +811,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public async Task Setup()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             var handler = new TestHttpMessageHandler(HttpStatusCode.OK, "");
@@ -625,7 +977,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public async Task Setup()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             var handler = new TestHttpMessageHandler(HttpStatusCode.OK, "");
@@ -676,7 +1030,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public async Task Setup()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             var handler = new TestHttpMessageHandler(HttpStatusCode.OK, "");
@@ -733,7 +1089,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public async Task Setup()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             var handler = new TestHttpMessageHandler(HttpStatusCode.OK, "");
@@ -796,7 +1154,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public async Task Setup()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             _handler = new TestHttpMessageHandler(HttpStatusCode.OK, "[]");
@@ -832,7 +1192,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public async Task Setup()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             _handler = new TestHttpMessageHandler(HttpStatusCode.OK, "[]");
@@ -865,7 +1227,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public async Task It_should_update_tenant_header_for_each_call()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             var handler = new TestHttpMessageHandler(HttpStatusCode.OK, "[]");
@@ -905,7 +1269,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public async Task Setup()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             var handler = new TestHttpMessageHandler(HttpStatusCode.OK, "[]");
@@ -948,7 +1314,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public void Setup()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             var handler = new TestHttpMessageHandler(HttpStatusCode.OK, "[]");
@@ -985,7 +1353,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public async Task Setup()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             _handler = new TestHttpMessageHandler(HttpStatusCode.OK, "");
@@ -1063,7 +1433,9 @@ public class ConfigurationServiceDataStoreProviderTests
         public async Task Setup()
         {
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             _handler = new TestHttpMessageHandler(HttpStatusCode.OK, "");
@@ -1141,7 +1513,9 @@ public class ConfigurationServiceDataStoreProviderTests
         {
             _fakeTimeProvider = new FakeTimeProvider();
             var tokenHandler = A.Fake<IConfigurationServiceTokenHandler>();
-            A.CallTo(() => tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._))
+            A.CallTo(() =>
+                    tokenHandler.GetTokenAsync(A<string>._, A<string>._, A<string>._, A<CancellationToken>._)
+                )
                 .Returns("valid-token");
 
             _handler = new TestHttpMessageHandler(HttpStatusCode.OK, "");
@@ -1221,6 +1595,126 @@ public class ConfigurationServiceDataStoreProviderTests
         }
     }
 
+    [TestFixture]
+    public class Given_Cancellation_During_DataStore_Load
+    {
+        [Test]
+        public async Task It_propagates_cancellation_to_token_acquisition()
+        {
+            BlockingTokenHandler tokenHandler = new();
+            var handler = new TestHttpMessageHandler(HttpStatusCode.OK, "[]");
+            using var httpClient = new HttpClient(handler)
+            {
+                BaseAddress = new Uri("https://api.example.com/"),
+            };
+            var provider = new ConfigurationServiceDataStoreProvider(
+                new ConfigurationServiceApiClient(httpClient),
+                tokenHandler,
+                new ConfigurationServiceContext("clientId", "secret", "scope"),
+                NullLogger<ConfigurationServiceDataStoreProvider>.Instance,
+                new ConnectionStringDecryptionService(TestEncryptionKey)
+            );
+            using var cancellationTokenSource = new CancellationTokenSource();
+
+            Task<IList<DataStore>> loadTask = provider.LoadDataStores(
+                cancellationToken: cancellationTokenSource.Token
+            );
+            CancellationToken observedToken = await tokenHandler.ObservedToken.Task.WaitAsync(
+                TimeSpan.FromSeconds(1)
+            );
+            await cancellationTokenSource.CancelAsync();
+            Func<Task> act = async () => await loadTask.WaitAsync(TimeSpan.FromSeconds(1));
+
+            observedToken.CanBeCanceled.Should().BeTrue();
+            await act.Should().ThrowAsync<OperationCanceledException>();
+            handler.GetRequestCount("v3/dataStores/").Should().Be(0);
+            provider.IsLoaded().Should().BeFalse();
+        }
+
+        [Test]
+        public async Task It_propagates_cancellation_to_data_store_http_request()
+        {
+            var handler = new BlockingDataStoreHttpMessageHandler();
+            using var httpClient = new HttpClient(handler)
+            {
+                BaseAddress = new Uri("https://api.example.com/"),
+            };
+            var provider = new ConfigurationServiceDataStoreProvider(
+                new ConfigurationServiceApiClient(httpClient),
+                new StaticTokenHandler(),
+                new ConfigurationServiceContext("clientId", "secret", "scope"),
+                NullLogger<ConfigurationServiceDataStoreProvider>.Instance,
+                new ConnectionStringDecryptionService(TestEncryptionKey)
+            );
+            using var cancellationTokenSource = new CancellationTokenSource();
+
+            Task<IList<DataStore>> loadTask = provider.LoadDataStores(
+                cancellationToken: cancellationTokenSource.Token
+            );
+            CancellationToken observedToken = await handler.ObservedRequestToken.Task.WaitAsync(
+                TimeSpan.FromSeconds(1)
+            );
+            await cancellationTokenSource.CancelAsync();
+            Func<Task> act = async () => await loadTask.WaitAsync(TimeSpan.FromSeconds(1));
+
+            observedToken.CanBeCanceled.Should().BeTrue();
+            await act.Should().ThrowAsync<OperationCanceledException>();
+            handler.RequestCount.Should().Be(1);
+            provider.IsLoaded().Should().BeFalse();
+        }
+    }
+
+    [TestFixture]
+    public class Given_Cancellation_During_DataStore_Cache_Refresh
+    {
+        [Test]
+        public async Task It_cancels_refresh_waiters_blocked_on_the_tenant_refresh_lock()
+        {
+            var handler = new ControllableDataStoreHttpMessageHandler();
+            using var httpClient = new HttpClient(handler)
+            {
+                BaseAddress = new Uri("https://api.example.com/"),
+            };
+            var fakeTimeProvider = new FakeTimeProvider();
+            var provider = new ConfigurationServiceDataStoreProvider(
+                new ConfigurationServiceApiClient(httpClient),
+                new StaticTokenHandler(),
+                new ConfigurationServiceContext("clientId", "secret", "scope"),
+                NullLogger<ConfigurationServiceDataStoreProvider>.Instance,
+                new ConnectionStringDecryptionService(TestEncryptionKey),
+                new CacheSettings
+                {
+                    DataStoreCacheRefreshEnabled = true,
+                    DataStoreCacheExpirationSeconds = 1,
+                },
+                fakeTimeProvider
+            );
+            await provider.LoadDataStores("TenantA");
+            fakeTimeProvider.Advance(TimeSpan.FromSeconds(2));
+            handler.BlockDataStoreRequests = true;
+            using var firstRefreshCancellation = new CancellationTokenSource();
+
+            Task firstRefresh = provider.RefreshInstancesIfExpiredAsync(
+                "TenantA",
+                firstRefreshCancellation.Token
+            );
+            await handler.BlockedRequestToken.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            using var secondRefreshCancellation = new CancellationTokenSource();
+            Task secondRefresh = provider.RefreshInstancesIfExpiredAsync(
+                "TenantA",
+                secondRefreshCancellation.Token
+            );
+            await secondRefreshCancellation.CancelAsync();
+            Func<Task> secondAct = async () => await secondRefresh.WaitAsync(TimeSpan.FromSeconds(1));
+
+            await secondAct.Should().ThrowAsync<OperationCanceledException>();
+
+            await firstRefreshCancellation.CancelAsync();
+            Func<Task> firstAct = async () => await firstRefresh.WaitAsync(TimeSpan.FromSeconds(1));
+            await firstAct.Should().ThrowAsync<OperationCanceledException>();
+        }
+    }
+
     /// <summary>
     /// Test HTTP message handler that returns predefined responses
     /// </summary>
@@ -1268,5 +1762,93 @@ public class ConfigurationServiceDataStoreProviderTests
 
             return Task.FromResult(httpResponse);
         }
+    }
+
+    private sealed class StaticTokenHandler : IConfigurationServiceTokenHandler
+    {
+        public Task<string> GetTokenAsync(
+            string clientId,
+            string clientSecret,
+            string scope,
+            CancellationToken cancellationToken = default
+        )
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult("valid-token");
+        }
+    }
+
+    private sealed class BlockingTokenHandler : IConfigurationServiceTokenHandler
+    {
+        public TaskCompletionSource<CancellationToken> ObservedToken { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<string> GetTokenAsync(
+            string clientId,
+            string clientSecret,
+            string scope,
+            CancellationToken cancellationToken = default
+        )
+        {
+            ObservedToken.TrySetResult(cancellationToken);
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
+            throw new AssertionException("Token acquisition should be cancelled.");
+        }
+    }
+
+    private sealed class BlockingDataStoreHttpMessageHandler : HttpMessageHandler
+    {
+        public TaskCompletionSource<CancellationToken> ObservedRequestToken { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public int RequestCount { get; private set; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken
+        )
+        {
+            RequestCount++;
+            ObservedRequestToken.TrySetResult(cancellationToken);
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
+            throw new AssertionException("Data-store request should be cancelled.");
+        }
+    }
+
+    private sealed class ControllableDataStoreHttpMessageHandler : HttpMessageHandler
+    {
+        public TaskCompletionSource<CancellationToken> BlockedRequestToken { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool BlockDataStoreRequests { get; set; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken
+        )
+        {
+            if (BlockDataStoreRequests)
+            {
+                BlockedRequestToken.TrySetResult(cancellationToken);
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
+                throw new AssertionException("Blocked data-store request should be cancelled.");
+            }
+
+            string content = JsonSerializer.Serialize(DataStoreResponse("Initial Instance"));
+            return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(content) };
+        }
+
+        private static object DataStoreResponse(string name) =>
+            new[]
+            {
+                new
+                {
+                    Id = 1L,
+                    DataStoreType = "Production",
+                    Name = name,
+                    ConnectionString = EncryptToBase64("host=first;database=db1;", TestEncryptionKey),
+                    DataStoreContexts = Array.Empty<object>(),
+                },
+            };
     }
 }

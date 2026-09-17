@@ -18,6 +18,21 @@ internal sealed partial class MssqlRelationalWriteExceptionClassifier : IRelatio
     private const int ForeignKeyConstraintViolationNumber = 547;
     private const int DeadlockVictimNumber = 1205;
     private const int LockRequestTimeoutNumber = 1222;
+    private const int SnapshotIsolationUpdateConflictNumber = 3960;
+    private const int SerializableValidationFailureNumber = 41325;
+    private const int RepeatableReadValidationFailureNumber = 41305;
+    private const int UpdateConflictNumber = 41302;
+    private const int DependencyFailureNumber = 41301;
+
+    // SqlClient reports a client-side command timeout as -2. Under write contention it is a symptom
+    // of the same lock waits that produce deadlock victims, but it must not be retried with them:
+    // every other code below is raised by the server, which proves the transaction did not commit,
+    // while this one expires on the client and leaves the outcome unknown. A timeout on the commit
+    // can mean the server committed and only failed to acknowledge it, so a replay would answer for
+    // state the first attempt already produced - a re-run DELETE reads as 404, a re-run conditional
+    // write as 412. It is classified so it stays out of the unrecognized bucket, and reported as a
+    // server error the client may safely reissue on its own terms.
+    private const int CommandTimeoutNumber = -2;
 
     public bool TryClassify(
         DbException exception,
@@ -55,7 +70,16 @@ internal sealed partial class MssqlRelationalWriteExceptionClassifier : IRelatio
                     constraintName
                 )
             ),
-            DeadlockVictimNumber or LockRequestTimeoutNumber => null,
+            CommandTimeoutNumber => RelationalWriteExceptionClassification
+                .IndeterminateOutcomeFailure
+                .Instance,
+            DeadlockVictimNumber
+            or LockRequestTimeoutNumber
+            or SnapshotIsolationUpdateConflictNumber
+            or SerializableValidationFailureNumber
+            or RepeatableReadValidationFailureNumber
+            or UpdateConflictNumber
+            or DependencyFailureNumber => null,
             _ => RelationalWriteExceptionClassification.UnrecognizedWriteFailure.Instance,
         };
 
@@ -91,7 +115,14 @@ internal sealed partial class MssqlRelationalWriteExceptionClassifier : IRelatio
         ArgumentNullException.ThrowIfNull(exception);
 
         return exception is SqlException sqlException
-            && sqlException.Number is DeadlockVictimNumber or LockRequestTimeoutNumber;
+            && sqlException.Number
+                is DeadlockVictimNumber
+                    or LockRequestTimeoutNumber
+                    or SnapshotIsolationUpdateConflictNumber
+                    or SerializableValidationFailureNumber
+                    or RepeatableReadValidationFailureNumber
+                    or UpdateConflictNumber
+                    or DependencyFailureNumber;
     }
 
     private static RelationalWriteExceptionClassification BuildConstraintClassification(

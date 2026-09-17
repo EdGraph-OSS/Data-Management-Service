@@ -32,8 +32,9 @@ needs no manual step. Edit `.env` to customize — `.env.example` itself is
 documentation only and is never consumed at runtime.
 
 Kafka and Kafka UI compose files remain available for local infrastructure
-testing. Relational DMS CDC/Kafka support is pending a separate implementation,
-so this compose setup does not register DMS source connectors.
+testing. The relational DMS CDC/Kafka design uses an explicit CDC opt-in for
+connector registration; until that implementation lands, this compose setup does
+not register DMS source connectors.
 
 Convenience PowerShell scripts have been included in the directory, which start
 the appropriate services.
@@ -172,7 +173,7 @@ entry points or `start-local-dms.ps1` (they seed `.env` from `.env.example` when
 ./bootstrap-local-dms.ps1 -DatabaseEngine mssql -d -v
 ```
 
-`mssql.yml` runs `mcr.microsoft.com/mssql/server:2022-latest` (Developer Edition), the same
+`mssql.yml` runs `mcr.microsoft.com/mssql/server:2025-latest` (Developer Edition), the same
 image used in CI, publishing host port `1435`. `-DatabaseEngine mssql` composes the `.env.mssql`
 overlay (`DMS_DATASTORE=mssql`, `DMS_CONFIG_DATASTORE=mssql`, the `MSSQL_*` keys, and the SQL
 Server connection strings) onto the base environment file automatically — the same composition
@@ -182,12 +183,26 @@ selection. Everything else (`SCHEMA_PACKAGES`, Kafka, Keycloak, identity-provide
 endpoints, etc.) still comes from the base environment file; pass `-EnvironmentFile` only to
 override those base settings, and the overlay still composes on top of it.
 
+> [!WARNING]
+> **SQL Server 2022 volume transition.** `mssql.yml` mounts the major-versioned
+> `dms-mssql-2025` volume so an ordinary `docker compose up` never reuses a legacy
+> `dms-mssql` volume with the SQL Server 2025 image. Microsoft currently supports persisted
+> container upgrades only between release candidates and GA, not from SQL Server 2022 to 2025.
+> Existing 2022 volumes remain intact for backup with the SQL Server 2022 image. The current
+> `-d -v` teardown removes only the 2025 volume; after stopping the old stack and confirming its
+> backups, locate legacy volumes with
+> `docker volume ls --filter label=com.docker.compose.volume=dms-mssql` and remove each intended
+> volume explicitly with `docker volume rm <volume-name>`.
+> See [Microsoft's SQL Server container upgrade guidance](https://learn.microsoft.com/en-us/sql/linux/containers/deploy?view=sql-server-ver17#upgrade-sql-server-in-containers).
+
 > [!NOTE]
-> **Database topology.** Local deployments host the Configuration Service and DMS in one shared
-> physical database on both engines: the CMS `dmscs` schema, and the self-contained (OpenIddict)
-> identity stores, live inside the same database as the DMS datastore (`POSTGRES_DB_NAME` on
-> PostgreSQL, `MSSQL_DB_NAME` on MSSQL) rather than a separate Configuration Service database. An
-> opt-in separate-CMS-database mode is planned (DMS-1270).
+> **Database topology.** By default, local deployments host the Configuration Service and DMS in
+> one shared physical database on both engines: the CMS `dmscs` schema, and the self-contained
+> (OpenIddict) identity stores, live inside the same database as the DMS datastore
+> (`POSTGRES_DB_NAME` on PostgreSQL, `MSSQL_DB_NAME` on MSSQL). An opt-in
+> `-SeparateConfigDatabase` switch moves the Configuration Service (and the OpenIddict stores)
+> into a dedicated `edfi_configurationservice` database instead — see
+> "Configuration Service database topology" below.
 
 A few things are specific to the MSSQL path:
 
@@ -195,9 +210,11 @@ A few things are specific to the MSSQL path:
   Service (CMS SQL Server backend), and the self-contained (OpenIddict) identity stores.
   `mssql.yml` swaps in for `postgresql.yml` - both define the same `db` service that
   `local-config.yml` health-gates on - and no PostgreSQL container runs. In the default
-  self-contained flow, `setup-openiddict.ps1 -InitDb` creates the shared database during the
-  infrastructure phase; CMS then deploys its `dmscs` schema before the provision phase deploys
-  the DMS relational schema into that database (see "Database topology" above).
+  self-contained flow, `setup-openiddict.ps1 -InitDb` creates the Configuration Service's
+  database during the infrastructure phase (the shared datastore database by default; the
+  dedicated one under `-SeparateConfigDatabase`); CMS then deploys its `dmscs` schema before the
+  provision phase deploys the DMS relational schema into the datastore database (see
+  "Configuration Service database topology" below).
 * **Relational backend only.** MSSQL is supported through the relational backend
   (`DMS_DATASTORE=mssql`). Schema is provisioned by `provision-dms-schema.ps1`,
   which auto-detects the SQL Server dialect from the data-store connection string and invokes
@@ -214,10 +231,20 @@ A few things are specific to the MSSQL path:
   `EdFi.Api.Populated.Template.MsSql.*` NuGet packages alongside the existing PostgreSQL ones.
   On MSSQL the package's data dump is a native `BACKUP DATABASE` `.bak` file (restored with
   `RESTORE DATABASE`); that `.bak` is coupled to the
-  `mcr.microsoft.com/mssql/server:2022-latest` image line it was built and verified against
-  (a moving tag tracking the latest SQL Server 2022 build - the coupling is at the SQL Server
-  2022 level, not an exact build), the same way the PostgreSQL `.sql` dump is coupled to the
+  `mcr.microsoft.com/mssql/server:2025-latest` image line it was built and verified against
+  (a moving tag tracking the latest SQL Server 2025 build - the coupling is at the SQL Server
+  2025 level, not an exact build), the same way the PostgreSQL `.sql` dump is coupled to the
   PostgreSQL major version it was built against.
+  This `.bak` coupling is a one-way compatibility boundary.
+  A package built and verified on SQL Server 2025 is not expected to restore onto a SQL Server
+  2022 instance.
+  Packages published previously against SQL Server 2022 do restore forward onto the SQL Server
+  2025 runtime.
+  Compatibility level 170 is the supported-runtime baseline because it is the SQL Server 2025
+  default for newly created databases.
+  The template content gates only verify that level; they never set it.
+  A database restored from a SQL Server 2022-built package keeps the compatibility level it had
+  at backup time; restoring does not upgrade it to 170.
   Every published package is restore-verified in CI
   (`eng/DatabaseTemplates/verify-template-restore.ps1`) before publishing. Base environment files'
   `DATABASE_TEMPLATE_PACKAGE` value (e.g. `EdFi.Api.Populated.Template.PostgreSql.5.2.0`) carries
@@ -232,6 +259,150 @@ After the stack is up, run the smoke tests the same way as for PostgreSQL:
 ```pwsh
 ../smoke_test/Invoke-NonDestructiveApiTests.ps1 -BaseUrl "http://localhost:8080" -Key $key -Secret $secret
 ```
+
+## Configuration Service database topology
+
+The Configuration Service (CMS) — its `dmscs` schema and, in the self-contained flow, the
+OpenIddict identity stores — can live in one of two places, on either database engine:
+
+* **Shared (default).** CMS lives inside the DMS datastore database (`POSTGRES_DB_NAME` on
+  PostgreSQL, `MSSQL_DB_NAME` on MSSQL). This is today's behavior, unchanged; omitting the switch
+  changes nothing.
+* **Separate (opt-in).** Pass `-SeparateConfigDatabase` and CMS lives in a dedicated
+  `edfi_configurationservice` database on the same server container. The database is created
+  during the infrastructure phase if absent (`setup-openiddict.ps1 -InitDb` in the self-contained
+  flow; CMS's own startup deploy otherwise). The switch leaves the DMS datastore's selection and
+  lifecycle unchanged — ordinary startup and provisioning still create and use the datastore
+  database exactly as in shared mode; it just no longer hosts CMS.
+
+The switch exists on every public entry point and is forwarded unchanged:
+`start-local-dms.ps1`, `start-published-dms.ps1`, `bootstrap-local-dms.ps1`,
+`bootstrap-published-dms.ps1`, and `build-dms.ps1 StartEnvironment`.
+
+```pwsh
+# Turnkey local stack with a dedicated CMS database (either engine)
+./bootstrap-local-dms.ps1 -SeparateConfigDatabase
+./bootstrap-local-dms.ps1 -DatabaseEngine mssql -SeparateConfigDatabase
+
+# Same through the build script, which lives at the repository root
+../../build-dms.ps1 StartEnvironment -SeparateConfigDatabase -DatabaseEngine postgresql
+```
+
+### Predicting the effective CMS database
+
+| Invocation shape | Switch omitted | With `-SeparateConfigDatabase` |
+|---|---|---|
+| `start-local-dms.ps1` / `start-published-dms.ps1`, default or `-InfraOnly` | Datastore database (`POSTGRES_DB_NAME` / `MSSQL_DB_NAME`) | `edfi_configurationservice` |
+| `start-published-dms.ps1` with `-IdentityProvider keycloak` and no `-EnableConfig`/`-InfraOnly` | CMS does not run at all (`published-config.yml` is opt-in on the published flow) | `edfi_configurationservice` — the switch also adds `published-config.yml` to the compose set so CMS actually runs to create it |
+| `-DmsOnly`, `-DbOnly`, teardown (`-d [-v]`) | No effect either way: these shapes never start CMS. The switch is accepted so continuation invocations of a running stack don't have to drop it; the stack keeps the topology it was started with |
+| `bootstrap-local-dms.ps1` / `bootstrap-published-dms.ps1` / `build-dms.ps1 StartEnvironment` | Same as the start script they invoke | Same — forwarded unchanged |
+
+The switch moves only the CMS seam: the DMS relational datastore itself and
+`DATABASE_CONNECTION_STRING_ADMIN` are unaffected. The configure and provision phases do consume
+the topology declaration, though, because each enforces one half of the same rule — in separate
+mode every DMS datastore, newly registered or reused, must stay distinct from
+`edfi_configurationservice`. `configure-local-data-store.ps1 -SeparateConfigDatabase` judges a
+datastore name it is about to register; `provision-dms-schema.ps1 -SeparateConfigDatabase` judges
+the database each selected target actually resolves to, which is the only place a *reused* data
+store's stored connection string (`-NoDataStore`) is known. The turnkey entry points forward the
+switch to both, so you only pass it yourself when running the phases by hand — and a
+separate-topology `-InfraOnly` start prints both commands with the switch already on them.
+
+### How the selection travels
+
+The seam is the `DMS_CONFIG_DATABASE_NAME` environment variable, which
+`DMS_CONFIG_DATABASE_CONNECTION_STRING`'s `database=` segment references. The checked-in
+environment files alias it to the datastore name (shared mode); a `-SeparateConfigDatabase` start
+writes a derived environment file under `.derived/` that redirects it to
+`edfi_configurationservice` — your source `-EnvironmentFile` is never edited. The derived file
+also carries an internal `DMS_TOPOLOGY_SEPARATE_CONFIG_DATABASE` marker recording the selection.
+When the connection string is entirely absent on PostgreSQL, the Compose fallback in
+`local-config.yml` / `published-config.yml` resolves the same seam
+(`${DMS_CONFIG_DATABASE_NAME:-${POSTGRES_DB_NAME}}`). That fallback is PostgreSQL-shaped — Compose
+interpolation cannot branch on the engine — so MSSQL always requires an explicit
+`DMS_CONFIG_DATABASE_CONNECTION_STRING` (the `.env.mssql` overlay supplies it), and an MSSQL run
+with the key entirely absent fails clearly rather than starting CMS against an unusable fallback.
+
+CMS-starting invocations validate the result before any container starts: the resolved connection
+string's database, host, and port must agree with the selected topology, and a hand-edited
+`DMS_CONFIG_DATABASE_CONNECTION_STRING` that disagrees fails fast with a
+`CMS database topology mismatch` error rather than silently starting CMS against the wrong
+database. In separate mode the datastore database must also be genuinely distinct from
+`edfi_configurationservice`, so a datastore name (or `-DataStoreDatabaseName`) that would land in it
+is rejected rather than quietly re-sharing the database the switch exists to split.
+
+What counts as a collision follows the whole path a name travels to the database server, so the
+inputs are not checked identically — and the two engines answer at different moments: PostgreSQL's
+rules are exact models of its creation mechanisms and are applied before any container starts, while
+SQL Server's answer can only come from the running instance itself.
+
+`POSTGRES_DB_NAME` reaches `postgresql-init.sh`, which passes it to `createdb` as a single quoted
+command argument. `createdb` quotes the identifier, so the database it creates is named the literal
+value and only `edfi_configurationservice` itself is rejected: a mixed-case name such as
+`EDFI_ConfigurationService`, or one differing only by surrounding whitespace, is a genuinely separate
+database you may use.
+
+`-DataStoreDatabaseName` takes a different route, and differs in exactly one respect. It is serialized
+into the data-store record's connection string, that string is parsed again before use, and SchemaTools
+then creates the database with a *quoted* identifier — so here too only `edfi_configurationservice`
+itself is rejected. The one exception is a trailing newline: connection-string serialization and parsing
+can collapse it, so such a name is rejected because the server really would receive the reserved
+database, whereas `createdb` preserves it and the initialized path treats it as distinct.
+
+On SQL Server, quoting decides nothing, and no name is pre-judged offline: database-name identity is
+decided by the *instance's* collation semantics, whose equivalences reach far beyond letter case and
+trailing spaces — measured examples that all resolve to the reserved database under the default
+collation include full-width letterforms, the `fi` ligature, and characters with no collation weight
+at all — and which differ between instances: a case variant that collides under the default
+collation is a genuinely distinct database on a case-sensitive one. The only entity that can answer
+is the SQL Server that will host these databases, so *every* SQL Server start that runs the
+Configuration Service verifies its database names against the running instance itself: after the
+database container starts and reports ready, and before OpenIddict, CMS, DMS, or the data-store
+registration touch it, the names are checked on the server. In shared mode the check is that the
+Configuration Service's target — the `DMS_CONFIG_DATABASE_NAME` seam and every `Database` /
+`Initial Catalog` segment of its connection string — really is the DMS datastore database. In
+separate mode the same targets must be the dedicated `edfi_configurationservice`, and the datastore
+name — plus any `-DataStoreDatabaseName`, as the value the provider actually receives — must be
+distinct from it. All SQL Server name verdicts happen there. Valid Unicode names are fully
+supported and no longer require renaming: a name is refused only when the instance itself reports
+the wrong relationship, or when the verification cannot be completed, in which case the start fails
+closed rather than proceeding unverified. A verification failure names the offending key or
+parameter and never prints the configured value.
+
+Shapes that never start the Configuration Service — `-DmsOnly`, `-DbOnly`, teardown, and a bare
+published Keycloak start that omits `published-config.yml` — get structural screening only, and
+only on SQL Server: every connection string the `.env.mssql` overlay owns must be present,
+non-blank, and carry a SQL Server data-source keyword (`Server=`, `Data Source=`, `Address=`,
+`Addr=`, or `Network Address=`) at a segment boundary. That is the entire check. The value is not
+parsed with ADO.NET, no database segment is discovered or validated, and no host or port is
+inspected. On PostgreSQL these shapes get no engine-composition check at all. No SQL Server name is
+judged for any of them: `-DbOnly` does start a database server, but the Configuration Service takes
+no part in these shapes, so CMS topology consistency is not evaluated — and where nothing is
+running there is no instance to ask, and no offline rule can answer in its place.
+
+To continue the manual phases from a `-SeparateConfigDatabase -InfraOnly` start, declare the same
+topology to **both** datastore phases — the start script prints each command with the switch already
+on it in its next-step guidance:
+
+```pwsh
+./configure-local-data-store.ps1 -SeparateConfigDatabase
+./provision-dms-schema.ps1 -SeparateConfigDatabase
+```
+
+Each re-derives the same effective environment the start wrote — the topology marker lives only in
+the derived file — and each enforces one half of the same rule.
+`configure-local-data-store.ps1` checks the name it is about to register, on SQL Server against the
+running instance and on PostgreSQL against the reserved name as the provider parses it, before it
+creates any Configuration Service state. `provision-dms-schema.ps1` checks the database each
+selected target actually resolves to, after placeholder resolution and decryption of the stored
+connection string and before SchemaTools runs — the only point at which a *reused* data store
+(`configure-local-data-store.ps1 -NoDataStore`) reveals where its schema would land, since that run
+registers no name for the configure phase to judge. Omit the switch and both phases behave exactly
+as they do for a shared-topology stack.
+
+Switching an existing stack between modes re-points CMS but does not move data: `dmscs` content
+already written in one database stays there. For a clean switch, tear down with `-d -v` and start
+fresh, or migrate the CMS data yourself.
 
 ## Selecting a Data Standard version (bootstrap)
 
@@ -342,7 +513,7 @@ package identity no longer matches) and then starts the stack. It auto-discovers
 > the staged `.bootstrap/ApiSchema` workspace's effective schema hash matches what the DMS
 > container downloads at startup. Only when prepare runs without an env file (direct diagnostic
 > invocation with no `-EnvironmentFile`, or an env file lacking `SCHEMA_PACKAGES`) does it fall
-> back to the catalog-pinned core-only default (`EdFi.DataStandard52.ApiSchema` at `1.0.333`).
+> back to the catalog-pinned core-only default (`EdFi.DataStandard52.ApiSchema` at `1.0.335`).
 
 ### Expert mode (filesystem)
 
@@ -403,8 +574,14 @@ Standard 5.2, where TPDM is a separate extension; Data Standard 6.1 folds TPDM
 into core.
 
 Bootstrap mode provisions the relational DMS schema only. Relational DMS
-CDC/Kafka support is pending a separate implementation, so bootstrap startup
-does not register DMS source connectors.
+CDC/Kafka connector registration is pending a separate implementation and should
+be controlled by an explicit CDC opt-in such as `-EnableKafkaCdc`; bootstrap
+startup does not register DMS source connectors today. The planned opt-in keeps
+immutable deployment-owned binding records under a separate persistent `.cdc-state`
+root (or an explicit `-CdcBindingStatePath`) and never stores them in the bootstrap
+manifest. Runtime DMS receives only explicit `DocumentCache:Targets` and exposes
+per-database projection health; deployment automation owns connector registration and
+combined CDC readiness.
 
 The DMS E2E setup wrappers stay on the non-bootstrap `SCHEMA_PACKAGES` flow.
 Those env files use `USE_API_SCHEMA_PATH=true` to download and materialize
@@ -466,7 +643,7 @@ The artifact includes:
 | `ConfigurationServiceSettings:ClientId` | `CMSReadOnlyAccess` (created by identity setup) |
 | `ConfigurationServiceSettings:ClientSecret` | `<local-cms-readonly-secret>` (replace with the `CMSReadOnlyAccess` client secret; local-dev default `ValidClientSecret1234567890!Abcd`) |
 | `ConfigurationServiceSettings:Scope` | `edfi_admin_api/readonly_access` |
-| `ConfigurationServiceSettings:EncryptionKey` | `<dms-config-database-encryption-key>` (replace with value of `DMS_CONFIG_DATABASE_ENCRYPTION_KEY` from `.env`; `.env.example` default `DefaultEncryptionKey32CharactersX1`) |
+| `ConfigurationServiceSettings:EncryptionKey` | `<dms-config-database-encryption-key>` (replace with value of `DMS_CONFIG_DATABASE_ENCRYPTION_KEY` from `.env`; `.env.example` default `secret!_32_chars_xxxxxxxxxxxxxxx`) |
 | `AppSettings:UseApiSchemaPath` | `true` (use staged bootstrap workspace schema; see activation note below) |
 | `AppSettings:ApiSchemaPath` | `<repo-root>/eng/docker-compose/.bootstrap/ApiSchema` (replace `<repo-root>` with your absolute path) |
 | `AppSettings:AuthenticationService` | `http://localhost:8081/connect/token` |
@@ -479,7 +656,7 @@ Replace `<local-cms-readonly-secret>` with the `CMSReadOnlyAccess` client secret
 `ValidClientSecret1234567890!Abcd` and does not print the value; if you override the secret at
 client creation, use your override here. Replace `<dms-config-database-encryption-key>`
 with the value of `DMS_CONFIG_DATABASE_ENCRYPTION_KEY` from your `.env` file (`.env.example`
-default `DefaultEncryptionKey32CharactersX1`). Replace `<repo-root>` with the absolute path
+default `secret!_32_chars_xxxxxxxxxxxxxxx`). Replace `<repo-root>` with the absolute path
 to the repository root on your machine.
 
 > **Activation note:** `AppSettings:UseApiSchemaPath` and `AppSettings:ApiSchemaPath` point at
@@ -532,6 +709,11 @@ wait passes.
 > the existing ones. Use the explicit phase commands against the data stores the earlier run
 > created: `./start-local-dms.ps1 -InfraOnly -DmsBaseUrl <url>` for the health wait, then
 > `./load-dms-seed-data.ps1 -DmsBaseUrl <url> -SchoolYear <years...>` for seed loading.
+>
+> A fresh run recomposes the environment from its own switches, so if the stack was started with
+> `-SeparateConfigDatabase`, carry that switch on every follow-up command too — dropping it
+> continues a separate-mode stack in shared mode. Both terminal guidance blocks print the switch
+> for you when it applies.
 
 ```pwsh
 cd eng/docker-compose
@@ -735,6 +917,149 @@ cd eng/docker-compose
 pwsh ./start-local-dms.ps1 -d -v
 ```
 
+## Loading plugins
+
+A plugin is an already-published directory of assemblies that DMS loads at startup.
+DMS ships no fetcher: getting a plugin directory under the plugin root is a
+deployment step that happens before the process starts, and it comes in two
+recipes. Each is an overlay added with its own `-f`, and they are **alternatives**
+rather than additions: `/app/plugins` is one mount target and two overlays cannot
+both claim it. `local-dms.yml` and `published-dms.yml` are unchanged by either.
+
+Add the overlays by naming them in `DMS_PLUGINS_COMPOSE_FILES` and starting the
+stack through `bootstrap-local-dms.ps1`. That variable is a semicolon-delimited
+list, added in the order written, each entry either absolute or relative to
+`eng/docker-compose`. Leave it unset and nothing changes; a path that does not
+exist, or an empty entry from a stray separator, fails the launcher by name before
+it touches Docker.
+
+**`DMS_PLUGINS_COMPOSE_FILES` is read from the environment file only.** The launcher
+reads it the same way it reads every other setting that shapes the compose command,
+and that reader deliberately ignores the process environment so a phase invoked
+directly cannot depend on ambient shell state. Exporting the variable therefore adds
+no overlay at all, and DMS starts successfully with no plugins. Put it in the
+environment file `bootstrap-local-dms.ps1` uses, which is `.env` unless you pass
+`-EnvironmentFile`. The four variables the overlays themselves declare are
+interpolated by Compose rather than read by the launcher, so those do honour an
+exported value; keeping all of them in one file is still the recipe below, because a
+deployment described in two places is a deployment nobody can read back.
+
+The launcher is the entry point rather than a convenience. An overlay only adds a
+mount and a fetch step to the DMS service; it provisions no schema and configures
+no Configuration Service, and DMS validates at startup that both were done. A bare
+`docker compose up` of `postgresql.yml` and `local-dms.yml` with an overlay added
+therefore cannot produce a working deployment on a fresh environment. Compose those
+files directly only against an environment already provisioned and configured by a
+previous `bootstrap-local-dms.ps1` run.
+
+### Recipe 1: a pre-populated plugin root
+
+`plugins-dms.yml` bind-mounts a directory of plugin directories read-only.
+
+```powershell
+cd eng/docker-compose
+
+# In the environment file the launcher reads (.env by default):
+#   DMS_PLUGINS_COMPOSE_FILES=plugins-dms.yml;my-plugins-allowed-dms.yml
+#   DMS_PLUGINS_MOUNT_SOURCE=C:/plugins
+
+pwsh ./bootstrap-local-dms.ps1
+```
+
+Nothing in this recipe writes into the mounted directory. The plugin directories are
+whatever you put there, so replacing one is your own step and DMS reads the bytes
+that are there when it starts.
+
+### Recipe 2: a pinned package fetched by the deployment
+
+`plugins-fetch-dms.yml` adds a one-shot `fetch-plugins` service that downloads a
+`.nupkg`, verifies it against a digest the operator pinned, extracts the plugin
+directory into a named volume and exits. `depends_on: service_completed_successfully`
+orders it ahead of DMS, which then mounts that volume read-only.
+
+```powershell
+cd eng/docker-compose
+
+# In the environment file the launcher reads (.env by default):
+#   DMS_PLUGINS_COMPOSE_FILES=plugins-fetch-dms.yml;my-plugins-allowed-dms.yml
+#   PLUGIN_PACKAGE_URL=https://feed.example/v3-flatcontainer/acme.dms.identity/1.2.0/acme.dms.identity.1.2.0.nupkg
+#   PLUGIN_PACKAGE_SHA256=9f2c...the digest you pinned...
+#   PLUGIN_NAME=Acme.Dms.Identity
+
+pwsh ./bootstrap-local-dms.ps1
+```
+
+`PLUGIN_PACKAGE_URL` is the package's download address in the feed's
+`PackageBaseAddress` form, `<base>/<id>/<version>/<id>.<version>.nupkg` in lower
+case, where `<base>` is what the feed's `index.json` publishes for that resource.
+It differs between feed hosts, which is one more reason the address belongs to the
+deployment rather than to DMS.
+
+#### Re-fetching requires stop, fetch, start
+
+**Stop DMS before fetching again.** The fetcher clears and rewrites the plugin
+directory inside the volume DMS mounts, and `service_completed_successfully` orders
+container *startup*; it does not keep a completed one-shot service away from the
+files of a container that is already running. Re-running the launcher against a
+stack that is already up starts the fetcher while DMS keeps running on the same
+volume, and because assemblies load lazily, a request arriving afterwards can find
+a file missing or load a dependency from a version other than the one the startup
+inventory recorded.
+
+Tear the stack down and bring it back up, which is what makes the inventory event a
+statement about the bytes the process is serving:
+
+```powershell
+cd eng/docker-compose
+pwsh ./bootstrap-local-dms.ps1 -d
+pwsh ./bootstrap-local-dms.ps1
+```
+
+`-d` without `-v` is deliberate. What a re-fetch needs is DMS stopped, and `down`
+alone does that; `-v` would additionally delete every volume in the stack, the
+PostgreSQL data volume included, so a routine plugin update would destroy the
+deployment's data. Keeping the `plugins` volume is safe, because the fetcher clears
+the plugin directory before it extracts. Add `-v` only when you actually want the
+whole environment reset.
+
+### Required variables
+
+All four are declared with `:?` rather than defaults, so composing an overlay in
+without setting its variables fails immediately instead of starting a deployment
+that silently loads nothing. They are listed, commented out, in `.env.example`.
+
+| Variable | Overlay | Meaning |
+| -------- | ------- | ------- |
+| `DMS_PLUGINS_MOUNT_SOURCE` | `plugins-dms.yml` | Host path holding the plugin directories. |
+| `PLUGIN_PACKAGE_URL` | `plugins-fetch-dms.yml` | `.nupkg` download address, `PackageBaseAddress` form. |
+| `PLUGIN_PACKAGE_SHA256` | `plugins-fetch-dms.yml` | SHA-256 of the pinned `.nupkg`. |
+| `PLUGIN_NAME` | `plugins-fetch-dms.yml` | Plugin directory name inside the package. Must be a single path segment matching `[A-Za-z0-9][A-Za-z0-9._-]*`; anything else fails the fetch before it deletes or moves anything. |
+
+### Enabling a plugin is a separate step
+
+**Neither overlay allowlists anything.** Acquiring the bytes and deciding which of
+them may load are separate decisions, and `Plugins:Allowed` is the only switch:
+a plugin runs if and only if its directory name appears there. It ships empty, so a
+deployment that adds an overlay and nothing else mounts a plugin root and loads
+nothing from it.
+
+The DMS service's environment is declared in the base compose files, which stay
+unchanged, so the allowlist arrives in a small deployment-owned overlay of its own.
+Write it once and name it in `DMS_PLUGINS_COMPOSE_FILES` after the acquisition
+overlay, as the two recipes above do:
+
+```yaml
+# my-plugins-allowed-dms.yml
+services:
+  dms:
+    environment:
+      Plugins__Allowed: Acme.Dms.Identity
+```
+
+The order written is the order plugins are invoked in. See the `Plugins` section of
+[docs/CONFIGURATION.md](../../docs/CONFIGURATION.md) for the full configuration
+surface.
+
 ## Kafka UI
 
 ```powershell
@@ -862,4 +1187,21 @@ $parameters = @{
 * `$InsertData` inserts the OpenIddict client, roles, scopes, and claims.
 * `ClientSecretMinimumLength` and `ClientSecretMaximumLength` should match the configured `IdentitySettings:ClientSecretValidation` bounds used by CMS.
 * `NewClientSecret` must also satisfy the CMS complexity rule: lowercase, uppercase, number, and one special character from `!@#$%^&*()-_=+[]{}:;,.?`.
+* `NewClientSecret` is always the literal secret, even when it begins with `ENV:`. Use `NewClientSecretEnvironmentVariable` (naming the variable, in place of `NewClientSecret`) only when the secret must be read from that process's environment instead of the argument list.
 * Both switches can be used together or separately as needed.
+
+### Expired token cleanup (self-contained identity)
+
+The self-contained (OpenIddict) identity provider runs a background sweep that deletes expired
+rows from `dmscs.OpenIddictToken` so the table does not grow without bound. Keycloak mode has no
+equivalent setting, because Keycloak owns its own token housekeeping.
+
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `DMS_CONFIG_IDENTITY_TOKEN_CLEANUP_ENABLED` | `true` | Enables the expired-token cleanup sweep. |
+| `DMS_CONFIG_IDENTITY_TOKEN_CLEANUP_INTERVAL_MINUTES` | `30` | Interval, in minutes, between cleanup sweeps. |
+
+These map to `IdentitySettings__TokenCleanupEnabled` and
+`IdentitySettings__TokenCleanupIntervalMinutes` in `local-config.yml` and `published-config.yml`.
+The interval accepts values from 1 to 71,582 minutes; a value outside that range is logged as a
+warning and falls back to the 30-minute default.

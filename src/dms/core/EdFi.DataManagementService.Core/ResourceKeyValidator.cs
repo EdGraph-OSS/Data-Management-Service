@@ -28,7 +28,7 @@ internal sealed class ResourceKeyValidator(
         short expectedResourceKeyCount,
         ImmutableArray<byte> expectedResourceKeySeedHash,
         IReadOnlyList<ResourceKeyRow> expectedResourceKeysInIdOrder,
-        string connectionString,
+        EffectiveDataStoreTarget target,
         CancellationToken cancellationToken = default
     )
     {
@@ -43,30 +43,50 @@ internal sealed class ResourceKeyValidator(
 
         // Slow path: read actual rows and diff. Wrap in try-catch so that
         // read failures (missing table, permissions, broken schema) produce a
-        // cached ValidationFailure rather than an evicted exception.
+        // cached ValidationFailure rather than an evicted exception. The one read failure that is
+        // not a statement about the database's contents - an unreachable snapshot, which never got
+        // as far as reading a row - is rethrown instead; see the arm below.
         logger.LogDebug("Resource key fingerprint mismatch detected, performing row-level validation");
 
         IReadOnlyList<ResourceKeyRow> actualRows;
         try
         {
-            actualRows = await resourceKeyRowReader.ReadResourceKeyRowsAsync(
-                connectionString,
-                cancellationToken
-            );
+            actualRows = await resourceKeyRowReader.ReadResourceKeyRowsAsync(target, cancellationToken);
         }
         catch (OperationCanceledException)
         {
             throw;
         }
+        catch (DatabaseConnectionUnavailableException ex) when (ex.TargetKind == EffectiveTargetKind.Snapshot)
+        {
+            // A snapshot that cannot be reached is not a seed mismatch. Reporting it as one would
+            // tell an operator to reprovision a database whose rows were never read, and would answer
+            // the request with the mismatch 503 instead of Snapshot Not Found. Rethrown so
+            // ValidateResourceKeySeedMiddleware can translate it; the entry faults rather than
+            // caching a verdict, and this provider retains no fault, so the next request revalidates.
+            //
+            // Deliberately conditioned on Snapshot. A primary or read-replica connection failure
+            // still becomes the ValidationFailure below, with the exact body it produces today.
+            throw;
+        }
         catch (Exception ex)
         {
+            // Only the exception's type reaches the log and the failure report, never the exception
+            // itself and never its message: the read goes through connection acquisition, and a
+            // provider exception from parsing or opening a connection string can quote its values
+            // back. The report is also logged downstream by the middleware and the startup task, so
+            // the discipline has to hold here, where the text is composed.
+            // S6667 asks for the caught exception to be passed to the logger. That is the right
+            // default and the wrong thing here, for the reason above.
+#pragma warning disable S6667
             logger.LogError(
-                ex,
-                "Failed to read dms.ResourceKey rows for slow-path diff (table may be missing or malformed)"
+                "Failed to read dms.ResourceKey rows for slow-path diff with {ExceptionType} (table may be missing or malformed)",
+                ex.GetType().Name
             );
+#pragma warning restore S6667
             return new ResourceKeyValidationResult.ValidationFailure(
-                "Resource key fingerprint mismatch detected, but slow-path dms.ResourceKey read failed: "
-                    + LoggingSanitizer.SanitizeForLogging(ex.Message)
+                "Resource key fingerprint mismatch detected, but slow-path dms.ResourceKey read failed with "
+                    + ex.GetType().Name
                     + ". The database must be reprovisioned with 'ddl provision' against a fresh database."
             );
         }

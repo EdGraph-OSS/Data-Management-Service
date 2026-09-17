@@ -122,9 +122,8 @@ public class Given_Relational_Write_No_Profile_Merge_Synthesizer
                 345L,
                 Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"),
                 44L,
-                44L,
                 new DateTimeOffset(2026, 4, 2, 12, 0, 0, TimeSpan.Zero),
-                new DateTimeOffset(2026, 4, 2, 12, 0, 0, TimeSpan.Zero)
+                1
             ),
             [
                 new HydratedTableRows(
@@ -507,9 +506,8 @@ public class Given_Relational_Write_No_Profile_Merge_Synthesizer
                 345L,
                 Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"),
                 44L,
-                44L,
                 new DateTimeOffset(2026, 4, 2, 12, 0, 0, TimeSpan.Zero),
-                new DateTimeOffset(2026, 4, 2, 12, 0, 0, TimeSpan.Zero)
+                1
             ),
             [
                 new HydratedTableRows(fixture.RootPlan.TableModel, rootRows ?? []),
@@ -532,9 +530,8 @@ public class Given_Relational_Write_No_Profile_Merge_Synthesizer
                 345L,
                 Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"),
                 44L,
-                44L,
                 new DateTimeOffset(2026, 4, 2, 12, 0, 0, TimeSpan.Zero),
-                new DateTimeOffset(2026, 4, 2, 12, 0, 0, TimeSpan.Zero)
+                1
             ),
             [
                 new HydratedTableRows(fixture.RootPlan.TableModel, rootRows ?? []),

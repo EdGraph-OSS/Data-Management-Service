@@ -24,11 +24,7 @@ internal sealed record MssqlGeneratedDdlMutableCounts(
     long AuthEducationOrganizationCount
 );
 
-internal sealed record MssqlGeneratedDdlDocumentState(
-    long DocumentId,
-    long ContentVersion,
-    long IdentityVersion
-);
+internal sealed record MssqlGeneratedDdlDocumentState(long DocumentId, long ContentVersion);
 
 internal sealed record MssqlGeneratedDdlResetIntegrityState(
     long DisabledForeignKeyCount,
@@ -124,6 +120,21 @@ public class Given_MssqlGeneratedDdlTestDatabase
 
         secondDocumentState.Should().Be(firstDocumentState);
         secondCollectionItemId.Should().Be(firstCollectionItemId);
+    }
+
+    [Test]
+    public async Task It_waits_until_the_SQL_Server_UTC_clock_advances_past_the_required_timestamp()
+    {
+        var before = await _database.ExecuteScalarAsync<DateTimeOffset>(
+            "SELECT TODATETIMEOFFSET(SYSUTCDATETIME(), '+00:00');"
+        );
+
+        await _database.WaitForUtcClockToAdvancePastAsync(before);
+
+        var after = await _database.ExecuteScalarAsync<DateTimeOffset>(
+            "SELECT TODATETIMEOFFSET(SYSUTCDATETIME(), '+00:00');"
+        );
+        after.Should().BeAfter(before);
     }
 
     private async Task<MssqlGeneratedDdlBaselineCounts> ReadBaselineCountsAsync()
@@ -239,7 +250,7 @@ public class Given_MssqlGeneratedDdlTestDatabase
 
         var documentRows = await _database.QueryRowsAsync(
             """
-            SELECT [DocumentId], [ContentVersion], [IdentityVersion]
+            SELECT [DocumentId], [ContentVersion]
             FROM [dms].[Document]
             WHERE [DocumentUuid] = @documentUuid;
             """,
@@ -248,8 +259,7 @@ public class Given_MssqlGeneratedDdlTestDatabase
         var documentRow = documentRows.Should().ContainSingle().Which;
         var documentState = new MssqlGeneratedDdlDocumentState(
             Convert.ToInt64(documentRow["DocumentId"]),
-            Convert.ToInt64(documentRow["ContentVersion"]),
-            Convert.ToInt64(documentRow["IdentityVersion"])
+            Convert.ToInt64(documentRow["ContentVersion"])
         );
 
         await _database.ExecuteNonQueryAsync(

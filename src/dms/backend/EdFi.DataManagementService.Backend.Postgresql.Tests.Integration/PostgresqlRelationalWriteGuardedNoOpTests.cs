@@ -17,7 +17,6 @@ using EdFi.DataManagementService.Core.External.Model;
 using EdFi.DataManagementService.Core.Extraction;
 using FluentAssertions;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Npgsql;
@@ -25,101 +24,40 @@ using NUnit.Framework;
 
 namespace EdFi.DataManagementService.Backend.Postgresql.Tests.Integration;
 
-file sealed class GuardedNoOpConcurrentContentVersionBumpFreshnessChecker(
-    NpgsqlDataSourceProvider dataSourceProvider
-) : IRelationalWriteFreshnessChecker
-{
-    private readonly NpgsqlDataSourceProvider _dataSourceProvider =
-        dataSourceProvider ?? throw new ArgumentNullException(nameof(dataSourceProvider));
-
-    private readonly RelationalWriteFreshnessChecker _innerChecker = new();
-    private bool _hasBumpedContentVersion;
-
-    public async Task<bool> IsCurrentAsync(
-        RelationalWriteExecutorRequest request,
-        RelationalWriteTargetContext.ExistingDocument targetContext,
-        IRelationalWriteSession writeSession,
-        CancellationToken cancellationToken = default
-    )
-    {
-        if (!_hasBumpedContentVersion)
-        {
-            _hasBumpedContentVersion = true;
-
-            await BumpContentVersionAsync(targetContext.DocumentId, cancellationToken);
-        }
-
-        return await _innerChecker.IsCurrentAsync(request, targetContext, writeSession, cancellationToken);
-    }
-
-    private async Task BumpContentVersionAsync(long documentId, CancellationToken cancellationToken)
-    {
-        await using var connection = await _dataSourceProvider.DataSource.OpenConnectionAsync(
-            cancellationToken
-        );
-
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            UPDATE "dms"."Document"
-            SET "ContentVersion" = "ContentVersion" + 1
-            WHERE "DocumentId" = @documentId;
-            """;
-        command.Parameters.Add(new NpgsqlParameter("documentId", documentId));
-
-        var rowsAffected = await command.ExecuteNonQueryAsync(cancellationToken);
-
-        if (rowsAffected != 1)
-        {
-            throw new InvalidOperationException(
-                $"Expected exactly one document content-version bump for document id '{documentId}', but affected {rowsAffected} rows."
-            );
-        }
-    }
-}
-
-internal sealed class GuardedNoOpCommitWindowProbe
-{
-    public int IsCurrentCallCount { get; private set; }
-
-    public List<bool> Results { get; } = [];
-
-    public void Record(bool result)
-    {
-        IsCurrentCallCount++;
-        Results.Add(result);
-    }
-}
-
-internal sealed class GuardedNoOpCommitWindowCoordinator(NpgsqlDataSourceProvider dataSourceProvider)
+/// <summary>
+/// Holds an uncommitted content-version bump on a target document from a second connection so a write
+/// under test has to contend for the row the composite capture statement locks. The bump stays
+/// uncommitted, and its row lock held, until <see cref="CommitAsync"/> runs.
+/// </summary>
+internal sealed class GuardedNoOpCompetingBumpCoordinator(NpgsqlDataSourceProvider dataSourceProvider)
     : IAsyncDisposable
 {
     private readonly NpgsqlDataSourceProvider _dataSourceProvider =
         dataSourceProvider ?? throw new ArgumentNullException(nameof(dataSourceProvider));
 
-    private readonly TaskCompletionSource _writePending = new(
-        TaskCreationOptions.RunContinuationsAsynchronously
-    );
-
-    private readonly TaskCompletionSource _allowCommit = new(
-        TaskCreationOptions.RunContinuationsAsynchronously
-    );
-
-    private readonly TaskCompletionSource _committed = new(
-        TaskCreationOptions.RunContinuationsAsynchronously
-    );
-
     private NpgsqlConnection? _connection;
     private NpgsqlTransaction? _transaction;
     private bool _commitCompleted;
+    private int _backendProcessId;
 
-    public int CommitCallCount { get; private set; }
-
-    public async Task BeginPendingContentVersionBumpAsync(
+    public async Task BeginUncommittedContentVersionBumpAsync(
         long documentId,
         CancellationToken cancellationToken = default
     )
     {
         _connection = await _dataSourceProvider.DataSource.OpenConnectionAsync(cancellationToken);
+
+        // Record this backend's pid so the contended write can be proven to be lock-blocked by THIS
+        // transaction before the commit is released.
+        await using (var backendPidCommand = _connection.CreateCommand())
+        {
+            backendPidCommand.CommandText = "SELECT pg_backend_pid();";
+            _backendProcessId = Convert.ToInt32(
+                await backendPidCommand.ExecuteScalarAsync(cancellationToken),
+                CultureInfo.InvariantCulture
+            );
+        }
+
         _transaction = await _connection.BeginTransactionAsync(
             IsolationLevel.ReadCommitted,
             cancellationToken
@@ -129,40 +67,102 @@ internal sealed class GuardedNoOpCommitWindowCoordinator(NpgsqlDataSourceProvide
         command.Transaction = _transaction;
         command.CommandText = """
             UPDATE "dms"."Document"
-            SET "ContentVersion" = "ContentVersion" + 1
+            SET "ContentVersion" = "ContentVersion" + 1,
+                "ContentLastModifiedAt" = @contentLastModifiedAt
             WHERE "DocumentId" = @documentId;
             """;
         command.Parameters.Add(new NpgsqlParameter("documentId", documentId));
+        command.Parameters.Add(
+            new NpgsqlParameter(
+                "contentLastModifiedAt",
+                NoProfileGuardedNoOpScenarios.ConcurrentBumpContentLastModifiedAt
+            )
+        );
 
         var rowsAffected = await command.ExecuteNonQueryAsync(cancellationToken);
 
         if (rowsAffected != 1)
         {
             throw new InvalidOperationException(
-                $"Expected exactly one pending document content-version bump for document id '{documentId}', but affected {rowsAffected} rows."
+                $"Expected exactly one competing document content-version bump for document id '{documentId}', but affected {rowsAffected} rows."
+            );
+        }
+    }
+
+    /// <summary>
+    /// Polls until PostgreSQL reports some backend lock-blocked by this coordinator's backend, proving
+    /// the contended write has actually reached the server and is waiting on the uncommitted bump's row
+    /// lock. Returns without throwing when <paramref name="timeout"/> elapses: a capture that never
+    /// blocks is the condition under test, and the caller's assertion reports it far more clearly than
+    /// a timeout exception would.
+    /// </summary>
+    public async Task WaitUntilBlockingAnotherBackendAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default
+    )
+    {
+        if (_connection is null)
+        {
+            throw new InvalidOperationException(
+                "The uncommitted content-version bump must be started before waiting for it to block a backend."
             );
         }
 
-        _writePending.TrySetResult();
-        await _allowCommit.Task.WaitAsync(cancellationToken);
-        await _transaction.CommitAsync(cancellationToken);
-        _commitCompleted = true;
-        CommitCallCount++;
-        _committed.TrySetResult();
+        await using var observerConnection = await _dataSourceProvider.DataSource.OpenConnectionAsync(
+            cancellationToken
+        );
+
+        using var timeoutSource = new CancellationTokenSource(timeout);
+        using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            timeoutSource.Token
+        );
+
+        try
+        {
+            while (true)
+            {
+                await using var command = observerConnection.CreateCommand();
+                command.CommandText = """
+                    SELECT COUNT(*)
+                    FROM pg_stat_activity activity
+                    WHERE activity.datname = current_database()
+                        AND @blockingProcessId = ANY(pg_blocking_pids(activity.pid));
+                    """;
+                command.Parameters.Add(new NpgsqlParameter("blockingProcessId", _backendProcessId));
+
+                var blockedBackendCount = Convert.ToInt32(
+                    await command.ExecuteScalarAsync(linkedSource.Token),
+                    CultureInfo.InvariantCulture
+                );
+
+                if (blockedBackendCount > 0)
+                {
+                    return;
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(25), linkedSource.Token);
+            }
+        }
+        catch (OperationCanceledException) when (timeoutSource.IsCancellationRequested)
+        {
+            // Nothing ever blocked. Leave the verdict to the caller's assertion.
+        }
     }
 
-    public Task WaitUntilWriteIsPendingAsync(CancellationToken cancellationToken = default) =>
-        _writePending.Task.WaitAsync(cancellationToken);
+    public async Task CommitAsync(CancellationToken cancellationToken = default)
+    {
+        if (_transaction is null || _commitCompleted)
+        {
+            return;
+        }
 
-    public void ReleaseCommit() => _allowCommit.TrySetResult();
-
-    public Task WaitUntilCommittedAsync(CancellationToken cancellationToken = default) =>
-        _committed.Task.WaitAsync(cancellationToken);
+        await _transaction.CommitAsync(cancellationToken);
+        _commitCompleted = true;
+    }
 
     public async ValueTask DisposeAsync()
     {
-        ReleaseCommit();
-
         if (_transaction is not null && !_commitCompleted)
         {
             try
@@ -187,143 +187,22 @@ internal sealed class GuardedNoOpCommitWindowCoordinator(NpgsqlDataSourceProvide
     }
 }
 
-internal sealed class GuardedNoOpCommitWindowFreshnessChecker(
-    GuardedNoOpCommitWindowCoordinator coordinator,
-    GuardedNoOpCommitWindowProbe probe
-) : IRelationalWriteFreshnessChecker
-{
-    private readonly GuardedNoOpCommitWindowCoordinator _coordinator =
-        coordinator ?? throw new ArgumentNullException(nameof(coordinator));
-
-    private readonly GuardedNoOpCommitWindowProbe _probe =
-        probe ?? throw new ArgumentNullException(nameof(probe));
-
-    private readonly RelationalWriteFreshnessChecker _innerChecker = new();
-
-    public async Task<bool> IsCurrentAsync(
-        RelationalWriteExecutorRequest request,
-        RelationalWriteTargetContext.ExistingDocument targetContext,
-        IRelationalWriteSession writeSession,
-        CancellationToken cancellationToken = default
-    )
-    {
-        if (_probe.IsCurrentCallCount == 0)
-        {
-            var isCurrentTask = _innerChecker.IsCurrentAsync(
-                request,
-                targetContext,
-                writeSession,
-                cancellationToken
-            );
-
-            _coordinator.ReleaseCommit();
-
-            var isCurrent = await isCurrentTask;
-            _probe.Record(isCurrent);
-            await _coordinator.WaitUntilCommittedAsync(cancellationToken);
-
-            return isCurrent;
-        }
-
-        var retryResult = await _innerChecker.IsCurrentAsync(
-            request,
-            targetContext,
-            writeSession,
-            cancellationToken
-        );
-
-        _probe.Record(retryResult);
-        return retryResult;
-    }
-}
-
-internal sealed class GuardedNoOpPreLoadContentVersionBumpProbe
-{
-    public int LoadCallCount { get; private set; }
-
-    public int ContentVersionBumpCallCount { get; private set; }
-
-    public List<long> LoadedContentVersions { get; } = [];
-
-    public void RecordLoad(RelationalWriteCurrentState? currentState)
-    {
-        LoadCallCount++;
-
-        if (currentState is not null)
-        {
-            LoadedContentVersions.Add(currentState.DocumentMetadata.ContentVersion);
-        }
-    }
-
-    public void RecordContentVersionBump() => ContentVersionBumpCallCount++;
-}
-
-file sealed class GuardedNoOpPreLoadContentVersionBumpCurrentStateLoader(
-    ISessionDocumentHydrator sessionDocumentHydrator,
-    NpgsqlDataSourceProvider dataSourceProvider,
-    GuardedNoOpPreLoadContentVersionBumpProbe probe
-) : IRelationalWriteCurrentStateLoader
-{
-    private readonly RelationalWriteCurrentStateLoader _inner = new(sessionDocumentHydrator);
-    private readonly NpgsqlDataSourceProvider _dataSourceProvider =
-        dataSourceProvider ?? throw new ArgumentNullException(nameof(dataSourceProvider));
-    private readonly GuardedNoOpPreLoadContentVersionBumpProbe _probe =
-        probe ?? throw new ArgumentNullException(nameof(probe));
-    private bool _hasBumpedContentVersion;
-
-    public async Task<RelationalWriteCurrentState?> LoadAsync(
-        RelationalWriteCurrentStateLoadRequest request,
-        IRelationalWriteSession writeSession,
-        CancellationToken cancellationToken = default
-    )
-    {
-        if (!_hasBumpedContentVersion)
-        {
-            _hasBumpedContentVersion = true;
-
-            await BumpContentVersionAsync(request.TargetContext.DocumentId, cancellationToken);
-            _probe.RecordContentVersionBump();
-        }
-
-        var currentState = await _inner.LoadAsync(request, writeSession, cancellationToken);
-        _probe.RecordLoad(currentState);
-
-        return currentState;
-    }
-
-    private async Task BumpContentVersionAsync(long documentId, CancellationToken cancellationToken)
-    {
-        await using var connection = await _dataSourceProvider.DataSource.OpenConnectionAsync(
-            cancellationToken
-        );
-
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            UPDATE "dms"."Document"
-            SET "ContentVersion" = "ContentVersion" + 1
-            WHERE "DocumentId" = @documentId;
-            """;
-        command.Parameters.Add(new NpgsqlParameter("documentId", documentId));
-
-        var rowsAffected = await command.ExecuteNonQueryAsync(cancellationToken);
-
-        if (rowsAffected != 1)
-        {
-            throw new InvalidOperationException(
-                $"Expected exactly one pre-load document content-version bump for document id '{documentId}', but affected {rowsAffected} rows."
-            );
-        }
-    }
-}
-
 internal sealed record GuardedNoOpDocumentRow(
     long DocumentId,
     Guid DocumentUuid,
     short ResourceKeyId,
-    long ContentVersion
+    long ContentVersion,
+    DateTimeOffset ContentLastModifiedAt,
+    DateTimeOffset CreatedAt
 );
 
-internal sealed record GuardedNoOpSchoolRow(long DocumentId, long SchoolId, string? ShortName);
+internal sealed record GuardedNoOpSchoolRow(
+    long DocumentId,
+    long SchoolId,
+    string? ShortName,
+    long ContentVersion,
+    DateTimeOffset ContentLastModifiedAt
+);
 
 internal sealed record GuardedNoOpSchoolAddressRow(
     long CollectionItemId,
@@ -343,7 +222,9 @@ internal sealed record GuardedNoOpPersistedState(
     GuardedNoOpSchoolRow School,
     IReadOnlyList<GuardedNoOpSchoolAddressRow> Addresses,
     IReadOnlyList<GuardedNoOpSchoolExtensionAddressRow> ExtensionAddresses,
-    long DocumentCount
+    IReadOnlyList<GuardedNoOpReferentialIdentityRow> ReferentialIdentities,
+    long DocumentCount,
+    long MaxChangeVersion
 );
 
 internal sealed record GuardedNoOpReferentialIdentityRow(
@@ -357,75 +238,17 @@ file static class GuardedNoOpIntegrationTestSupport
     public const string FixtureRelativePath =
         "src/dms/backend/EdFi.DataManagementService.Backend.Ddl.Tests.Unit/Fixtures/focused/stable-key-update-semantics";
 
-    public const string RequestBodyJson = """
-        {
-          "schoolId": 255901,
-          "shortName": "LHS",
-          "addresses": [
-            {
-              "city": "Austin"
-            },
-            {
-              "city": "Dallas"
-            }
-          ],
-          "_ext": {
-            "sample": {
-              "addresses": [
-                {
-                  "_ext": {
-                    "sample": {
-                      "zone": "Zone-1"
-                    }
-                  }
-                },
-                {
-                  "_ext": {
-                    "sample": {
-                      "zone": "Zone-2"
-                    }
-                  }
-                }
-              ]
-            }
-          }
-        }
-        """;
+    // The provider-neutral request bodies live in the shared contract so every engine adapter exercises
+    // identical inputs; this PostgreSQL adapter consumes them rather than defining its own.
+    public const string RequestBodyJson = NoProfileGuardedNoOpScenarios.RequestBodyJson;
+    public const string ReorderedRequestBodyJson = NoProfileGuardedNoOpScenarios.ReorderedRequestBodyJson;
 
-    public const string ReorderedRequestBodyJson = """
-        {
-          "schoolId": 255901,
-          "shortName": "LHS",
-          "addresses": [
-            {
-              "city": "Dallas"
-            },
-            {
-              "city": "Austin"
-            }
-          ],
-          "_ext": {
-            "sample": {
-              "addresses": [
-                {
-                  "_ext": {
-                    "sample": {
-                      "zone": "Zone-2"
-                    }
-                  }
-                },
-                {
-                  "_ext": {
-                    "sample": {
-                      "zone": "Zone-1"
-                    }
-                  }
-                }
-              ]
-            }
-          }
-        }
-        """;
+    // Upper bound on how long to wait for the contended write to show up as lock-blocked. Reaching it
+    // means the capture never took the row lock, which the fixture's assertion reports.
+    public static readonly TimeSpan CompetingBumpBlockObservationTimeout = TimeSpan.FromSeconds(10);
+
+    // Upper bound for the contended write to finish once the competing transaction releases its lock.
+    public static readonly TimeSpan CompetingBumpCompletionTimeout = TimeSpan.FromSeconds(30);
 
     public static readonly QualifiedResourceName SchoolResource = new("Ed-Fi", "School");
     public static readonly ResourceInfo SchoolResourceInfo = new(
@@ -447,7 +270,7 @@ file static class GuardedNoOpIntegrationTestSupport
         services.Configure<DatabaseOptions>(options => options.IsolationLevel = IsolationLevel.ReadCommitted);
         services.AddTestReadableProfileProjector();
         services.AddScoped<RelationalDocumentStoreRepository>();
-        services.AddPostgresqlReferenceResolver();
+        services.AddPostgresqlBackendIntegrationTestServices();
         configureServices?.Invoke(services);
 
         return services.BuildServiceProvider(
@@ -455,35 +278,8 @@ file static class GuardedNoOpIntegrationTestSupport
         );
     }
 
-    public static ServiceProvider CreateStaleCompareServiceProvider() =>
-        CreateServiceProvider(static services =>
-        {
-            services.RemoveAll<IRelationalWriteFreshnessChecker>();
-            services.AddScoped<
-                IRelationalWriteFreshnessChecker,
-                GuardedNoOpConcurrentContentVersionBumpFreshnessChecker
-            >();
-        });
-
-    public static ServiceProvider CreateCommitWindowServiceProvider() =>
-        CreateServiceProvider(static services =>
-        {
-            services.AddSingleton<GuardedNoOpCommitWindowProbe>();
-            services.AddScoped<GuardedNoOpCommitWindowCoordinator>();
-            services.RemoveAll<IRelationalWriteFreshnessChecker>();
-            services.AddScoped<IRelationalWriteFreshnessChecker, GuardedNoOpCommitWindowFreshnessChecker>();
-        });
-
-    public static ServiceProvider CreatePreLoadContentVersionBumpServiceProvider() =>
-        CreateServiceProvider(static services =>
-        {
-            services.AddSingleton<GuardedNoOpPreLoadContentVersionBumpProbe>();
-            services.RemoveAll<IRelationalWriteCurrentStateLoader>();
-            services.AddScoped<
-                IRelationalWriteCurrentStateLoader,
-                GuardedNoOpPreLoadContentVersionBumpCurrentStateLoader
-            >();
-        });
+    public static ServiceProvider CreateCompetingBumpServiceProvider() =>
+        CreateServiceProvider(static services => services.AddScoped<GuardedNoOpCompetingBumpCoordinator>());
 
     public static UpsertRequest CreateCreateRequest(
         MappingSet mappingSet,
@@ -562,10 +358,69 @@ file static class GuardedNoOpIntegrationTestSupport
         var school = await ReadSchoolAsync(database, document.DocumentId);
         var addresses = await ReadSchoolAddressesAsync(database, document.DocumentId);
         var extensionAddresses = await ReadSchoolExtensionAddressesAsync(database, document.DocumentId);
+        var referentialIdentities = await ReadAllReferentialIdentityRowsAsync(database);
         var documentCount = await ReadDocumentCountAsync(database);
+        var maxChangeVersion = await ReadMaxChangeVersionAsync(database);
 
-        return new GuardedNoOpPersistedState(document, school, addresses, extensionAddresses, documentCount);
+        return new GuardedNoOpPersistedState(
+            document,
+            school,
+            addresses,
+            extensionAddresses,
+            referentialIdentities,
+            documentCount,
+            maxChangeVersion
+        );
     }
+
+    // Project the actual PostgreSQL readback into the full provider-neutral snapshot the shared
+    // NoProfileGuardedNoOpScenarios contract compares field-for-field.
+    public static NoProfileGuardedNoOpScenarios.PersistedState ToNeutral(GuardedNoOpPersistedState state) =>
+        new(
+            new NoProfileGuardedNoOpScenarios.DocumentRow(
+                state.Document.DocumentId,
+                state.Document.DocumentUuid,
+                state.Document.ResourceKeyId,
+                state.Document.ContentVersion,
+                state.Document.ContentLastModifiedAt,
+                state.Document.CreatedAt
+            ),
+            new NoProfileGuardedNoOpScenarios.SchoolRow(
+                state.School.DocumentId,
+                state.School.SchoolId,
+                state.School.ShortName,
+                state.School.ContentVersion,
+                state.School.ContentLastModifiedAt
+            ),
+            [
+                .. state.Addresses.Select(address => new NoProfileGuardedNoOpScenarios.SchoolAddressRow(
+                    address.CollectionItemId,
+                    address.SchoolDocumentId,
+                    address.Ordinal,
+                    address.City
+                )),
+            ],
+            [
+                .. state.ExtensionAddresses.Select(
+                    extensionAddress => new NoProfileGuardedNoOpScenarios.SchoolExtensionAddressRow(
+                        extensionAddress.BaseCollectionItemId,
+                        extensionAddress.SchoolDocumentId,
+                        extensionAddress.Zone
+                    )
+                ),
+            ],
+            [
+                .. state.ReferentialIdentities.Select(
+                    referentialIdentity => new NoProfileGuardedNoOpScenarios.ReferentialIdentityRow(
+                        referentialIdentity.ReferentialId,
+                        referentialIdentity.DocumentId,
+                        referentialIdentity.ResourceKeyId
+                    )
+                ),
+            ],
+            state.DocumentCount,
+            state.MaxChangeVersion
+        );
 
     public static async Task<GuardedNoOpReferentialIdentityRow> ReadReferentialIdentityRowAsync(
         PostgresqlGeneratedDdlTestDatabase database,
@@ -593,6 +448,37 @@ file static class GuardedNoOpIntegrationTestSupport
             : throw new InvalidOperationException(
                 $"Expected exactly one referential identity row for document id '{documentId}' and resource key '{resourceKeyId}', but found {rows.Count}."
             );
+    }
+
+    private static async Task<long> ReadMaxChangeVersionAsync(PostgresqlGeneratedDdlTestDatabase database)
+    {
+        var rows = await database.QueryRowsAsync(
+            """
+            SELECT "dms"."GetMaxChangeVersion"() AS "MaxChangeVersion";
+            """
+        );
+
+        return GetInt64(rows[0], "MaxChangeVersion");
+    }
+
+    private static async Task<
+        IReadOnlyList<GuardedNoOpReferentialIdentityRow>
+    > ReadAllReferentialIdentityRowsAsync(PostgresqlGeneratedDdlTestDatabase database)
+    {
+        var rows = await database.QueryRowsAsync(
+            """
+            SELECT "ReferentialId", "DocumentId", "ResourceKeyId"
+            FROM "dms"."ReferentialIdentity"
+            ORDER BY "ReferentialId";
+            """
+        );
+
+        return rows.Select(row => new GuardedNoOpReferentialIdentityRow(
+                GetGuid(row, "ReferentialId"),
+                GetInt64(row, "DocumentId"),
+                GetInt16(row, "ResourceKeyId")
+            ))
+            .ToArray();
     }
 
     public static async Task<long> ReadDocumentCountAsync(
@@ -627,6 +513,22 @@ file static class GuardedNoOpIntegrationTestSupport
         GetRequiredValue(row, columnName) is Guid value
             ? value
             : throw new InvalidOperationException($"Expected column '{columnName}' to contain a Guid value.");
+
+    public static DateTimeOffset GetDateTimeOffset(
+        IReadOnlyDictionary<string, object?> row,
+        string columnName
+    ) =>
+        GetRequiredValue(row, columnName) switch
+        {
+            DateTimeOffset value => value,
+            DateTime value => new DateTimeOffset(
+                DateTime.SpecifyKind(value, DateTimeKind.Utc),
+                TimeSpan.Zero
+            ),
+            _ => throw new InvalidOperationException(
+                $"Expected column '{columnName}' to contain a DateTimeOffset value."
+            ),
+        };
 
     public static string GetString(IReadOnlyDictionary<string, object?> row, string columnName) =>
         GetRequiredValue(row, columnName) as string
@@ -663,7 +565,8 @@ file static class GuardedNoOpIntegrationTestSupport
     {
         var rows = await database.QueryRowsAsync(
             """
-            SELECT "DocumentId", "DocumentUuid", "ResourceKeyId", "ContentVersion"
+            SELECT "DocumentId", "DocumentUuid", "ResourceKeyId", "ContentVersion",
+                "ContentLastModifiedAt", "CreatedAt"
             FROM "dms"."Document"
             WHERE "DocumentUuid" = @documentUuid;
             """,
@@ -675,7 +578,9 @@ file static class GuardedNoOpIntegrationTestSupport
                 GetInt64(rows[0], "DocumentId"),
                 GetGuid(rows[0], "DocumentUuid"),
                 GetInt16(rows[0], "ResourceKeyId"),
-                GetInt64(rows[0], "ContentVersion")
+                GetInt64(rows[0], "ContentVersion"),
+                GetDateTimeOffset(rows[0], "ContentLastModifiedAt"),
+                GetDateTimeOffset(rows[0], "CreatedAt")
             )
             : throw new InvalidOperationException(
                 $"Expected exactly one document row for '{documentUuid}', but found {rows.Count}."
@@ -689,7 +594,7 @@ file static class GuardedNoOpIntegrationTestSupport
     {
         var rows = await database.QueryRowsAsync(
             """
-            SELECT "DocumentId", "SchoolId", "ShortName"
+            SELECT "DocumentId", "SchoolId", "ShortName", "ContentVersion", "ContentLastModifiedAt"
             FROM "edfi"."School"
             WHERE "DocumentId" = @documentId;
             """,
@@ -700,7 +605,9 @@ file static class GuardedNoOpIntegrationTestSupport
             ? new GuardedNoOpSchoolRow(
                 GetInt64(rows[0], "DocumentId"),
                 GetInt64(rows[0], "SchoolId"),
-                GetNullableString(rows[0], "ShortName")
+                GetNullableString(rows[0], "ShortName"),
+                GetInt64(rows[0], "ContentVersion"),
+                GetDateTimeOffset(rows[0], "ContentLastModifiedAt")
             )
             : throw new InvalidOperationException(
                 $"Expected exactly one school row for document id '{documentId}', but found {rows.Count}."
@@ -863,20 +770,17 @@ internal class Given_A_Postgresql_Relational_Guarded_No_Op_Put_With_A_Focused_St
     }
 
     [Test]
-    public void It_returns_update_success_for_an_unchanged_put()
-    {
-        _updateResult.Should().BeOfType<UpdateResult.UpdateSuccess>();
-        _updateResult.As<UpdateResult.UpdateSuccess>().ExistingDocumentUuid.Should().Be(SchoolDocumentUuid);
-    }
+    public void It_returns_update_success_for_an_unchanged_put() =>
+        NoProfileGuardedNoOpScenarios.AssertPutNoOpOutcome(_updateResult, SchoolDocumentUuid);
 
     [Test]
-    public void It_keeps_rowsets_and_content_version_unchanged_for_a_guarded_no_op_put()
-    {
-        _stateAfterUpdate.Should().BeEquivalentTo(_stateBeforeUpdate);
-        _stateAfterUpdate
-            .Document.ResourceKeyId.Should()
-            .Be(_mappingSet.ResourceKeyIdByResource[GuardedNoOpIntegrationTestSupport.SchoolResource]);
-    }
+    public void It_keeps_rowsets_and_content_version_unchanged_for_a_guarded_no_op_put() =>
+        NoProfileGuardedNoOpScenarios.AssertRowsetUnchanged(
+            GuardedNoOpIntegrationTestSupport.ToNeutral(_stateBeforeUpdate),
+            GuardedNoOpIntegrationTestSupport.ToNeutral(_stateAfterUpdate),
+            _mappingSet,
+            GuardedNoOpIntegrationTestSupport.SchoolResource
+        );
 
     private async Task ExecuteCreateAsync()
     {
@@ -985,24 +889,21 @@ internal class Given_A_Postgresql_Relational_Guarded_No_Op_Post_As_Update_With_A
     }
 
     [Test]
-    public void It_returns_update_success_and_preserves_the_existing_document_for_an_unchanged_post_as_update()
-    {
-        _postAsUpdateResult.Should().BeOfType<UpsertResult.UpdateSuccess>();
-        _postAsUpdateResult
-            .As<UpsertResult.UpdateSuccess>()
-            .ExistingDocumentUuid.Should()
-            .Be(ExistingSchoolDocumentUuid);
-        _incomingDocumentUuidCount.Should().Be(0);
-    }
+    public void It_returns_update_success_and_preserves_the_existing_document_for_an_unchanged_post_as_update() =>
+        NoProfileGuardedNoOpScenarios.AssertPostAsUpdateNoOpOutcome(
+            _postAsUpdateResult,
+            ExistingSchoolDocumentUuid,
+            _incomingDocumentUuidCount
+        );
 
     [Test]
-    public void It_keeps_rowsets_and_content_version_unchanged_for_a_guarded_no_op_post_as_update()
-    {
-        _stateAfterPostAsUpdate.Should().BeEquivalentTo(_stateBeforePostAsUpdate);
-        _stateAfterPostAsUpdate
-            .Document.ResourceKeyId.Should()
-            .Be(_mappingSet.ResourceKeyIdByResource[GuardedNoOpIntegrationTestSupport.SchoolResource]);
-    }
+    public void It_keeps_rowsets_and_content_version_unchanged_for_a_guarded_no_op_post_as_update() =>
+        NoProfileGuardedNoOpScenarios.AssertRowsetUnchanged(
+            GuardedNoOpIntegrationTestSupport.ToNeutral(_stateBeforePostAsUpdate),
+            GuardedNoOpIntegrationTestSupport.ToNeutral(_stateAfterPostAsUpdate),
+            _mappingSet,
+            GuardedNoOpIntegrationTestSupport.SchoolResource
+        );
 
     private async Task ExecuteCreateAsync()
     {
@@ -1064,269 +965,6 @@ internal class Given_A_Postgresql_Relational_Guarded_No_Op_Post_As_Update_With_A
 [TestFixture]
 [Category("DatabaseIntegration")]
 [Category("PostgresqlIntegration")]
-internal class Given_A_Postgresql_Relational_Guarded_No_Op_Put_When_Current_State_Refreshes_Content_Version
-    : GuardedNoOpGeneratedDdlFixtureTestBase
-{
-    private static readonly DocumentUuid SchoolDocumentUuid = new(
-        Guid.Parse("dddddddd-0000-0000-0000-000000000010")
-    );
-
-    private GuardedNoOpPreLoadContentVersionBumpProbe _probe = null!;
-    private GuardedNoOpPersistedState _stateBeforeUpdate = null!;
-    private GuardedNoOpPersistedState _stateAfterUpdate = null!;
-    private UpdateResult _updateResult = null!;
-
-    protected override ServiceProvider CreateServiceProvider() =>
-        GuardedNoOpIntegrationTestSupport.CreatePreLoadContentVersionBumpServiceProvider();
-
-    protected override async Task SetUpTestAsync()
-    {
-        _probe = _serviceProvider.GetRequiredService<GuardedNoOpPreLoadContentVersionBumpProbe>();
-
-        await ExecuteCreateAsync();
-        _stateBeforeUpdate = await GuardedNoOpIntegrationTestSupport.ReadPersistedStateAsync(
-            _database,
-            SchoolDocumentUuid.Value
-        );
-
-        _updateResult = await ExecuteUpdateAsync();
-        _stateAfterUpdate = await GuardedNoOpIntegrationTestSupport.ReadPersistedStateAsync(
-            _database,
-            SchoolDocumentUuid.Value
-        );
-    }
-
-    [Test]
-    public void It_returns_update_success_without_a_repository_retry_when_current_state_refreshes_the_content_version()
-    {
-        _updateResult.Should().BeOfType<UpdateResult.UpdateSuccess>();
-        _updateResult.As<UpdateResult.UpdateSuccess>().ExistingDocumentUuid.Should().Be(SchoolDocumentUuid);
-        _probe.ContentVersionBumpCallCount.Should().Be(1);
-        _probe.LoadCallCount.Should().Be(1);
-        _probe.LoadedContentVersions.Should().Equal(_stateBeforeUpdate.Document.ContentVersion + 1);
-    }
-
-    [Test]
-    public void It_preserves_rowsets_and_avoids_an_extra_content_version_bump_during_the_guarded_no_op_put()
-    {
-        var adjustedAfterState = _stateAfterUpdate with
-        {
-            Document = _stateAfterUpdate.Document with
-            {
-                ContentVersion = _stateBeforeUpdate.Document.ContentVersion,
-            },
-        };
-
-        adjustedAfterState.Should().BeEquivalentTo(_stateBeforeUpdate);
-        _stateAfterUpdate.Document.ContentVersion.Should().Be(_stateBeforeUpdate.Document.ContentVersion + 1);
-        _stateAfterUpdate
-            .Document.ResourceKeyId.Should()
-            .Be(_mappingSet.ResourceKeyIdByResource[GuardedNoOpIntegrationTestSupport.SchoolResource]);
-    }
-
-    private async Task ExecuteCreateAsync()
-    {
-        await using var scope = _serviceProvider.CreateAsyncScope();
-
-        scope
-            .ServiceProvider.GetRequiredService<IDataStoreSelection>()
-            .SetSelectedDataStore(
-                new DataStore(
-                    Id: 1,
-                    DataStoreType: "test",
-                    Name: "PostgresqlRelationalWriteGuardedNoOpCurrentStateRefreshPut",
-                    ConnectionString: _database.ConnectionString,
-                    RouteContext: []
-                )
-            );
-
-        var repository = scope.ServiceProvider.GetRequiredService<RelationalDocumentStoreRepository>();
-        var createResult = await repository.UpsertDocument(
-            GuardedNoOpIntegrationTestSupport.CreateCreateRequest(
-                _mappingSet,
-                SchoolDocumentUuid,
-                "pg-guarded-no-op-current-state-refresh-put-create"
-            )
-        );
-
-        createResult.Should().BeOfType<UpsertResult.InsertSuccess>();
-    }
-
-    private async Task<UpdateResult> ExecuteUpdateAsync()
-    {
-        await using var scope = _serviceProvider.CreateAsyncScope();
-
-        scope
-            .ServiceProvider.GetRequiredService<IDataStoreSelection>()
-            .SetSelectedDataStore(
-                new DataStore(
-                    Id: 1,
-                    DataStoreType: "test",
-                    Name: "PostgresqlRelationalWriteGuardedNoOpCurrentStateRefreshPut",
-                    ConnectionString: _database.ConnectionString,
-                    RouteContext: []
-                )
-            );
-
-        var repository = scope.ServiceProvider.GetRequiredService<RelationalDocumentStoreRepository>();
-
-        return await repository.UpdateDocumentById(
-            GuardedNoOpIntegrationTestSupport.CreateUpdateRequest(
-                _mappingSet,
-                SchoolDocumentUuid,
-                "pg-guarded-no-op-current-state-refresh-put-update"
-            )
-        );
-    }
-}
-
-[TestFixture]
-[Category("DatabaseIntegration")]
-[Category("PostgresqlIntegration")]
-internal class Given_A_Postgresql_Relational_Guarded_No_Op_Post_As_Update_When_Current_State_Refreshes_Content_Version
-    : GuardedNoOpGeneratedDdlFixtureTestBase
-{
-    private static readonly DocumentUuid ExistingSchoolDocumentUuid = new(
-        Guid.Parse("dddddddd-0000-0000-0000-000000000011")
-    );
-    private static readonly DocumentUuid IncomingSchoolDocumentUuid = new(
-        Guid.Parse("dddddddd-0000-0000-0000-000000000012")
-    );
-
-    private GuardedNoOpPreLoadContentVersionBumpProbe _probe = null!;
-    private GuardedNoOpPersistedState _stateBeforePostAsUpdate = null!;
-    private GuardedNoOpPersistedState _stateAfterPostAsUpdate = null!;
-    private UpsertResult _postAsUpdateResult = null!;
-    private long _incomingDocumentUuidCount;
-
-    protected override ServiceProvider CreateServiceProvider() =>
-        GuardedNoOpIntegrationTestSupport.CreatePreLoadContentVersionBumpServiceProvider();
-
-    protected override async Task SetUpTestAsync()
-    {
-        _probe = _serviceProvider.GetRequiredService<GuardedNoOpPreLoadContentVersionBumpProbe>();
-
-        await ExecuteCreateAsync();
-        _stateBeforePostAsUpdate = await GuardedNoOpIntegrationTestSupport.ReadPersistedStateAsync(
-            _database,
-            ExistingSchoolDocumentUuid.Value
-        );
-
-        var persistedReferentialIdentity =
-            await GuardedNoOpIntegrationTestSupport.ReadReferentialIdentityRowAsync(
-                _database,
-                _stateBeforePostAsUpdate.Document.DocumentId,
-                _mappingSet.ResourceKeyIdByResource[GuardedNoOpIntegrationTestSupport.SchoolResource]
-            );
-
-        _postAsUpdateResult = await ExecutePostAsUpdateAsync(
-            new ReferentialId(persistedReferentialIdentity.ReferentialId)
-        );
-
-        _stateAfterPostAsUpdate = await GuardedNoOpIntegrationTestSupport.ReadPersistedStateAsync(
-            _database,
-            ExistingSchoolDocumentUuid.Value
-        );
-        _incomingDocumentUuidCount = await GuardedNoOpIntegrationTestSupport.ReadDocumentCountAsync(
-            _database,
-            IncomingSchoolDocumentUuid.Value
-        );
-    }
-
-    [Test]
-    public void It_returns_update_success_without_a_repository_retry_when_post_as_update_refreshes_current_state_freshness()
-    {
-        _postAsUpdateResult.Should().BeOfType<UpsertResult.UpdateSuccess>();
-        _postAsUpdateResult
-            .As<UpsertResult.UpdateSuccess>()
-            .ExistingDocumentUuid.Should()
-            .Be(ExistingSchoolDocumentUuid);
-        _incomingDocumentUuidCount.Should().Be(0);
-        _probe.ContentVersionBumpCallCount.Should().Be(1);
-        _probe.LoadCallCount.Should().Be(1);
-        _probe.LoadedContentVersions.Should().Equal(_stateBeforePostAsUpdate.Document.ContentVersion + 1);
-    }
-
-    [Test]
-    public void It_preserves_rowsets_and_avoids_an_extra_content_version_bump_during_the_guarded_no_op_post_as_update()
-    {
-        var adjustedAfterState = _stateAfterPostAsUpdate with
-        {
-            Document = _stateAfterPostAsUpdate.Document with
-            {
-                ContentVersion = _stateBeforePostAsUpdate.Document.ContentVersion,
-            },
-        };
-
-        adjustedAfterState.Should().BeEquivalentTo(_stateBeforePostAsUpdate);
-        _stateAfterPostAsUpdate
-            .Document.ContentVersion.Should()
-            .Be(_stateBeforePostAsUpdate.Document.ContentVersion + 1);
-        _stateAfterPostAsUpdate
-            .Document.ResourceKeyId.Should()
-            .Be(_mappingSet.ResourceKeyIdByResource[GuardedNoOpIntegrationTestSupport.SchoolResource]);
-    }
-
-    private async Task ExecuteCreateAsync()
-    {
-        await using var scope = _serviceProvider.CreateAsyncScope();
-
-        scope
-            .ServiceProvider.GetRequiredService<IDataStoreSelection>()
-            .SetSelectedDataStore(
-                new DataStore(
-                    Id: 1,
-                    DataStoreType: "test",
-                    Name: "PostgresqlRelationalWriteGuardedNoOpCurrentStateRefreshPostAsUpdate",
-                    ConnectionString: _database.ConnectionString,
-                    RouteContext: []
-                )
-            );
-
-        var repository = scope.ServiceProvider.GetRequiredService<RelationalDocumentStoreRepository>();
-        var createResult = await repository.UpsertDocument(
-            GuardedNoOpIntegrationTestSupport.CreateCreateRequest(
-                _mappingSet,
-                ExistingSchoolDocumentUuid,
-                "pg-guarded-no-op-current-state-refresh-post-as-update-create"
-            )
-        );
-
-        createResult.Should().BeOfType<UpsertResult.InsertSuccess>();
-    }
-
-    private async Task<UpsertResult> ExecutePostAsUpdateAsync(ReferentialId referentialId)
-    {
-        await using var scope = _serviceProvider.CreateAsyncScope();
-
-        scope
-            .ServiceProvider.GetRequiredService<IDataStoreSelection>()
-            .SetSelectedDataStore(
-                new DataStore(
-                    Id: 1,
-                    DataStoreType: "test",
-                    Name: "PostgresqlRelationalWriteGuardedNoOpCurrentStateRefreshPostAsUpdate",
-                    ConnectionString: _database.ConnectionString,
-                    RouteContext: []
-                )
-            );
-
-        var repository = scope.ServiceProvider.GetRequiredService<RelationalDocumentStoreRepository>();
-
-        return await repository.UpsertDocument(
-            GuardedNoOpIntegrationTestSupport.CreatePostAsUpdateRequest(
-                _mappingSet,
-                IncomingSchoolDocumentUuid,
-                "pg-guarded-no-op-current-state-refresh-post-as-update",
-                referentialId
-            )
-        );
-    }
-}
-
-[TestFixture]
-[Category("DatabaseIntegration")]
-[Category("PostgresqlIntegration")]
 internal class Given_A_Postgresql_Relational_Guarded_No_Op_Put_After_A_Full_Surface_Collection_Reorder_With_A_Focused_Stable_Key_Fixture
     : GuardedNoOpGeneratedDdlFixtureTestBase
 {
@@ -1358,21 +996,17 @@ internal class Given_A_Postgresql_Relational_Guarded_No_Op_Put_After_A_Full_Surf
     }
 
     [Test]
-    public void It_returns_update_success_for_an_unchanged_put_after_reorder()
-    {
-        _updateResult.Should().BeOfType<UpdateResult.UpdateSuccess>();
-        _updateResult.As<UpdateResult.UpdateSuccess>().ExistingDocumentUuid.Should().Be(SchoolDocumentUuid);
-    }
+    public void It_returns_update_success_for_an_unchanged_put_after_reorder() =>
+        NoProfileGuardedNoOpScenarios.AssertPutNoOpOutcome(_updateResult, SchoolDocumentUuid);
 
     [Test]
-    public void It_keeps_rowsets_and_content_version_unchanged_for_a_guarded_no_op_put_after_reorder()
-    {
-        _stateBeforeNoOpUpdate.Addresses.Select(address => address.City).Should().Equal("Dallas", "Austin");
-        _stateAfterNoOpUpdate.Should().BeEquivalentTo(_stateBeforeNoOpUpdate);
-        _stateAfterNoOpUpdate
-            .Document.ResourceKeyId.Should()
-            .Be(_mappingSet.ResourceKeyIdByResource[GuardedNoOpIntegrationTestSupport.SchoolResource]);
-    }
+    public void It_keeps_rowsets_and_content_version_unchanged_for_a_guarded_no_op_put_after_reorder() =>
+        NoProfileGuardedNoOpScenarios.AssertRowsetUnchangedAfterReorder(
+            GuardedNoOpIntegrationTestSupport.ToNeutral(_stateBeforeNoOpUpdate),
+            GuardedNoOpIntegrationTestSupport.ToNeutral(_stateAfterNoOpUpdate),
+            _mappingSet,
+            GuardedNoOpIntegrationTestSupport.SchoolResource
+        );
 
     private async Task ExecuteCreateAsync()
     {
@@ -1512,25 +1146,21 @@ internal class Given_A_Postgresql_Relational_Guarded_No_Op_Post_As_Update_After_
     }
 
     [Test]
-    public void It_returns_update_success_and_preserves_the_existing_document_for_an_unchanged_post_as_update_after_reorder()
-    {
-        _postAsUpdateResult.Should().BeOfType<UpsertResult.UpdateSuccess>();
-        _postAsUpdateResult
-            .As<UpsertResult.UpdateSuccess>()
-            .ExistingDocumentUuid.Should()
-            .Be(ExistingSchoolDocumentUuid);
-        _incomingDocumentUuidCount.Should().Be(0);
-    }
+    public void It_returns_update_success_and_preserves_the_existing_document_for_an_unchanged_post_as_update_after_reorder() =>
+        NoProfileGuardedNoOpScenarios.AssertPostAsUpdateNoOpOutcome(
+            _postAsUpdateResult,
+            ExistingSchoolDocumentUuid,
+            _incomingDocumentUuidCount
+        );
 
     [Test]
-    public void It_keeps_rowsets_and_content_version_unchanged_for_a_guarded_no_op_post_as_update_after_reorder()
-    {
-        _stateBeforePostAsUpdate.Addresses.Select(address => address.City).Should().Equal("Dallas", "Austin");
-        _stateAfterPostAsUpdate.Should().BeEquivalentTo(_stateBeforePostAsUpdate);
-        _stateAfterPostAsUpdate
-            .Document.ResourceKeyId.Should()
-            .Be(_mappingSet.ResourceKeyIdByResource[GuardedNoOpIntegrationTestSupport.SchoolResource]);
-    }
+    public void It_keeps_rowsets_and_content_version_unchanged_for_a_guarded_no_op_post_as_update_after_reorder() =>
+        NoProfileGuardedNoOpScenarios.AssertRowsetUnchangedAfterReorder(
+            GuardedNoOpIntegrationTestSupport.ToNeutral(_stateBeforePostAsUpdate),
+            GuardedNoOpIntegrationTestSupport.ToNeutral(_stateAfterPostAsUpdate),
+            _mappingSet,
+            GuardedNoOpIntegrationTestSupport.SchoolResource
+        );
 
     private async Task ExecuteCreateAsync()
     {
@@ -1622,7 +1252,7 @@ internal class Given_A_Postgresql_Relational_Guarded_No_Op_Post_As_Update_After_
 [TestFixture]
 [Category("DatabaseIntegration")]
 [Category("PostgresqlIntegration")]
-internal class Given_A_Postgresql_Relational_Stale_Guarded_No_Op_Put_With_A_Focused_Stable_Key_Fixture
+internal class Given_A_Postgresql_Relational_Guarded_No_Op_Put_With_A_Competing_Uncommitted_Content_Version_Bump
     : GuardedNoOpGeneratedDdlFixtureTestBase
 {
     private static readonly DocumentUuid SchoolDocumentUuid = new(
@@ -1632,9 +1262,11 @@ internal class Given_A_Postgresql_Relational_Stale_Guarded_No_Op_Put_With_A_Focu
     private GuardedNoOpPersistedState _stateBeforeUpdate = null!;
     private GuardedNoOpPersistedState _stateAfterUpdate = null!;
     private UpdateResult _updateResult = null!;
+    private bool _completedBeforeCompetingCommit;
+    private bool _completedAfterCompetingCommit;
 
     protected override ServiceProvider CreateServiceProvider() =>
-        GuardedNoOpIntegrationTestSupport.CreateStaleCompareServiceProvider();
+        GuardedNoOpIntegrationTestSupport.CreateCompetingBumpServiceProvider();
 
     protected override async Task SetUpTestAsync()
     {
@@ -1644,7 +1276,7 @@ internal class Given_A_Postgresql_Relational_Stale_Guarded_No_Op_Put_With_A_Focu
             SchoolDocumentUuid.Value
         );
 
-        _updateResult = await ExecuteUpdateAsync();
+        _updateResult = await ExecuteContendedUpdateAsync(_stateBeforeUpdate.Document.DocumentId);
         _stateAfterUpdate = await GuardedNoOpIntegrationTestSupport.ReadPersistedStateAsync(
             _database,
             SchoolDocumentUuid.Value
@@ -1652,28 +1284,23 @@ internal class Given_A_Postgresql_Relational_Stale_Guarded_No_Op_Put_With_A_Focu
     }
 
     [Test]
-    public void It_retries_and_returns_update_success_after_the_no_op_compare_goes_stale()
-    {
-        _updateResult.Should().BeOfType<UpdateResult.UpdateSuccess>();
-        _updateResult.As<UpdateResult.UpdateSuccess>().ExistingDocumentUuid.Should().Be(SchoolDocumentUuid);
-    }
+    public void It_blocks_the_capture_until_the_competing_transaction_commits() =>
+        NoProfileGuardedNoOpScenarios.AssertCaptureBlockedUntilCompetingCommit(
+            _completedBeforeCompetingCommit,
+            _completedAfterCompetingCommit
+        );
 
     [Test]
-    public void It_preserves_the_rowsets_but_keeps_the_concurrent_content_version_bump()
+    public void It_returns_update_success_and_keeps_the_competing_content_version_bump()
     {
-        var adjustedAfterState = _stateAfterUpdate with
-        {
-            Document = _stateAfterUpdate.Document with
-            {
-                ContentVersion = _stateBeforeUpdate.Document.ContentVersion,
-            },
-        };
-
-        adjustedAfterState.Should().BeEquivalentTo(_stateBeforeUpdate);
-        _stateAfterUpdate.Document.ContentVersion.Should().Be(_stateBeforeUpdate.Document.ContentVersion + 1);
-        _stateAfterUpdate
-            .Document.ResourceKeyId.Should()
-            .Be(_mappingSet.ResourceKeyIdByResource[GuardedNoOpIntegrationTestSupport.SchoolResource]);
+        NoProfileGuardedNoOpScenarios.AssertPutNoOpOutcome(_updateResult, SchoolDocumentUuid);
+        NoProfileGuardedNoOpScenarios.AssertRowsetUnchangedExceptOneContentVersionBump(
+            GuardedNoOpIntegrationTestSupport.ToNeutral(_stateBeforeUpdate),
+            GuardedNoOpIntegrationTestSupport.ToNeutral(_stateAfterUpdate),
+            _mappingSet,
+            GuardedNoOpIntegrationTestSupport.SchoolResource,
+            NoProfileGuardedNoOpScenarios.ConcurrentBumpContentLastModifiedAt
+        );
     }
 
     private async Task ExecuteCreateAsync()
@@ -1686,7 +1313,7 @@ internal class Given_A_Postgresql_Relational_Stale_Guarded_No_Op_Put_With_A_Focu
                 new DataStore(
                     Id: 1,
                     DataStoreType: "test",
-                    Name: "PostgresqlRelationalWriteStaleGuardedNoOpPut",
+                    Name: "PostgresqlRelationalWriteGuardedNoOpCompetingBumpPut",
                     ConnectionString: _database.ConnectionString,
                     RouteContext: []
                 )
@@ -1697,16 +1324,16 @@ internal class Given_A_Postgresql_Relational_Stale_Guarded_No_Op_Put_With_A_Focu
             GuardedNoOpIntegrationTestSupport.CreateCreateRequest(
                 _mappingSet,
                 SchoolDocumentUuid,
-                "pg-stale-guarded-no-op-put-create"
+                "pg-guarded-no-op-competing-bump-put-create"
             )
         );
 
         createResult.Should().BeOfType<UpsertResult.InsertSuccess>();
     }
 
-    private async Task<UpdateResult> ExecuteUpdateAsync()
+    private async Task<UpdateResult> ExecuteContendedUpdateAsync(long documentId)
     {
-        using var scope = _serviceProvider.CreateScope();
+        await using var scope = _serviceProvider.CreateAsyncScope();
 
         scope
             .ServiceProvider.GetRequiredService<IDataStoreSelection>()
@@ -1714,28 +1341,47 @@ internal class Given_A_Postgresql_Relational_Stale_Guarded_No_Op_Put_With_A_Focu
                 new DataStore(
                     Id: 1,
                     DataStoreType: "test",
-                    Name: "PostgresqlRelationalWriteStaleGuardedNoOpPut",
+                    Name: "PostgresqlRelationalWriteGuardedNoOpCompetingBumpPut",
                     ConnectionString: _database.ConnectionString,
                     RouteContext: []
                 )
             );
 
         var repository = scope.ServiceProvider.GetRequiredService<RelationalDocumentStoreRepository>();
+        var coordinator = scope.ServiceProvider.GetRequiredService<GuardedNoOpCompetingBumpCoordinator>();
 
-        return await repository.UpdateDocumentById(
+        await coordinator.BeginUncommittedContentVersionBumpAsync(documentId);
+
+        var updateTask = repository.UpdateDocumentById(
             GuardedNoOpIntegrationTestSupport.CreateUpdateRequest(
                 _mappingSet,
                 SchoolDocumentUuid,
-                "pg-stale-guarded-no-op-put-update"
+                "pg-guarded-no-op-competing-bump-put-update"
             )
         );
+
+        await coordinator.WaitUntilBlockingAnotherBackendAsync(
+            GuardedNoOpIntegrationTestSupport.CompetingBumpBlockObservationTimeout
+        );
+
+        _completedBeforeCompetingCommit = updateTask.IsCompleted;
+
+        await coordinator.CommitAsync();
+
+        var updateResult = await updateTask.WaitAsync(
+            GuardedNoOpIntegrationTestSupport.CompetingBumpCompletionTimeout
+        );
+
+        _completedAfterCompetingCommit = true;
+
+        return updateResult;
     }
 }
 
 [TestFixture]
 [Category("DatabaseIntegration")]
 [Category("PostgresqlIntegration")]
-internal class Given_A_Postgresql_Relational_Stale_Guarded_No_Op_Post_As_Update_With_A_Focused_Stable_Key_Fixture
+internal class Given_A_Postgresql_Relational_Guarded_No_Op_Post_As_Update_With_A_Competing_Uncommitted_Content_Version_Bump
     : GuardedNoOpGeneratedDdlFixtureTestBase
 {
     private static readonly DocumentUuid ExistingSchoolDocumentUuid = new(
@@ -1749,9 +1395,11 @@ internal class Given_A_Postgresql_Relational_Stale_Guarded_No_Op_Post_As_Update_
     private GuardedNoOpPersistedState _stateAfterPostAsUpdate = null!;
     private UpsertResult _postAsUpdateResult = null!;
     private long _incomingDocumentUuidCount;
+    private bool _completedBeforeCompetingCommit;
+    private bool _completedAfterCompetingCommit;
 
     protected override ServiceProvider CreateServiceProvider() =>
-        GuardedNoOpIntegrationTestSupport.CreateStaleCompareServiceProvider();
+        GuardedNoOpIntegrationTestSupport.CreateCompetingBumpServiceProvider();
 
     protected override async Task SetUpTestAsync()
     {
@@ -1768,278 +1416,7 @@ internal class Given_A_Postgresql_Relational_Stale_Guarded_No_Op_Post_As_Update_
                 _mappingSet.ResourceKeyIdByResource[GuardedNoOpIntegrationTestSupport.SchoolResource]
             );
 
-        _postAsUpdateResult = await ExecutePostAsUpdateAsync(
-            new ReferentialId(persistedReferentialIdentity.ReferentialId)
-        );
-
-        _stateAfterPostAsUpdate = await GuardedNoOpIntegrationTestSupport.ReadPersistedStateAsync(
-            _database,
-            ExistingSchoolDocumentUuid.Value
-        );
-        _incomingDocumentUuidCount = await GuardedNoOpIntegrationTestSupport.ReadDocumentCountAsync(
-            _database,
-            IncomingSchoolDocumentUuid.Value
-        );
-    }
-
-    [Test]
-    public void It_retries_and_returns_update_success_for_a_stale_post_as_update_no_op_compare()
-    {
-        _postAsUpdateResult.Should().BeOfType<UpsertResult.UpdateSuccess>();
-        _postAsUpdateResult
-            .As<UpsertResult.UpdateSuccess>()
-            .ExistingDocumentUuid.Should()
-            .Be(ExistingSchoolDocumentUuid);
-        _incomingDocumentUuidCount.Should().Be(0);
-    }
-
-    [Test]
-    public void It_preserves_the_existing_rowsets_but_keeps_the_concurrent_content_version_bump()
-    {
-        var adjustedAfterState = _stateAfterPostAsUpdate with
-        {
-            Document = _stateAfterPostAsUpdate.Document with
-            {
-                ContentVersion = _stateBeforePostAsUpdate.Document.ContentVersion,
-            },
-        };
-
-        adjustedAfterState.Should().BeEquivalentTo(_stateBeforePostAsUpdate);
-        _stateAfterPostAsUpdate
-            .Document.ContentVersion.Should()
-            .Be(_stateBeforePostAsUpdate.Document.ContentVersion + 1);
-        _stateAfterPostAsUpdate
-            .Document.ResourceKeyId.Should()
-            .Be(_mappingSet.ResourceKeyIdByResource[GuardedNoOpIntegrationTestSupport.SchoolResource]);
-    }
-
-    private async Task ExecuteCreateAsync()
-    {
-        await using var scope = _serviceProvider.CreateAsyncScope();
-
-        scope
-            .ServiceProvider.GetRequiredService<IDataStoreSelection>()
-            .SetSelectedDataStore(
-                new DataStore(
-                    Id: 1,
-                    DataStoreType: "test",
-                    Name: "PostgresqlRelationalWriteStaleGuardedNoOpPostAsUpdate",
-                    ConnectionString: _database.ConnectionString,
-                    RouteContext: []
-                )
-            );
-
-        var repository = scope.ServiceProvider.GetRequiredService<RelationalDocumentStoreRepository>();
-        var createResult = await repository.UpsertDocument(
-            GuardedNoOpIntegrationTestSupport.CreateCreateRequest(
-                _mappingSet,
-                ExistingSchoolDocumentUuid,
-                "pg-stale-guarded-no-op-post-as-update-create"
-            )
-        );
-
-        createResult.Should().BeOfType<UpsertResult.InsertSuccess>();
-    }
-
-    private async Task<UpsertResult> ExecutePostAsUpdateAsync(ReferentialId referentialId)
-    {
-        using var scope = _serviceProvider.CreateScope();
-
-        scope
-            .ServiceProvider.GetRequiredService<IDataStoreSelection>()
-            .SetSelectedDataStore(
-                new DataStore(
-                    Id: 1,
-                    DataStoreType: "test",
-                    Name: "PostgresqlRelationalWriteStaleGuardedNoOpPostAsUpdate",
-                    ConnectionString: _database.ConnectionString,
-                    RouteContext: []
-                )
-            );
-
-        var repository = scope.ServiceProvider.GetRequiredService<RelationalDocumentStoreRepository>();
-
-        return await repository.UpsertDocument(
-            GuardedNoOpIntegrationTestSupport.CreatePostAsUpdateRequest(
-                _mappingSet,
-                IncomingSchoolDocumentUuid,
-                "pg-stale-guarded-no-op-post-as-update",
-                referentialId
-            )
-        );
-    }
-}
-
-[TestFixture]
-[Category("DatabaseIntegration")]
-[Category("PostgresqlIntegration")]
-internal class Given_A_Postgresql_Relational_Guarded_No_Op_Put_With_A_Commit_Window_Race
-    : GuardedNoOpGeneratedDdlFixtureTestBase
-{
-    private static readonly DocumentUuid SchoolDocumentUuid = new(
-        Guid.Parse("dddddddd-0000-0000-0000-000000000007")
-    );
-
-    private GuardedNoOpCommitWindowProbe _freshnessProbe = null!;
-    private GuardedNoOpPersistedState _stateBeforeUpdate = null!;
-    private GuardedNoOpPersistedState _stateAfterUpdate = null!;
-    private UpdateResult _updateResult = null!;
-
-    protected override ServiceProvider CreateServiceProvider() =>
-        GuardedNoOpIntegrationTestSupport.CreateCommitWindowServiceProvider();
-
-    protected override async Task SetUpTestAsync()
-    {
-        _freshnessProbe = _serviceProvider.GetRequiredService<GuardedNoOpCommitWindowProbe>();
-
-        await ExecuteCreateAsync();
-        _stateBeforeUpdate = await GuardedNoOpIntegrationTestSupport.ReadPersistedStateAsync(
-            _database,
-            SchoolDocumentUuid.Value
-        );
-
-        _updateResult = await ExecuteUpdateAsync(_stateBeforeUpdate.Document.DocumentId);
-        _stateAfterUpdate = await GuardedNoOpIntegrationTestSupport.ReadPersistedStateAsync(
-            _database,
-            SchoolDocumentUuid.Value
-        );
-    }
-
-    [Test]
-    public void It_retries_the_no_op_after_the_commit_window_race_and_returns_update_success()
-    {
-        _updateResult.Should().BeOfType<UpdateResult.UpdateSuccess>();
-        _updateResult.As<UpdateResult.UpdateSuccess>().ExistingDocumentUuid.Should().Be(SchoolDocumentUuid);
-        _freshnessProbe.IsCurrentCallCount.Should().Be(2);
-        _freshnessProbe.Results.Should().Equal(false, true);
-    }
-
-    [Test]
-    public void It_preserves_rowsets_but_keeps_the_concurrent_content_version_bump()
-    {
-        var adjustedAfterState = _stateAfterUpdate with
-        {
-            Document = _stateAfterUpdate.Document with
-            {
-                ContentVersion = _stateBeforeUpdate.Document.ContentVersion,
-            },
-        };
-
-        adjustedAfterState.Should().BeEquivalentTo(_stateBeforeUpdate);
-        _stateAfterUpdate.Document.ContentVersion.Should().Be(_stateBeforeUpdate.Document.ContentVersion + 1);
-        _stateAfterUpdate
-            .Document.ResourceKeyId.Should()
-            .Be(_mappingSet.ResourceKeyIdByResource[GuardedNoOpIntegrationTestSupport.SchoolResource]);
-    }
-
-    private async Task ExecuteCreateAsync()
-    {
-        await using var scope = _serviceProvider.CreateAsyncScope();
-
-        scope
-            .ServiceProvider.GetRequiredService<IDataStoreSelection>()
-            .SetSelectedDataStore(
-                new DataStore(
-                    Id: 1,
-                    DataStoreType: "test",
-                    Name: "PostgresqlRelationalWriteGuardedNoOpCommitWindowPut",
-                    ConnectionString: _database.ConnectionString,
-                    RouteContext: []
-                )
-            );
-
-        var repository = scope.ServiceProvider.GetRequiredService<RelationalDocumentStoreRepository>();
-        var createResult = await repository.UpsertDocument(
-            GuardedNoOpIntegrationTestSupport.CreateCreateRequest(
-                _mappingSet,
-                SchoolDocumentUuid,
-                "pg-guarded-no-op-commit-window-put-create"
-            )
-        );
-
-        createResult.Should().BeOfType<UpsertResult.InsertSuccess>();
-    }
-
-    private async Task<UpdateResult> ExecuteUpdateAsync(long documentId)
-    {
-        await using var scope = _serviceProvider.CreateAsyncScope();
-
-        scope
-            .ServiceProvider.GetRequiredService<IDataStoreSelection>()
-            .SetSelectedDataStore(
-                new DataStore(
-                    Id: 1,
-                    DataStoreType: "test",
-                    Name: "PostgresqlRelationalWriteGuardedNoOpCommitWindowPut",
-                    ConnectionString: _database.ConnectionString,
-                    RouteContext: []
-                )
-            );
-
-        var repository = scope.ServiceProvider.GetRequiredService<RelationalDocumentStoreRepository>();
-        var coordinator = scope.ServiceProvider.GetRequiredService<GuardedNoOpCommitWindowCoordinator>();
-        var pendingCommitTask = coordinator.BeginPendingContentVersionBumpAsync(documentId);
-
-        await coordinator.WaitUntilWriteIsPendingAsync();
-
-        try
-        {
-            return await repository.UpdateDocumentById(
-                GuardedNoOpIntegrationTestSupport.CreateUpdateRequest(
-                    _mappingSet,
-                    SchoolDocumentUuid,
-                    "pg-guarded-no-op-commit-window-put-update"
-                )
-            );
-        }
-        finally
-        {
-            coordinator.ReleaseCommit();
-            await pendingCommitTask;
-        }
-    }
-}
-
-[TestFixture]
-[Category("DatabaseIntegration")]
-[Category("PostgresqlIntegration")]
-internal class Given_A_Postgresql_Relational_Guarded_No_Op_Post_As_Update_With_A_Commit_Window_Race
-    : GuardedNoOpGeneratedDdlFixtureTestBase
-{
-    private static readonly DocumentUuid ExistingSchoolDocumentUuid = new(
-        Guid.Parse("dddddddd-0000-0000-0000-000000000008")
-    );
-    private static readonly DocumentUuid IncomingSchoolDocumentUuid = new(
-        Guid.Parse("dddddddd-0000-0000-0000-000000000009")
-    );
-
-    private GuardedNoOpCommitWindowProbe _freshnessProbe = null!;
-    private GuardedNoOpPersistedState _stateBeforePostAsUpdate = null!;
-    private GuardedNoOpPersistedState _stateAfterPostAsUpdate = null!;
-    private UpsertResult _postAsUpdateResult = null!;
-    private long _incomingDocumentUuidCount;
-
-    protected override ServiceProvider CreateServiceProvider() =>
-        GuardedNoOpIntegrationTestSupport.CreateCommitWindowServiceProvider();
-
-    protected override async Task SetUpTestAsync()
-    {
-        _freshnessProbe = _serviceProvider.GetRequiredService<GuardedNoOpCommitWindowProbe>();
-
-        await ExecuteCreateAsync();
-        _stateBeforePostAsUpdate = await GuardedNoOpIntegrationTestSupport.ReadPersistedStateAsync(
-            _database,
-            ExistingSchoolDocumentUuid.Value
-        );
-
-        var persistedReferentialIdentity =
-            await GuardedNoOpIntegrationTestSupport.ReadReferentialIdentityRowAsync(
-                _database,
-                _stateBeforePostAsUpdate.Document.DocumentId,
-                _mappingSet.ResourceKeyIdByResource[GuardedNoOpIntegrationTestSupport.SchoolResource]
-            );
-
-        _postAsUpdateResult = await ExecutePostAsUpdateAsync(
+        _postAsUpdateResult = await ExecuteContendedPostAsUpdateAsync(
             _stateBeforePostAsUpdate.Document.DocumentId,
             new ReferentialId(persistedReferentialIdentity.ReferentialId)
         );
@@ -2055,36 +1432,27 @@ internal class Given_A_Postgresql_Relational_Guarded_No_Op_Post_As_Update_With_A
     }
 
     [Test]
-    public void It_retries_the_no_op_after_the_commit_window_race_and_preserves_the_existing_document()
-    {
-        _postAsUpdateResult.Should().BeOfType<UpsertResult.UpdateSuccess>();
-        _postAsUpdateResult
-            .As<UpsertResult.UpdateSuccess>()
-            .ExistingDocumentUuid.Should()
-            .Be(ExistingSchoolDocumentUuid);
-        _incomingDocumentUuidCount.Should().Be(0);
-        _freshnessProbe.IsCurrentCallCount.Should().Be(2);
-        _freshnessProbe.Results.Should().Equal(false, true);
-    }
+    public void It_blocks_the_capture_until_the_competing_transaction_commits() =>
+        NoProfileGuardedNoOpScenarios.AssertCaptureBlockedUntilCompetingCommit(
+            _completedBeforeCompetingCommit,
+            _completedAfterCompetingCommit
+        );
 
     [Test]
-    public void It_preserves_existing_rowsets_but_keeps_the_concurrent_content_version_bump()
+    public void It_returns_update_success_and_preserves_the_existing_document_with_the_competing_content_version_bump()
     {
-        var adjustedAfterState = _stateAfterPostAsUpdate with
-        {
-            Document = _stateAfterPostAsUpdate.Document with
-            {
-                ContentVersion = _stateBeforePostAsUpdate.Document.ContentVersion,
-            },
-        };
-
-        adjustedAfterState.Should().BeEquivalentTo(_stateBeforePostAsUpdate);
-        _stateAfterPostAsUpdate
-            .Document.ContentVersion.Should()
-            .Be(_stateBeforePostAsUpdate.Document.ContentVersion + 1);
-        _stateAfterPostAsUpdate
-            .Document.ResourceKeyId.Should()
-            .Be(_mappingSet.ResourceKeyIdByResource[GuardedNoOpIntegrationTestSupport.SchoolResource]);
+        NoProfileGuardedNoOpScenarios.AssertPostAsUpdateNoOpOutcome(
+            _postAsUpdateResult,
+            ExistingSchoolDocumentUuid,
+            _incomingDocumentUuidCount
+        );
+        NoProfileGuardedNoOpScenarios.AssertRowsetUnchangedExceptOneContentVersionBump(
+            GuardedNoOpIntegrationTestSupport.ToNeutral(_stateBeforePostAsUpdate),
+            GuardedNoOpIntegrationTestSupport.ToNeutral(_stateAfterPostAsUpdate),
+            _mappingSet,
+            GuardedNoOpIntegrationTestSupport.SchoolResource,
+            NoProfileGuardedNoOpScenarios.ConcurrentBumpContentLastModifiedAt
+        );
     }
 
     private async Task ExecuteCreateAsync()
@@ -2097,7 +1465,7 @@ internal class Given_A_Postgresql_Relational_Guarded_No_Op_Post_As_Update_With_A
                 new DataStore(
                     Id: 1,
                     DataStoreType: "test",
-                    Name: "PostgresqlRelationalWriteGuardedNoOpCommitWindowPostAsUpdate",
+                    Name: "PostgresqlRelationalWriteGuardedNoOpCompetingBumpPostAsUpdate",
                     ConnectionString: _database.ConnectionString,
                     RouteContext: []
                 )
@@ -2108,14 +1476,17 @@ internal class Given_A_Postgresql_Relational_Guarded_No_Op_Post_As_Update_With_A
             GuardedNoOpIntegrationTestSupport.CreateCreateRequest(
                 _mappingSet,
                 ExistingSchoolDocumentUuid,
-                "pg-guarded-no-op-commit-window-post-as-update-create"
+                "pg-guarded-no-op-competing-bump-post-as-update-create"
             )
         );
 
         createResult.Should().BeOfType<UpsertResult.InsertSuccess>();
     }
 
-    private async Task<UpsertResult> ExecutePostAsUpdateAsync(long documentId, ReferentialId referentialId)
+    private async Task<UpsertResult> ExecuteContendedPostAsUpdateAsync(
+        long documentId,
+        ReferentialId referentialId
+    )
     {
         await using var scope = _serviceProvider.CreateAsyncScope();
 
@@ -2125,33 +1496,40 @@ internal class Given_A_Postgresql_Relational_Guarded_No_Op_Post_As_Update_With_A
                 new DataStore(
                     Id: 1,
                     DataStoreType: "test",
-                    Name: "PostgresqlRelationalWriteGuardedNoOpCommitWindowPostAsUpdate",
+                    Name: "PostgresqlRelationalWriteGuardedNoOpCompetingBumpPostAsUpdate",
                     ConnectionString: _database.ConnectionString,
                     RouteContext: []
                 )
             );
 
         var repository = scope.ServiceProvider.GetRequiredService<RelationalDocumentStoreRepository>();
-        var coordinator = scope.ServiceProvider.GetRequiredService<GuardedNoOpCommitWindowCoordinator>();
-        var pendingCommitTask = coordinator.BeginPendingContentVersionBumpAsync(documentId);
+        var coordinator = scope.ServiceProvider.GetRequiredService<GuardedNoOpCompetingBumpCoordinator>();
 
-        await coordinator.WaitUntilWriteIsPendingAsync();
+        await coordinator.BeginUncommittedContentVersionBumpAsync(documentId);
 
-        try
-        {
-            return await repository.UpsertDocument(
-                GuardedNoOpIntegrationTestSupport.CreatePostAsUpdateRequest(
-                    _mappingSet,
-                    IncomingSchoolDocumentUuid,
-                    "pg-guarded-no-op-commit-window-post-as-update",
-                    referentialId
-                )
-            );
-        }
-        finally
-        {
-            coordinator.ReleaseCommit();
-            await pendingCommitTask;
-        }
+        var postAsUpdateTask = repository.UpsertDocument(
+            GuardedNoOpIntegrationTestSupport.CreatePostAsUpdateRequest(
+                _mappingSet,
+                IncomingSchoolDocumentUuid,
+                "pg-guarded-no-op-competing-bump-post-as-update",
+                referentialId
+            )
+        );
+
+        await coordinator.WaitUntilBlockingAnotherBackendAsync(
+            GuardedNoOpIntegrationTestSupport.CompetingBumpBlockObservationTimeout
+        );
+
+        _completedBeforeCompetingCommit = postAsUpdateTask.IsCompleted;
+
+        await coordinator.CommitAsync();
+
+        var postAsUpdateResult = await postAsUpdateTask.WaitAsync(
+            GuardedNoOpIntegrationTestSupport.CompetingBumpCompletionTimeout
+        );
+
+        _completedAfterCompetingCommit = true;
+
+        return postAsUpdateResult;
     }
 }

@@ -4,11 +4,13 @@
 // See the LICENSE and NOTICES files in the project root for more information.
 
 using EdFi.DataManagementService.Backend;
+using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Backend.Tests.Common;
 using EdFi.DataManagementService.Core.External.Backend;
 using EdFi.DataManagementService.Core.External.Model;
 using EdFi.DataManagementService.Core.External.Security;
 using FluentAssertions;
+using Npgsql;
 using NUnit.Framework;
 
 namespace EdFi.DataManagementService.Backend.Postgresql.Tests.Integration;
@@ -45,11 +47,28 @@ public class Given_A_Postgresql_Relational_Get_By_Id_Authorization_With_A_Synthe
         AuthorizationStrategyNameConstants.RelationshipsWithEdOrgsOnly,
         AuthorizationStrategyNameConstants.NoFurtherAuthorizationRequired,
     ];
-    private static readonly IReadOnlyList<string> _normalPlusKnownUnsupportedStrategy =
+
+    /// <summary>
+    /// OwnershipBased is enforced for GET-by-id and withheld everywhere else, so this composition plans
+    /// rather than returning the known-but-not-enabled 501 that the write and query routes still return.
+    /// </summary>
+    private static readonly IReadOnlyList<string> _normalPlusOwnershipStrategy =
     [
         AuthorizationStrategyNameConstants.RelationshipsWithEdOrgsOnly,
         AuthorizationStrategyNameConstants.OwnershipBased,
     ];
+
+    /// <summary>
+    /// A custom view over School authorizing School 100 only. School 200 is reachable through the claim's
+    /// edorg edges, so a denial on 200 can only come from the view's membership query.
+    /// </summary>
+    private const string CustomViewStrategyName = "SchoolWithGetByIdProviderTest";
+    private static readonly IReadOnlyList<string> _customViewStrategy = [CustomViewStrategyName];
+
+    /// <summary>
+    /// A configured strategy whose <c>auth</c> object the masquerade test creates as a table rather than a view.
+    /// </summary>
+    private const string TableInsteadOfCustomViewStrategyName = "SchoolWithGetByIdTableProviderTest";
 
     private static readonly QuerySchoolSeed[] _schoolSeeds =
     [
@@ -279,6 +298,7 @@ public class Given_A_Postgresql_Relational_Get_By_Id_Authorization_With_A_Synthe
 
         await _context.InsertAuthEdgeAsync(ClaimEducationOrganizationId, 100);
         await _context.InsertAuthEdgeAsync(ClaimEducationOrganizationId, 200);
+        await _context.CreateSchoolCustomAuthViewAsync(CustomViewStrategyName, [100]);
         await _context.InsertAuthEdgeAsync(300, ClaimEducationOrganizationId);
         await _context.DeleteAuthEdgeAsync(ClaimEducationOrganizationId, ClaimEducationOrganizationId);
     }
@@ -288,6 +308,7 @@ public class Given_A_Postgresql_Relational_Get_By_Id_Authorization_With_A_Synthe
     {
         if (_context is not null)
         {
+            await _context.DropCustomAuthViewAsync(CustomViewStrategyName);
             await _context.DisposeAsync();
         }
     }
@@ -296,6 +317,78 @@ public class Given_A_Postgresql_Relational_Get_By_Id_Authorization_With_A_Synthe
     public void SetUp()
     {
         _context.ResetRecorder();
+    }
+
+    [Test]
+    public async Task Given_A_Custom_View_Strategy_It_Authorizes_A_School_The_View_Includes()
+    {
+        var result = await _context.GetByIdAsync(
+            "ed-fi",
+            "School",
+            _schoolSeeds[0].DocumentUuid,
+            [ClaimEducationOrganizationId],
+            _customViewStrategy
+        );
+
+        result.Should().BeOfType<GetResult.GetSuccess>();
+    }
+
+    [Test]
+    public async Task Given_A_Custom_View_Strategy_It_Denies_A_School_The_View_Excludes()
+    {
+        var result = await _context.GetByIdAsync(
+            "ed-fi",
+            "School",
+            _schoolSeeds[1].DocumentUuid,
+            [ClaimEducationOrganizationId],
+            _customViewStrategy
+        );
+
+        var failure = result
+            .Should()
+            .BeOfType<GetResult.GetFailureCustomViewNotAuthorized>()
+            .Subject.CustomViewFailure;
+        failure.StrategyName.Should().Be(CustomViewStrategyName);
+    }
+
+    [Test]
+    public async Task Given_A_Custom_Authorization_Object_That_Is_A_Table_It_Throws_On_Get_By_Id()
+    {
+        // A table whose DocumentId is type-compatible answers the membership query without raising anything, so
+        // the request would authorize or deny against an object auth.md does not accept. The run has to prove the
+        // object is a view first, and surface the documented urn:ed-fi:api:system 500 instead.
+        await _context.Database.ExecuteNonQueryAsync(
+            $"""
+            CREATE TABLE "auth"."{TableInsteadOfCustomViewStrategyName}" (
+                "DocumentId" bigint NOT NULL
+            );
+            """
+        );
+
+        try
+        {
+            Func<Task> act = () =>
+                _context.GetByIdAsync(
+                    "ed-fi",
+                    "School",
+                    _schoolSeeds[0].DocumentUuid,
+                    [ClaimEducationOrganizationId],
+                    [TableInsteadOfCustomViewStrategyName]
+                );
+
+            var assertion = await act.Should().ThrowAsync<CustomViewAuthorizationValidationException>();
+            assertion
+                .Which.InnerException.Should()
+                .BeOfType<PostgresException>()
+                .Subject.Message.Should()
+                .Contain("Invalid custom authorization view DocumentId contract.");
+        }
+        finally
+        {
+            await _context.Database.ExecuteNonQueryAsync(
+                $"""DROP TABLE IF EXISTS "auth"."{TableInsteadOfCustomViewStrategyName}";"""
+            );
+        }
     }
 
     [Test]
@@ -438,16 +531,22 @@ public class Given_A_Postgresql_Relational_Get_By_Id_Authorization_With_A_Synthe
         _context.AssertNoHydration();
     }
 
+    /// <summary>
+    /// OwnershipBased composed with a supported relationship strategy. It is an AND filter running before the
+    /// relationship OR group, so it decides first: these rows were seeded without an ownership token, which
+    /// is auth.md 2.14 and stops the read before hydration even though the relationship claim would have
+    /// authorized it.
+    /// </summary>
     [Test]
-    public async Task It_returns_501_for_known_but_not_enabled_mixed_strategies()
+    public async Task It_denies_an_unstamped_row_for_ownership_composed_with_a_relationship_strategy()
     {
-        var result = await GetRootChildAsync(
-            _authorizationRootChildSeeds[0],
-            _normalPlusKnownUnsupportedStrategy
-        );
+        var result = await GetRootChildAsync(_authorizationRootChildSeeds[0], _normalPlusOwnershipStrategy);
 
-        var failure = result.Should().BeOfType<GetResult.GetFailureNotImplemented>().Subject;
-        failure.FailureMessage.Should().Contain(AuthorizationStrategyNameConstants.OwnershipBased);
+        result
+            .Should()
+            .BeOfType<GetResult.GetFailureOwnershipNotAuthorized>()
+            .Which.OwnershipFailure.FailureKind.Should()
+            .Be(OwnershipAuthorizationFailureKind.StoredOwnershipTokenUninitialized);
         _context.AssertNoHydration();
     }
 
@@ -459,7 +558,7 @@ public class Given_A_Postgresql_Relational_Get_By_Id_Authorization_With_A_Synthe
             RelationshipAuthorizationCrudTestSupport.ChildOnlyEdOrgResourceName,
             _authorizationChildOnlySeed.DocumentUuid,
             [ClaimEducationOrganizationId],
-            _normalPlusKnownUnsupportedStrategy
+            _normalPlusOwnershipStrategy
         );
 
         var failure = result.Should().BeOfType<GetResult.GetFailureSecurityConfiguration>().Subject;
@@ -955,6 +1054,64 @@ public class Given_A_Postgresql_PeopleRelationship_Crud_Authorization_Matrix
             RelationshipAuthorizationCrudTestSupport.RelationshipsWithStudentsOnlyThroughResponsibility,
             "Student",
             "auth.EducationOrganizationIdToStudentDocumentIdThroughResponsibility"
+        );
+    }
+
+    [Test]
+    public async Task It_authorizes_student_self_path_when_the_auth_view_yields_duplicate_pairs()
+    {
+        // DMS-1329: without SELECT DISTINCT the student auth view yields one row per closure path.
+        // Enroll the authorized student at a second school reachable from the same claim so the
+        // (claim EdOrg, student) pair genuinely occurs twice, then prove the single-record EXISTS
+        // check still authorizes and the unauthorized student is still denied.
+        RelationalQueryAuthorizationAssertions.AssertInsertSuccess(
+            await _context.CreateSchoolAsync(
+                new QuerySchoolSeed(
+                    new DocumentUuid(Guid.Parse("99999999-1000-0000-0000-000000001001")),
+                    200,
+                    "East School"
+                )
+            )
+        );
+        await _context.SeedStudentSchoolAssociationAsync(
+            new StudentSchoolAssociationSeed(
+                new DocumentUuid(Guid.Parse("99999999-1000-0000-0000-000000001002")),
+                _authorizedStudentSeed.StudentUniqueId,
+                200,
+                _schoolYearSeed.SchoolYear,
+                EntryGradeLevelDescriptor,
+                new DateOnly(2026, 8, 15)
+            )
+        );
+        await _context.InsertAuthEdgeAsync(ClaimEducationOrganizationId, 200);
+
+        // Non-vacuity precondition: the duplicate pair actually exists in the view.
+        await _context.AssertPeopleAuthViewPairCountAsync(
+            AuthPeopleViewKind.Student,
+            _authorizedStudentSeed.StudentUniqueId,
+            ClaimEducationOrganizationId,
+            expectedPairCount: 2
+        );
+
+        var authorizedResult = await GetEdFiAsync(
+            "Student",
+            _authorizedStudentSeed.DocumentUuid,
+            RelationshipAuthorizationCrudTestSupport.StudentsOnlyStrategyNames
+        );
+        var unauthorizedResult = await GetEdFiAsync(
+            "Student",
+            _unauthorizedStudentSeed.DocumentUuid,
+            RelationshipAuthorizationCrudTestSupport.StudentsOnlyStrategyNames
+        );
+
+        AssertSuccess(authorizedResult, _authorizedStudentSeed.DocumentUuid);
+        AssertPeopleRelationshipDenied(
+            unauthorizedResult,
+            RelationshipAuthorizationFailureValueSource.Stored,
+            RelationshipAuthorizationSubjectFailureKind.NoRelationship,
+            RelationshipAuthorizationCrudTestSupport.RelationshipsWithStudentsOnly,
+            "Student",
+            "auth.EducationOrganizationIdToStudentDocumentId"
         );
     }
 

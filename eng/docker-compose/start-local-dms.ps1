@@ -102,6 +102,21 @@ param (
     [Switch]
     $EnableKafka,
 
+    # Initial CDC preparation includes provider prerequisites without Kafka artifacts.
+    [switch]
+    $CdcDatabaseInfrastructure,
+
+    # Retained CDC phase seam: start broker/UI only; controller owns the later worker launch.
+    [switch]
+    $CdcKafkaInfrastructure,
+
+    [switch]$SuppressWriterGuidance,
+    [string]$CdcDmsComposeFile,
+
+    [string]$CdcBindingStatePath,
+    [string]$CdcSettingsPath,
+    [string]$CdcBrokerSizeOverrideFile,
+
     # Enable Kafka UI. This also enables Kafka infrastructure.
     [Switch]
     $EnableKafkaUI,
@@ -177,7 +192,28 @@ param (
     # Resolve-DatabaseEngineEnvironmentFile.
     [ValidateSet("postgresql", "mssql")]
     [string]
-    $DatabaseEngine = "postgresql"
+    $DatabaseEngine = "postgresql",
+
+    # Redirects the CMS (Configuration Service) database to a dedicated edfi_configurationservice
+    # database instead of sharing the DMS datastore database. Applies only when CMS actually
+    # participates (the default/-InfraOnly shape); has no effect with -DmsOnly/-DbOnly/-d, where
+    # CMS does not start. Supported on both database engines.
+    [Switch]
+    $SeparateConfigDatabase,
+
+    # Set by bootstrap-wrapper.psm1 on its own infrastructure invocation, where THIS script is a step
+    # inside a wrapper-owned workflow rather than the operator's entry point. It suppresses only the
+    # "run a fresh bootstrap-local-dms.ps1" hint in the -InfraOnly guidance below.
+    #
+    # That hint has to reconstruct the input a FRESH wrapper run would compose from, and inside a
+    # wrapper-owned run this script cannot: the wrapper hands it an already-derived -EnvironmentFile
+    # and deliberately does not forward its own -DataStandardVersion (forwarding it would recompose the
+    # shared data-standard overlay over the wrapper's bootstrap-scoped one). Emitting the hint anyway
+    # would advertise a derived path as a base file, and omit a data standard the operator selected.
+    # The wrapper owns that hint instead and prints it from its own caller-supplied state. Direct
+    # invocation never passes this and its guidance is unchanged.
+    [Switch]
+    $SuppressWrapperContinuationGuidance
 )
 
 # Early fail-fast parameter validation — runs before any module import or Docker activity.
@@ -197,6 +233,15 @@ if ($DbOnly -and $r) {
     throw "Parameter -r/-Rebuild is not valid with -DbOnly. Database-only mode starts and waits for the database without building application images."
 }
 
+Import-Module (Join-Path $PSScriptRoot 'cdc-lifecycle.psm1')
+if (-not (Test-CdcInfrastructureInvocation)) {
+    if (Test-CdcDeployment -Project 'dms-local') {
+        Invoke-CdcDeploymentLifecycle -Project 'dms-local' -StartScript $PSCommandPath -Parameters (@{} + $PSBoundParameters)
+        return
+    }
+    if ($CdcBindingStatePath -or $CdcSettingsPath) { throw 'CDC lifecycle requires its original retained deployment inventory.' }
+}
+
 $databaseOnlyStartup = $DbOnly -and -not $d
 if (-not $databaseOnlyStartup) {
     # Database-only startup must not depend on bootstrap module loading or workspace state.
@@ -206,6 +251,9 @@ if (-not $databaseOnlyStartup) {
 }
 $originalLocation = Get-Location
 Import-Module (Join-Path $PSScriptRoot "env-utility.psm1") -Force
+# Shared Compose-equivalent resolver so the readiness probes use the same port/password the container
+# received (ambient process/shell value wins over the env file), not a stale file value.
+Import-Module (Join-Path $PSScriptRoot "database-safety.psm1") -Force
 if (-not [string]::IsNullOrWhiteSpace($EnvironmentFile)) {
     if (-not [System.IO.Path]::IsPathRooted($EnvironmentFile)) {
         # Caller supplied an explicit relative path - resolve against the caller's CWD.
@@ -218,6 +266,11 @@ else {
     # teardown - work on a clean checkout with no hand-created .env, matching the phase commands.
     $EnvironmentFile = Resolve-LocalSettingsEnvironmentFile -Path "" -DockerComposeRoot $PSScriptRoot
 }
+# The base env file, before any overlay composition below reassigns $EnvironmentFile to a derived path.
+# A continuation that recomposes the environment from its own switches - the fresh wrapper run the
+# -InfraOnly guidance prints - must start from THIS file, not from a derived one it would then compose
+# a second set of overlays over.
+$baseEnvironmentFile = $EnvironmentFile
 if (-not $databaseOnlyStartup) {
     $bootstrapEnvSnapshot = Get-BootstrapEnvSnapshot
 }
@@ -241,7 +294,36 @@ $EnvironmentFile = Resolve-DataStandardEnvironmentFile -DataStandardVersion $Dat
 # path (Resolve-DatabaseEngineEnvironmentFile detects the overlay is already composed via
 # DMS_DATASTORE=mssql and returns the file unchanged, avoiding a derived-of-derived file).
 # DbOnly and teardown skip the CMS/OpenIddict invariant because neither initializes identity data.
-$EnvironmentFile = Resolve-DatabaseEngineEnvironmentFile -DatabaseEngine $DatabaseEngine -BaseEnvironmentFile $EnvironmentFile -DockerComposeRoot $PSScriptRoot -SkipMssqlCmsDatabaseValidation:($databaseOnlyStartup -or $d)
+#
+# CMS participates only in the default/-InfraOnly forward-starting shape - not -DmsOnly (CMS
+# doesn't start), -DbOnly, or teardown (-d). Non-participating shapes get structural validation
+# only; every participating MSSQL shape is verified physically on the running server after
+# readiness (Assert-MssqlTopologyPhysicalConsistency), in shared and separate mode alike.
+$cmsParticipates = -not ($databaseOnlyStartup -or $d -or $DmsOnly)
+
+if ($cmsParticipates) {
+    $EnvironmentFile = Resolve-DatabaseEngineEnvironmentFile -DatabaseEngine $DatabaseEngine -BaseEnvironmentFile $EnvironmentFile -DockerComposeRoot $PSScriptRoot -SkipMssqlCmsDatabaseValidation:$true
+
+    # Both engines run the same topology-write sequence, so shared and separate mode are symmetric
+    # across PostgreSQL and SQL Server. The profile files and both .yml inline fallbacks carry the
+    # topology seam in their database segment; the fallbacks' host, port, and credentials stay
+    # PostgreSQL-shaped because Compose interpolation cannot branch on the engine, which is why an
+    # MSSQL run must supply DMS_CONFIG_DATABASE_CONNECTION_STRING explicitly (the .env.mssql overlay
+    # always does).
+    $EnvironmentFile = Resolve-CmsDatabaseTopologyEnvironmentFile -BaseEnvironmentFile $EnvironmentFile -DatabaseEngine $DatabaseEngine -SeparateConfigDatabase:$SeparateConfigDatabase -DockerComposeRoot $PSScriptRoot
+    Confirm-CmsDatabaseTopologyAgreement -EnvironmentFile $EnvironmentFile -DatabaseEngine $DatabaseEngine
+}
+else {
+    # CMS does not participate in this shape, so the topology sequence above does not run and this
+    # path composes the engine overlay only - structural validation, no database-NAME verdict. A
+    # SQL Server name relationship is the running instance's collation's call, and this shape never
+    # starts a server to ask, so a documented "accepted, gated no-op" continuation like
+    # `-DmsOnly -SeparateConfigDatabase` against the original -EnvironmentFile proceeds regardless
+    # of which database its CMS connection string names.
+    # -SkipMssqlCmsDatabaseValidation is retained at this call site for compatibility and is a
+    # documented no-op; the switch value is preserved so the argument still records the intent.
+    $EnvironmentFile = Resolve-DatabaseEngineEnvironmentFile -DatabaseEngine $DatabaseEngine -BaseEnvironmentFile $EnvironmentFile -DockerComposeRoot $PSScriptRoot -SkipMssqlCmsDatabaseValidation:($databaseOnlyStartup -or $d -or $SeparateConfigDatabase)
+}
 $envValues = ReadValuesFromEnvFile $EnvironmentFile
 if (-not $databaseOnlyStartup) {
     # Identity/CMS/DMS settings are application concerns. Keeping them outside DbOnly means an
@@ -325,6 +407,71 @@ if (-not $databaseOnlyStartup) {
         "local-dms.yml"
     )
 
+    $documentCacheComposeFile = Get-EnvValue `
+        -EnvValues $envValues `
+        -Name "DMS_DOCUMENTCACHE_COMPOSE_FILE" `
+        -DefaultValue ""
+    if (-not [string]::IsNullOrWhiteSpace($documentCacheComposeFile)) {
+        $documentCacheComposeFilePath =
+            if ([System.IO.Path]::IsPathRooted($documentCacheComposeFile)) {
+                $documentCacheComposeFile
+            }
+            else {
+                Join-Path $PSScriptRoot $documentCacheComposeFile
+            }
+
+        if (-not (Test-Path -LiteralPath $documentCacheComposeFilePath -PathType Leaf)) {
+            throw "DMS_DOCUMENTCACHE_COMPOSE_FILE does not identify a compose file: $documentCacheComposeFilePath"
+        }
+
+        Write-Output "Using DocumentCache Docker Compose file '$documentCacheComposeFilePath'."
+        $files += @("-f", $documentCacheComposeFilePath)
+    }
+
+    # Plugin acquisition, and whatever else a deployment layers beside it. Semicolon-delimited and
+    # appended in the order written, because the two halves are separate files: one of the committed
+    # acquisition overlays, plus the deployment's own override naming Plugins:Allowed. Neither is
+    # required and an unset or whitespace value adds nothing, which is the shipped default.
+    #
+    # Every path is resolved and validated here, before anything touches Docker, so a typo fails
+    # while the stack is still untouched rather than halfway through a recreate. An empty segment in
+    # a non-empty list is refused rather than skipped: it is a stray or doubled separator, and
+    # silently dropping one would leave an operator with a deployment missing a file they wrote.
+    $pluginComposeFiles = Get-EnvValue `
+        -EnvValues $envValues `
+        -Name "DMS_PLUGINS_COMPOSE_FILES" `
+        -DefaultValue ""
+    if (-not [string]::IsNullOrWhiteSpace($pluginComposeFiles)) {
+        $resolvedPluginComposeFiles = @()
+
+        foreach ($pluginComposeFile in $pluginComposeFiles.Split(';')) {
+            $trimmedPluginComposeFile = $pluginComposeFile.Trim()
+
+            if ([string]::IsNullOrEmpty($trimmedPluginComposeFile)) {
+                throw "DMS_PLUGINS_COMPOSE_FILES contains an empty entry: '$pluginComposeFiles'"
+            }
+
+            $pluginComposeFilePath =
+                if ([System.IO.Path]::IsPathRooted($trimmedPluginComposeFile)) {
+                    $trimmedPluginComposeFile
+                }
+                else {
+                    Join-Path $PSScriptRoot $trimmedPluginComposeFile
+                }
+
+            if (-not (Test-Path -LiteralPath $pluginComposeFilePath -PathType Leaf)) {
+                throw "DMS_PLUGINS_COMPOSE_FILES does not identify a compose file: $pluginComposeFilePath"
+            }
+
+            $resolvedPluginComposeFiles += $pluginComposeFilePath
+        }
+
+        foreach ($resolvedPluginComposeFile in $resolvedPluginComposeFiles) {
+            Write-Output "Using plugin Docker Compose file '$resolvedPluginComposeFile'."
+            $files += @("-f", $resolvedPluginComposeFile)
+        }
+    }
+
     $enableDotnetDiagnostics = [string]::Equals(
         (Get-EnvValue -EnvValues $envValues -Name "DMS_ENABLE_DOTNET_DIAGNOSTICS" -DefaultValue "false"),
         "true",
@@ -335,20 +482,40 @@ if (-not $databaseOnlyStartup) {
         $files += @("-f", "local-dms-diagnostics.yml")
     }
 
-    # Kafka (and KafkaUI) back the PostgreSQL Debezium CDC path only and are opt-in via
-    # -EnableKafka / -EnableKafkaUI. The relational MSSQL path serves writes and queries directly
-    # from SQL and registers no connector, so Kafka is omitted.
-    $enableKafkaInfrastructure = $EnableKafka -or $EnableKafkaUI
-    if ($enableKafkaInfrastructure -and $DatabaseEngine -eq "postgresql") {
+    if ($CdcDatabaseInfrastructure) {
+        if (-not $InfraOnly -or $d -or $EnableKafka -or $EnableKafkaUI -or $CdcKafkaInfrastructure) {
+            throw "CDC database preparation requires -InfraOnly without Kafka startup or teardown flags."
+        }
+        if ($DatabaseEngine -eq "mssql") { $files += @("-f", "mssql-cdc.yml") }
+    }
+
+    # CDC selects the same broker/qualified worker for either provider. The worker's
+    # profile stays inactive until the controller completes fresh offset-store preparation.
+    $enableKafkaInfrastructure = $EnableKafka -or $EnableKafkaUI -or $CdcKafkaInfrastructure
+    if ($CdcKafkaInfrastructure) {
+        if (-not $InfraOnly -and -not $d) {
+            throw "CDC infrastructure startup requires -InfraOnly; the controller owns writer handoff."
+        }
+        if (-not [string]::IsNullOrWhiteSpace($env:COMPOSE_PROFILES)) {
+            throw "CDC infrastructure startup does not accept COMPOSE_PROFILES."
+        }
+        $files += @("-f", "kafka-cdc.yml")
+        if ($DatabaseEngine -eq "mssql") { $files += @("-f", "mssql-cdc.yml") }
+    }
+    elseif ($enableKafkaInfrastructure -and $DatabaseEngine -eq "postgresql") {
         $files += @("-f", "kafka.yml")
     }
 
-    if ($IdentityProvider -eq "keycloak") {
-        # Keep Keycloak in the managed compose set so follow-up up/down calls operate on the full environment.
+    # Keep Keycloak in the managed compose set so follow-up up/down calls operate on the full
+    # environment. Teardown (-d) always includes it: the identity provider is resolved from the
+    # environment file, which need not name the provider the running stack was started with, and a
+    # compose file left out of the down set takes its named volume (dms-keycloak) with it, leaking
+    # <project>_dms-keycloak past `down -v`.
+    if ($d -or $IdentityProvider -eq "keycloak") {
         $files += @("-f", "keycloak.yml")
     }
 
-    if ($EnableKafkaUI -and $DatabaseEngine -eq "postgresql") {
+    if ($EnableKafkaUI -and ($DatabaseEngine -eq "postgresql" -or $CdcKafkaInfrastructure)) {
         $files += @("-f", "kafka-ui.yml")
     }
 
@@ -369,6 +536,22 @@ if (-not $databaseOnlyStartup) {
     }
 }
 
+if ($CdcBrokerSizeOverrideFile -and (Test-Path -LiteralPath $CdcBrokerSizeOverrideFile)) {
+    $files += @('-f', $CdcBrokerSizeOverrideFile)
+}
+
+if ($CdcDmsComposeFile) {
+    if (-not $DmsOnly -or -not (Test-Path -LiteralPath $CdcDmsComposeFile -PathType Leaf)) {
+        throw 'CDC DMS settings handoff requires -DmsOnly and an existing Compose override.'
+    }
+    $files += @('-f', $CdcDmsComposeFile)
+}
+
+# Complete offline validation before inspecting Docker, and inspect before any stack changes.
+if (-not (Test-CdcInfrastructureInvocation)) {
+    Assert-CdcUnregisteredInfrastructure -Project 'dms-local'
+}
+
 if ($d) {
     $downArgs = @("--remove-orphans")
     if ($v) {
@@ -378,7 +561,13 @@ if ($d) {
     else {
         Write-Output "Shutting down"
     }
-    docker compose $files --env-file $EnvironmentFile -p dms-local down $downArgs
+    if ($CdcKafkaInfrastructure -and -not $v) {
+        docker compose $files --env-file $EnvironmentFile -p dms-local --profile cdc-managed-worker stop
+    }
+    elseif ($CdcKafkaInfrastructure) {
+        docker compose $files --env-file $EnvironmentFile -p dms-local --profile cdc-managed-worker down $downArgs
+    }
+    else { docker compose $files --env-file $EnvironmentFile -p dms-local down $downArgs }
     # Fail before workspace removal: a failed down can leave services running against the
     # bind-mounted .bootstrap schema and claims, so removing the workspace would pull it
     # out from under a live stack.
@@ -396,9 +585,10 @@ else {
     }
 
     $upArgs = @("--detach")
-    if (-not $databaseOnlyStartup) {
-        # The DbOnly compose set intentionally contains only the database definition. Passing
-        # --remove-orphans there would remove already-running DMS/CMS containers from this project.
+    if (-not $databaseOnlyStartup -and -not $DmsOnly -and -not $CdcDatabaseInfrastructure) {
+        # DbOnly, DmsOnly, and managed database/CMS preparation must preserve CDC/peer services.
+        # Their narrowed compose sets omit retained services; --remove-orphans would remove
+        # already-running DMS/CMS or Kafka/worker/UI containers from this project.
         $upArgs += "--remove-orphans"
     }
     if ($r) {
@@ -408,6 +598,170 @@ else {
             throw "Failed to build images. Exit code $LASTEXITCODE"
         }
     }
+
+    function Get-ContinuationCommandArgument {
+        <#
+        .SYNOPSIS
+        Formats the argument text a printed continuation command needs to reconstruct THIS run's
+        execution state: the database engine, the environment file the continuation should read, and
+        the topology declaration when this run declared it.
+
+        .DESCRIPTION
+        One helper for every command the -InfraOnly guidance emits, so the separate-mode and
+        shared-mode branches cannot drift apart in which state they carry. Carrying only
+        -SeparateConfigDatabase was the defect: following the hint after an MSSQL run, or after a run
+        against a custom environment file, silently continued on the PostgreSQL default and the default
+        environment.
+
+        -EnvironmentFile is emitted as a PowerShell single-quoted literal so a path containing spaces
+        stays one argument and an embedded apostrophe is doubled rather than terminating the quote.
+        Single quotes also suppress interpolation, so a '$' in a path is not expanded by the shell the
+        operator pastes into.
+
+        -DataStandardVersion is emitted only for a command that recomposes a data-standard overlay of
+        its own AND only when this run selected a version explicitly. With no selection this script
+        composed no overlay, so there is no version to carry and naming one would compose an overlay the
+        run never had.
+
+        -IdentityProvider is emitted only when a caller supplies one, because only the fresh-wrapper
+        command accepts it: an explicit provider outranks the environment file's own
+        DMS_CONFIG_IDENTITY_PROVIDER, so a keycloak run over a self-contained environment would otherwise
+        advertise a continuation that silently switches providers. The two phase commands do not declare
+        the parameter and are never given it.
+        #>
+        param(
+            [Parameter(Mandatory)]
+            [string]
+            $DatabaseEngine,
+
+            [Parameter(Mandatory)]
+            [string]
+            $EnvironmentFile,
+
+            [switch]
+            $SeparateConfigDatabase,
+
+            [string]
+            $DataStandardVersion = "",
+
+            [string]
+            $IdentityProvider = ""
+        )
+
+        $quotedEnvironmentFile = "'" + $EnvironmentFile.Replace("'", "''") + "'"
+        $argumentText = "-DatabaseEngine $DatabaseEngine -EnvironmentFile $quotedEnvironmentFile"
+        if (-not [string]::IsNullOrWhiteSpace($DataStandardVersion)) {
+            $argumentText += " -DataStandardVersion $DataStandardVersion"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($IdentityProvider)) {
+            $argumentText += " -IdentityProvider $IdentityProvider"
+        }
+        if ($SeparateConfigDatabase) {
+            $argumentText += " -SeparateConfigDatabase"
+        }
+
+        return $argumentText
+    }
+
+    function Get-InfraOnlyTerminalGuidance {
+        <#
+        .SYNOPSIS
+        Builds the -InfraOnly terminal guidance block: the manual phase next-steps and, when this script
+        is the operator's entry point, the fresh-wrapper continuation command. Returns the lines rather
+        than writing them, so every command it would print can be collected and bound in a test without
+        starting infrastructure.
+
+        .DESCRIPTION
+        Same shape as provision-dms-schema.ps1's Get-ProvisionIdeGuidance, and for the same reason: the
+        commands are the contract, and a block that can only be observed by running the whole start-up
+        cannot be asserted on. Pure and side-effect-free.
+
+        The two phase commands and the fresh-wrapper command deliberately receive DIFFERENT environment
+        files:
+
+          - The phase commands continue from the environment this run already composed, so they get
+            -EffectiveEnvironmentFile, the derived file carrying the engine overlay and the topology
+            marker. Both recompose idempotently from it - the engine overlay detects it is already
+            applied, and the topology derivation recomputes the same artifact from the same switch.
+          - The fresh wrapper run recomposes its own overlays from its input, so it gets
+            -BaseEnvironmentFile, captured before this script's overlays ran. Handing it a derived file
+            would layer a second generation of overlays on top, and an explicitly selected data standard
+            has to travel with it because the wrapper always recomposes a data-standard overlay for a
+            local bootstrap.
+
+        Both datastore phases enforce the separate topology and neither can infer it from the environment
+        file the operator hands it - the marker lives in the derived file this start wrote - so a
+        separate-topology start declares it on each. Configure judges the name it registers; provision
+        judges the database each selected target resolves to, which is the only place a REUSED data
+        store's stored connection string is known. Without the switch the continuation could register,
+        or deploy the DMS schema into, the dedicated Configuration Service database.
+
+        Terminal guidance contract (DMS-1153 AC): print actionable phase next-steps but do NOT present a
+        second start-local-dms.ps1 run as a resume mechanism.
+        #>
+        param(
+            [Parameter(Mandatory)]
+            [string]
+            $DatabaseEngine,
+
+            [Parameter(Mandatory)]
+            [string]
+            $EffectiveEnvironmentFile,
+
+            [Parameter(Mandatory)]
+            [string]
+            $BaseEnvironmentFile,
+
+            [string]
+            $DataStandardVersion = "",
+
+            # The provider this run RESOLVED (explicit parameter, then the environment file, then
+            # self-contained). Travels on the fresh-wrapper command only; configure and provision do not
+            # declare it.
+            [string]
+            $IdentityProvider = "",
+
+            [switch]
+            $SeparateConfigDatabase,
+
+            [switch]
+            $SuppressWrapperContinuationGuidance
+        )
+
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add("Infrastructure phase complete. DMS service was not started.")
+        $lines.Add("")
+        $lines.Add("Next steps for the manual IDE / debugger phase flow:")
+
+        $phaseContinuationArgument = Get-ContinuationCommandArgument `
+            -DatabaseEngine $DatabaseEngine `
+            -EnvironmentFile $EffectiveEnvironmentFile `
+            -SeparateConfigDatabase:$SeparateConfigDatabase
+        $lines.Add("  1. configure-local-data-store.ps1 $phaseContinuationArgument    (instance creation / selection)")
+        $lines.Add("  2. provision-dms-schema.ps1 $phaseContinuationArgument          (schema provisioning; prints IDE configuration guidance)")
+        $lines.Add("  3. Launch DMS in your IDE / debugger")
+        $lines.Add("  4. load-dms-seed-data.ps1 -DmsBaseUrl <url>   (optional seed delivery to the IDE-hosted DMS)")
+
+        # Emitted only when THIS script is the operator's entry point. Inside a wrapper-owned run the
+        # wrapper prints this hint itself, from the caller-supplied base environment file and data
+        # standard it still holds - state this script is not given (see
+        # -SuppressWrapperContinuationGuidance). Printing both would put two fresh-wrapper commands in
+        # one transcript, disagreeing about the environment to compose from.
+        if (-not $SuppressWrapperContinuationGuidance) {
+            $lines.Add("For a wrapper-managed health-wait and optional seed, run a fresh:")
+            $wrapperContinuationArgument = Get-ContinuationCommandArgument `
+                -DatabaseEngine $DatabaseEngine `
+                -EnvironmentFile $BaseEnvironmentFile `
+                -DataStandardVersion $DataStandardVersion `
+                -IdentityProvider $IdentityProvider `
+                -SeparateConfigDatabase:$SeparateConfigDatabase
+            $lines.Add("  bootstrap-local-dms.ps1 -InfraOnly -DmsBaseUrl <url> $wrapperContinuationArgument [-LoadSeedData ...]")
+        }
+
+        return $lines.ToArray()
+    }
+
+    if ($CdcDmsComposeFile) { $upArgs += "--no-deps" }
 
     function Wait-HttpEndpointHealthy {
         param(
@@ -540,13 +894,7 @@ else {
         }
 
         if ($DatabaseEngine -eq "mssql") {
-            $mssqlSaPassword =
-                if ([string]::IsNullOrWhiteSpace($envValues.MSSQL_SA_PASSWORD)) {
-                    "abcdefgh1!"
-                }
-                else {
-                    $envValues.MSSQL_SA_PASSWORD
-                }
+            $mssqlSaPassword = Get-ComposeResolvedEnvValue -EnvironmentValues $envValues -Name "MSSQL_SA_PASSWORD" -DefaultValue "abcdefgh1!"
             Wait-MssqlReady -ContainerName "dms-mssql" -Password $mssqlSaPassword
         }
         else {
@@ -555,6 +903,19 @@ else {
 
         Write-Output "Database phase complete. Only the database container was started."
         return
+    }
+
+    # The two role names CMS enforces are supported overrides: local-config.yml maps
+    # IdentitySettings:ConfigServiceRole / :ClientRole from DMS_CONFIG_IDENTITY_SERVICE_ROLE /
+    # DMS_CONFIG_IDENTITY_CLIENT_ROLE, and BOTH identity setup scripts -- setup-keycloak.ps1 and
+    # setup-openiddict.ps1 -InsertData -- fall back to their own cms-client / dms-client defaults when
+    # the parameters are omitted. Resolved once, above the provider branch, so neither provider
+    # registers clients against a role the configured CMS does not require: that registration
+    # succeeds and tokens mint, and the failure surfaces later as DMS unable to read claim sets. The
+    # defaults are the compose file's own fallbacks, so an unset override resolves exactly as before.
+    $identityRoleParams = @{
+        ConfigServiceRole = Get-ComposeResolvedEnvValue -EnvironmentValues $envValues -Name "DMS_CONFIG_IDENTITY_SERVICE_ROLE" -DefaultValue "cms-client"
+        DmsClientRole     = Get-ComposeResolvedEnvValue -EnvironmentValues $envValues -Name "DMS_CONFIG_IDENTITY_CLIENT_ROLE" -DefaultValue "dms-client"
     }
 
     if($IdentityProvider -eq "keycloak")
@@ -567,13 +928,13 @@ else {
 
         Write-Output "Running setup-keycloak.ps1 scripts..."
         # Create client with default edfi_admin_api/full_access scope
-        ./setup-keycloak.ps1 -NewClientSecret $identityClientSecrets.DmsConfigurationServiceClientSecret -ClientSecretMinimumLength $identityClientSecrets.ClientSecretMinimumLength -ClientSecretMaximumLength $identityClientSecrets.ClientSecretMaximumLength
+        ./setup-keycloak.ps1 @identityRoleParams -NewClientSecret $identityClientSecrets.DmsConfigurationServiceClientSecret -ClientSecretMinimumLength $identityClientSecrets.ClientSecretMinimumLength -ClientSecretMaximumLength $identityClientSecrets.ClientSecretMaximumLength
 
         # Create client with edfi_admin_api/readonly_access scope
-        ./setup-keycloak.ps1 -NewClientId "CMSReadOnlyAccess" -NewClientName "CMS ReadOnly Access" -ClientScopeName "edfi_admin_api/readonly_access" -NewClientSecret $identityClientSecrets.CmsReadOnlyAccessClientSecret -ClientSecretMinimumLength $identityClientSecrets.ClientSecretMinimumLength -ClientSecretMaximumLength $identityClientSecrets.ClientSecretMaximumLength
+        ./setup-keycloak.ps1 @identityRoleParams -NewClientId "CMSReadOnlyAccess" -NewClientName "CMS ReadOnly Access" -ClientScopeName "edfi_admin_api/readonly_access" -NewClientSecret $identityClientSecrets.CmsReadOnlyAccessClientSecret -ClientSecretMinimumLength $identityClientSecrets.ClientSecretMinimumLength -ClientSecretMaximumLength $identityClientSecrets.ClientSecretMaximumLength
 
         # Create client with edfi_admin_api/authMetadata_readonly_access scope
-        ./setup-keycloak.ps1 -NewClientId "CMSAuthMetadataReadOnlyAccess" -NewClientName "CMS Auth Endpoints Only Access" -ClientScopeName "edfi_admin_api/authMetadata_readonly_access"
+        ./setup-keycloak.ps1 @identityRoleParams -NewClientId "CMSAuthMetadataReadOnlyAccess" -NewClientName "CMS Auth Endpoints Only Access" -ClientScopeName "edfi_admin_api/authMetadata_readonly_access"
     }
     $databaseDisplayName = if ($DatabaseEngine -eq "mssql") { "SQL Server" } else { "Postgresql" }
     Write-Output "Starting $databaseDisplayName..."
@@ -585,28 +946,51 @@ else {
     if ($DatabaseEngine -eq "mssql") {
         # SQL Server accepts connections noticeably later than its container reports running;
         # poll before the phase commands need it. Default matches mssql.yml's compose default.
-        $mssqlSaPassword =
-            if ([string]::IsNullOrWhiteSpace($envValues.MSSQL_SA_PASSWORD)) {
-                "abcdefgh1!"
-            }
-            else {
-                $envValues.MSSQL_SA_PASSWORD
-            }
+        $mssqlSaPassword = Get-ComposeResolvedEnvValue -EnvironmentValues $envValues -Name "MSSQL_SA_PASSWORD" -DefaultValue "abcdefgh1!"
         Wait-MssqlReady -ContainerName "dms-mssql" -Password $mssqlSaPassword
+
+        if ($cmsParticipates) {
+            # The live topology check for EVERY CMS-participating MSSQL start: the RUNNING SQL
+            # Server - the only authority on its own database-name semantics - verifies that the
+            # CMS targets (the seam and every connection-string segment) are physically the
+            # database the effective topology expects, and in separate mode that the datastore
+            # stays physically distinct from the dedicated Configuration Service database. The
+            # authority reads the effective file's own topology marker (raw) to select the mode;
+            # on this participating path the topology resolver above just recomputed the topology
+            # from the switch, so the marker in the file it RETURNED is the current declaration.
+            # Placed hard against readiness so a violated relation, or any inability to verify
+            # (it fails closed), stops the start after the database container exists but before
+            # OpenIddict, CMS, DMS, or any datastore work touches it.
+            Assert-MssqlTopologyPhysicalConsistency `
+                -EnvironmentFile $EnvironmentFile `
+                -ContainerName "dms-mssql" `
+                -SaPassword $mssqlSaPassword
+        }
     }
 
-    # Engine-aware database parameters for the setup-openiddict.ps1 calls below (mirrors
-    # start-local-config.ps1). On SQL Server the OpenIddict stores live in the shared DMS
-    # datastore database (MSSQL_DB_NAME), which CMS also uses now that the two share one
-    # database; -InitDb creates it (and the dmscs schema) when missing, ahead of the CMS
-    # startup deploy. On PostgreSQL the script defaults apply unchanged (shared
-    # POSTGRES_DB_NAME database).
+    # Engine-aware database parameters for the setup-openiddict.ps1 calls below. On both engines the
+    # OpenIddict stores live in whichever database CMS itself targets - DMS_CONFIG_DATABASE_NAME,
+    # the CMS database topology seam (DMS-1270): the shared DMS datastore database by default, or
+    # the dedicated edfi_configurationservice database when -SeparateConfigDatabase redirects CMS
+    # there. -InitDb creates that database (and the dmscs schema) when missing, ahead of the CMS
+    # startup deploy. Only the connection details differ per engine; the database name is resolved
+    # from the same seam either way, so the two modes stay symmetric across engines.
     $identityDbParams =
         if ($DatabaseEngine -eq "mssql") {
-            @{ DbType = "MSSQL"; DbUser = "sa"; DbPort = "ENV:MSSQL_PORT"; DbName = "ENV:MSSQL_DB_NAME" }
+            @{ DbType = "MSSQL"; DbUser = "sa"; DbPort = "ENV:MSSQL_PORT"; DbName = "ENV:DMS_CONFIG_DATABASE_NAME" }
         }
         else {
-            @{}
+            # POSTGRES_USER is a supported override - postgresql.yml passes ${POSTGRES_USER:-postgres}
+            # to the container - and setup-openiddict.ps1 defaults DbUser to postgres. Because these
+            # calls pass -EnvironmentFile, Get-EffectiveConnectionString always builds the connection
+            # string from this parameter group, so that default would reach psql as Username=postgres
+            # and a stack using the override would fail to connect before the OpenIddict stores exist.
+            # Resolved with the same Compose precedence the container itself saw, and with the same
+            # default the compose file falls back to, so an unset override resolves exactly as before.
+            @{
+                DbUser = Get-ComposeResolvedEnvValue -EnvironmentValues $envValues -Name "POSTGRES_USER" -DefaultValue "postgres"
+                DbName = "ENV:DMS_CONFIG_DATABASE_NAME"
+            }
         }
 
     Start-Sleep 20
@@ -630,12 +1014,19 @@ else {
         if($IdentityProvider -eq "self-contained")
         {
             Write-Output "Starting self-contained initialization script..."
-            ./setup-openiddict.ps1 -InsertData -NewClientSecret $identityClientSecrets.DmsConfigurationServiceClientSecret -ClientSecretMinimumLength $identityClientSecrets.ClientSecretMinimumLength -ClientSecretMaximumLength $identityClientSecrets.ClientSecretMaximumLength -EnvironmentFile $EnvironmentFile @identityDbParams
-            ./setup-openiddict.ps1 -InsertData -NewClientId "CMSReadOnlyAccess" -NewClientName "CMS ReadOnly Access" -ClientScopeName "edfi_admin_api/readonly_access" -NewClientSecret $identityClientSecrets.CmsReadOnlyAccessClientSecret -ClientSecretMinimumLength $identityClientSecrets.ClientSecretMinimumLength -ClientSecretMaximumLength $identityClientSecrets.ClientSecretMaximumLength -EnvironmentFile $EnvironmentFile @identityDbParams
-            ./setup-openiddict.ps1 -InsertData -NewClientId "CMSAuthMetadataReadOnlyAccess" -NewClientName "CMS Auth Endpoints Only Access" -ClientScopeName "edfi_admin_api/authMetadata_readonly_access" -EnvironmentFile $EnvironmentFile @identityDbParams
+            ./setup-openiddict.ps1 -InsertData @identityRoleParams -NewClientSecret $identityClientSecrets.DmsConfigurationServiceClientSecret -ClientSecretMinimumLength $identityClientSecrets.ClientSecretMinimumLength -ClientSecretMaximumLength $identityClientSecrets.ClientSecretMaximumLength -EnvironmentFile $EnvironmentFile @identityDbParams
+            ./setup-openiddict.ps1 -InsertData @identityRoleParams -NewClientId "CMSReadOnlyAccess" -NewClientName "CMS ReadOnly Access" -ClientScopeName "edfi_admin_api/readonly_access" -NewClientSecret $identityClientSecrets.CmsReadOnlyAccessClientSecret -ClientSecretMinimumLength $identityClientSecrets.ClientSecretMinimumLength -ClientSecretMaximumLength $identityClientSecrets.ClientSecretMaximumLength -EnvironmentFile $EnvironmentFile @identityDbParams
+            ./setup-openiddict.ps1 -InsertData @identityRoleParams -NewClientId "CMSAuthMetadataReadOnlyAccess" -NewClientName "CMS Auth Endpoints Only Access" -ClientScopeName "edfi_admin_api/authMetadata_readonly_access" -EnvironmentFile $EnvironmentFile @identityDbParams
         }
 
-        if ($enableKafkaInfrastructure -and $DatabaseEngine -eq "postgresql") {
+        if ($CdcKafkaInfrastructure) {
+            Write-Output "Starting CDC broker; Connect remains stopped until offset-store preparation succeeds."
+            docker compose $files --env-file $EnvironmentFile -p dms-local up $upArgs --wait kafka
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to start CDC broker. Exit code $LASTEXITCODE"
+            }
+        }
+        elseif ($enableKafkaInfrastructure -and $DatabaseEngine -eq "postgresql") {
             Write-Output "Starting Kafka infrastructure..."
             docker compose $files --env-file $EnvironmentFile -p dms-local up $upArgs kafka kafka-postgresql-source
             if ($LASTEXITCODE -ne 0) {
@@ -646,7 +1037,7 @@ else {
             Write-Output "Skipping Kafka infrastructure: the MSSQL relational path does not use Debezium CDC (PostgreSQL-only)."
         }
 
-        if ($EnableKafkaUI -and $DatabaseEngine -eq "postgresql") {
+        if ($EnableKafkaUI -and ($DatabaseEngine -eq "postgresql" -or $CdcKafkaInfrastructure)) {
             Write-Output "Starting Kafka UI..."
             docker compose $files --env-file $EnvironmentFile -p dms-local up $upArgs kafka-ui
             if ($LASTEXITCODE -ne 0) {
@@ -679,19 +1070,20 @@ else {
             Wait-HttpEndpointHealthy -Url "$($DmsBaseUrl.TrimEnd('/'))/health" -Name "DMS (IDE-hosted)" -TimeoutSeconds 300
             Write-Output "DMS (IDE-hosted) is healthy. Infrastructure and DMS health-wait complete."
         }
-        else {
+        elseif (-not $SuppressWriterGuidance) {
             # Terminal guidance contract (DMS-1153 AC): print actionable phase next-steps but do
             # NOT present a second start-local-dms.ps1 run as a resume mechanism. The wrapper
             # continuation shape is the supported health-wait path after a terminal stop.
-            Write-Output "Infrastructure phase complete. DMS service was not started."
-            Write-Output ""
-            Write-Output "Next steps for the manual IDE / debugger phase flow:"
-            Write-Output "  1. configure-local-data-store.ps1    (instance creation / selection)"
-            Write-Output "  2. provision-dms-schema.ps1          (schema provisioning; prints IDE configuration guidance)"
-            Write-Output "  3. Launch DMS in your IDE / debugger"
-            Write-Output "  4. load-dms-seed-data.ps1 -DmsBaseUrl <url>   (optional seed delivery to the IDE-hosted DMS)"
-            Write-Output "For a wrapper-managed health-wait and optional seed, run a fresh:"
-            Write-Output "  bootstrap-local-dms.ps1 -InfraOnly -DmsBaseUrl <url> [-LoadSeedData ...]"
+            foreach ($line in (Get-InfraOnlyTerminalGuidance `
+                -DatabaseEngine $DatabaseEngine `
+                -EffectiveEnvironmentFile $EnvironmentFile `
+                -BaseEnvironmentFile $baseEnvironmentFile `
+                -DataStandardVersion $DataStandardVersion `
+                -IdentityProvider $IdentityProvider `
+                -SeparateConfigDatabase:$SeparateConfigDatabase `
+                -SuppressWrapperContinuationGuidance:$SuppressWrapperContinuationGuidance)) {
+                Write-Output $line
+            }
         }
         return
     }
@@ -720,13 +1112,13 @@ else {
     {
         Write-Output "Starting self-contained initialization script..."
         # Create client with default edfi_admin_api/full_access scope
-        ./setup-openiddict.ps1 -InsertData -NewClientSecret $identityClientSecrets.DmsConfigurationServiceClientSecret -ClientSecretMinimumLength $identityClientSecrets.ClientSecretMinimumLength -ClientSecretMaximumLength $identityClientSecrets.ClientSecretMaximumLength -EnvironmentFile $EnvironmentFile @identityDbParams
+        ./setup-openiddict.ps1 -InsertData @identityRoleParams -NewClientSecret $identityClientSecrets.DmsConfigurationServiceClientSecret -ClientSecretMinimumLength $identityClientSecrets.ClientSecretMinimumLength -ClientSecretMaximumLength $identityClientSecrets.ClientSecretMaximumLength -EnvironmentFile $EnvironmentFile @identityDbParams
 
         # Create client with edfi_admin_api/readonly_access scope
-        ./setup-openiddict.ps1 -InsertData -NewClientId "CMSReadOnlyAccess" -NewClientName "CMS ReadOnly Access" -ClientScopeName "edfi_admin_api/readonly_access" -NewClientSecret $identityClientSecrets.CmsReadOnlyAccessClientSecret -ClientSecretMinimumLength $identityClientSecrets.ClientSecretMinimumLength -ClientSecretMaximumLength $identityClientSecrets.ClientSecretMaximumLength -EnvironmentFile $EnvironmentFile @identityDbParams
+        ./setup-openiddict.ps1 -InsertData @identityRoleParams -NewClientId "CMSReadOnlyAccess" -NewClientName "CMS ReadOnly Access" -ClientScopeName "edfi_admin_api/readonly_access" -NewClientSecret $identityClientSecrets.CmsReadOnlyAccessClientSecret -ClientSecretMinimumLength $identityClientSecrets.ClientSecretMinimumLength -ClientSecretMaximumLength $identityClientSecrets.ClientSecretMaximumLength -EnvironmentFile $EnvironmentFile @identityDbParams
 
         # Create client with edfi_admin_api/authMetadata_readonly_access scope
-        ./setup-openiddict.ps1 -InsertData -NewClientId "CMSAuthMetadataReadOnlyAccess" -NewClientName "CMS Auth Endpoints Only Access" -ClientScopeName "edfi_admin_api/authMetadata_readonly_access" -EnvironmentFile $EnvironmentFile @identityDbParams
+        ./setup-openiddict.ps1 -InsertData @identityRoleParams -NewClientId "CMSAuthMetadataReadOnlyAccess" -NewClientName "CMS Auth Endpoints Only Access" -ClientScopeName "edfi_admin_api/authMetadata_readonly_access" -EnvironmentFile $EnvironmentFile @identityDbParams
     }
     Start-Sleep 20
 }

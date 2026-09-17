@@ -67,6 +67,7 @@ CREATE TABLE [tracked_changes_edfi].[StaffEducationOrganizationAssignmentAssocia
     [NewStaff_DocumentId] bigint NULL,
     [Id] uniqueidentifier NOT NULL,
     [ChangeVersion] bigint NOT NULL,
+    [DocumentId] bigint NOT NULL,
     [CreatedAt] datetime2(7) NOT NULL CONSTRAINT [DF_tracked_changes_edfi_StaffEducationOrganizationAssignmentAssociation_CreatedAt] DEFAULT (sysutcdatetime()),
     CONSTRAINT [PK_tracked_changes_edfi_StaffEducationOrganizationAssignmentAssociation] PRIMARY KEY CLUSTERED ([ChangeVersion])
 );
@@ -80,6 +81,7 @@ CREATE TABLE [tracked_changes_edfi].[StaffEducationOrganizationEmploymentAssocia
     [NewStaff_DocumentId] bigint NULL,
     [Id] uniqueidentifier NOT NULL,
     [ChangeVersion] bigint NOT NULL,
+    [DocumentId] bigint NOT NULL,
     [CreatedAt] datetime2(7) NOT NULL CONSTRAINT [DF_tracked_changes_edfi_StaffEducationOrganizationEmploymentAssociation_CreatedAt] DEFAULT (sysutcdatetime()),
     CONSTRAINT [PK_tracked_changes_edfi_StaffEducationOrganizationEmploymentAssociation] PRIMARY KEY CLUSTERED ([ChangeVersion])
 );
@@ -93,6 +95,7 @@ CREATE TABLE [tracked_changes_edfi].[StudentContactAssociation]
     [NewContact_DocumentId] bigint NULL,
     [Id] uniqueidentifier NOT NULL,
     [ChangeVersion] bigint NOT NULL,
+    [DocumentId] bigint NOT NULL,
     [CreatedAt] datetime2(7) NOT NULL CONSTRAINT [DF_tracked_changes_edfi_StudentContactAssociation_CreatedAt] DEFAULT (sysutcdatetime()),
     CONSTRAINT [PK_tracked_changes_edfi_StudentContactAssociation] PRIMARY KEY CLUSTERED ([ChangeVersion])
 );
@@ -106,6 +109,7 @@ CREATE TABLE [tracked_changes_edfi].[StudentEducationOrganizationResponsibilityA
     [NewStudent_DocumentId] bigint NULL,
     [Id] uniqueidentifier NOT NULL,
     [ChangeVersion] bigint NOT NULL,
+    [DocumentId] bigint NOT NULL,
     [CreatedAt] datetime2(7) NOT NULL CONSTRAINT [DF_tracked_changes_edfi_StudentEducationOrganizationResponsibilityAssociation_CreatedAt] DEFAULT (sysutcdatetime()),
     CONSTRAINT [PK_tracked_changes_edfi_StudentEducationOrganizationResponsibilityAssociation] PRIMARY KEY CLUSTERED ([ChangeVersion])
 );
@@ -119,6 +123,7 @@ CREATE TABLE [tracked_changes_edfi].[StudentSchoolAssociation]
     [NewStudent_DocumentId] bigint NULL,
     [Id] uniqueidentifier NOT NULL,
     [ChangeVersion] bigint NOT NULL,
+    [DocumentId] bigint NOT NULL,
     [CreatedAt] datetime2(7) NOT NULL CONSTRAINT [DF_tracked_changes_edfi_StudentSchoolAssociation_CreatedAt] DEFAULT (sysutcdatetime()),
     CONSTRAINT [PK_tracked_changes_edfi_StudentSchoolAssociation] PRIMARY KEY CLUSTERED ([ChangeVersion])
 );
@@ -133,7 +138,7 @@ CREATE INDEX [IX_EducationOrganizationIdToEducationOrganizationId_Target] ON [au
 
 GO
 CREATE OR ALTER VIEW [auth].[EducationOrganizationIdToContactDocumentId] AS
-SELECT DISTINCT
+SELECT
     edOrg.[SourceEducationOrganizationId],
     sca.[Contact_DocumentId]
 FROM [auth].[EducationOrganizationIdToEducationOrganizationId] edOrg
@@ -148,7 +153,7 @@ SELECT
     seoaa.[Staff_DocumentId]
 FROM [auth].[EducationOrganizationIdToEducationOrganizationId] edOrg
 INNER JOIN [edfi].[StaffEducationOrganizationAssignmentAssociation] seoaa ON edOrg.[TargetEducationOrganizationId] = seoaa.[EducationOrganization_EducationOrganizationId]
-UNION
+UNION ALL
 SELECT
     edOrg.[SourceEducationOrganizationId],
     seoea.[Staff_DocumentId]
@@ -158,7 +163,7 @@ INNER JOIN [edfi].[StaffEducationOrganizationEmploymentAssociation] seoea ON edO
 
 GO
 CREATE OR ALTER VIEW [auth].[EducationOrganizationIdToStudentDocumentId] AS
-SELECT DISTINCT
+SELECT
     edOrg.[SourceEducationOrganizationId],
     ssa.[Student_DocumentId]
 FROM [auth].[EducationOrganizationIdToEducationOrganizationId] edOrg
@@ -167,7 +172,7 @@ INNER JOIN [edfi].[StudentSchoolAssociation] ssa ON edOrg.[TargetEducationOrgani
 
 GO
 CREATE OR ALTER VIEW [auth].[EducationOrganizationIdToStudentDocumentIdThroughResponsibility] AS
-SELECT DISTINCT
+SELECT
     edOrg.[SourceEducationOrganizationId],
     seora.[Student_DocumentId]
 FROM [auth].[EducationOrganizationIdToEducationOrganizationId] edOrg

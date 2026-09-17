@@ -12,25 +12,90 @@ namespace EdFi.DataManagementService.Backend;
 
 internal sealed class DescriptorQueryPageKeysetPlanner(SqlDialect dialect)
 {
-    private const string OffsetParameterName = "offset";
-    private const string LimitParameterName = "limit";
     private const string ResourceKeyIdParameterName = "resourceKeyId";
     private const string ContentVersionColumnName = ChangeVersionFilterConstants.ContentVersionColumnName;
     private const string MinChangeVersionParameterName =
         ChangeVersionFilterConstants.MinChangeVersionParameterName;
     private const string MaxChangeVersionParameterName =
         ChangeVersionFilterConstants.MaxChangeVersionParameterName;
-    private static readonly DbColumnName _documentUuidColumn = new("DocumentUuid");
-    private static readonly DbTableName _documentTable = new(new DbSchemaName("dms"), "Document");
+    private static readonly DbTableName _descriptorTable = new(new DbSchemaName("dms"), "Descriptor");
     private readonly PageDocumentIdSqlCompiler _sqlCompiler = new(dialect);
 
     public PageKeysetSpec.Query Plan(
         MappingSet mappingSet,
         QualifiedResourceName requestResource,
         DescriptorQueryPreprocessingResult preprocessingResult,
-        PaginationParameters paginationParameters,
+        CollectionPaging paging,
         PageDocumentIdAuthorizationSpec? authorization = null,
-        ChangeVersionRange? changeVersionRange = null
+        ChangeVersionRange? changeVersionRange = null,
+        PageOrderingMode orderingMode = PageOrderingMode.DocumentId
+    )
+    {
+        ArgumentNullException.ThrowIfNull(paging);
+
+        var plannedCandidates = PlanCandidates(
+            mappingSet,
+            requestResource,
+            preprocessingResult,
+            PageCandidateModePlanning.ForPaging(paging, orderingMode),
+            authorization,
+            changeVersionRange
+        );
+
+        return new PageKeysetSpec.Query(
+            plannedCandidates.Plan,
+            plannedCandidates.ParameterValues,
+            plannedCandidates.OrderingMode
+        );
+    }
+
+    /// <summary>
+    /// Plans the unpaged, unordered descriptor candidate relation over the same
+    /// <c>dms.Descriptor</c> root, <c>ResourceKeyId</c> discriminator, filters, change-version window,
+    /// and authorization the paged modes use.
+    /// </summary>
+    /// <remarks>
+    /// Callers must short-circuit an empty page themselves before planning: this throws when
+    /// <paramref name="preprocessingResult" /> is not in the continue state. Unlike the relational
+    /// planner, there is no <c>Try</c> overload, because descriptor preprocessing converts every value up
+    /// front and reports its own <c>EmptyPage</c> outcome, so planning has no way to discover that a
+    /// request matches nothing. A descriptor <c>TryPlanCandidates</c> could therefore never return
+    /// <see langword="false" />. <c>DescriptorReadHandler</c> is the model for the required caller shape.
+    /// </remarks>
+    /// <param name="orderingMode">
+    /// The anchor Core resolved for this request, forwarded so descriptor partition boundaries are cut
+    /// on the same key a descriptor page of the same request seeks. Boundaries cut on a different key
+    /// than the page a client replays them as would overlap and leave rows in no partition.
+    /// </param>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="preprocessingResult" /> is not in the continue state.
+    /// </exception>
+    public CandidateQueryPlan PlanCandidates(
+        MappingSet mappingSet,
+        QualifiedResourceName requestResource,
+        DescriptorQueryPreprocessingResult preprocessingResult,
+        PageDocumentIdAuthorizationSpec? authorization = null,
+        ChangeVersionRange? changeVersionRange = null,
+        PageOrderingMode orderingMode = PageOrderingMode.DocumentId
+    )
+    {
+        return PlanCandidates(
+            mappingSet,
+            requestResource,
+            preprocessingResult,
+            PageCandidateModePlanning.ForUnpagedCandidates(orderingMode),
+            authorization,
+            changeVersionRange
+        );
+    }
+
+    private CandidateQueryPlan PlanCandidates(
+        MappingSet mappingSet,
+        QualifiedResourceName requestResource,
+        DescriptorQueryPreprocessingResult preprocessingResult,
+        PlannedCandidateMode plannedMode,
+        PageDocumentIdAuthorizationSpec? authorization,
+        ChangeVersionRange? changeVersionRange
     )
     {
         ArgumentNullException.ThrowIfNull(mappingSet);
@@ -44,16 +109,23 @@ internal sealed class DescriptorQueryPageKeysetPlanner(SqlDialect dialect)
             );
         }
 
+        var (foldedMode, windowPredicateRange) =
+            PageCandidateModePlanning.FoldChangeVersionWindowIntoCursorBounds(
+                plannedMode,
+                changeVersionRange
+            );
+
         var parameterNamesByIndex = DeriveParameterNames(
             preprocessingResult.QueryElementsInOrder,
-            authorization
+            authorization,
+            foldedMode.OwnedParameterNames
         );
         var queryPredicates = PlanPredicates(preprocessingResult.QueryElementsInOrder, parameterNamesByIndex);
         var resourceKeyId = RelationalWriteSupport.GetResourceKeyIdOrThrow(mappingSet, requestResource);
 
-        // The page keyset roots on dms.Document so the descriptor type predicate filters on the
-        // project-qualified ResourceKeyId — the same type authority descriptor GET-by-id uses.
-        // Descriptor field filters join dms.Descriptor through the page SQL compiler.
+        // The page keyset roots on dms.Descriptor, whose denormalized ResourceKeyId carries the
+        // same project-qualified type authority descriptor GET-by-id reads from dms.Document.
+        // Descriptor field filters land on the root; only ?id= joins dms.Document.
         List<QueryValuePredicate> predicates =
         [
             new QueryValuePredicate(
@@ -63,15 +135,13 @@ internal sealed class DescriptorQueryPageKeysetPlanner(SqlDialect dialect)
             ),
             .. queryPredicates,
         ];
-        AppendChangeVersionPredicates(changeVersionRange, predicates);
+        AppendChangeVersionPredicates(windowPredicateRange, predicates);
 
         var pageQuerySpec = new PageDocumentIdQuerySpec(
-            RootTable: _documentTable,
+            RootTable: _descriptorTable,
             Predicates: predicates,
             UnifiedAliasMappingsByColumn: new Dictionary<DbColumnName, ColumnStorage.UnifiedAlias>(),
-            OffsetParameterName: OffsetParameterName,
-            LimitParameterName: LimitParameterName,
-            IncludeTotalCountSql: paginationParameters.TotalCount,
+            Mode: foldedMode.Mode,
             Authorization: authorization
         );
         var sqlPlan = _sqlCompiler.Compile(pageQuerySpec);
@@ -79,18 +149,19 @@ internal sealed class DescriptorQueryPageKeysetPlanner(SqlDialect dialect)
             resourceKeyId,
             preprocessingResult.QueryElementsInOrder,
             parameterNamesByIndex,
-            paginationParameters,
+            foldedMode,
             authorization,
-            changeVersionRange
+            windowPredicateRange
         );
 
-        return new PageKeysetSpec.Query(sqlPlan, parameterValues);
+        return new CandidateQueryPlan(sqlPlan, parameterValues, foldedMode.OrderingMode);
     }
 
     /// <summary>
-    /// Appends <c>dms.Document.ContentVersion</c> range predicates for the validated change-version
-    /// window. The DMS-1173 stamping triggers keep the descriptor mirror in lock-step, so filtering
-    /// the canonical document column is equivalent and stays on the page keyset root.
+    /// Appends <c>ContentVersion</c> range predicates for the validated change-version window
+    /// against the page keyset root. The root is <c>dms.Descriptor</c>, whose ContentVersion
+    /// mirror the DMS-1173 stamping triggers keep in lock-step with the canonical
+    /// <c>dms.Document.ContentVersion</c> — the same root-mirror filtering regular resources use.
     /// </summary>
     private static void AppendChangeVersionPredicates(
         ChangeVersionRange? changeVersionRange,
@@ -158,8 +229,11 @@ internal sealed class DescriptorQueryPageKeysetPlanner(SqlDialect dialect)
 
         return queryElement.SupportedField.ValueKind switch
         {
+            // The ?id= filter targets dms.Document.DocumentUuid, which is not on the
+            // dms.Descriptor root, so the DocumentUuid target makes the compiler emit the
+            // shared document join.
             DescriptorQueryValueKind.DocumentUuid => new QueryValuePredicate(
-                _documentUuidColumn,
+                new QueryPredicateTarget.DocumentUuid(),
                 QueryComparisonOperator.Equal,
                 parameterName
             ),
@@ -191,8 +265,9 @@ internal sealed class DescriptorQueryPageKeysetPlanner(SqlDialect dialect)
                     + $"'{supportedField.QueryFieldName}' with value kind '{supportedField.ValueKind}'."
             );
 
+        // Descriptor columns live on the dms.Descriptor page keyset root itself.
         return new QueryValuePredicate(
-            new QueryPredicateTarget.DescriptorColumn(descriptorColumn),
+            descriptorColumn,
             QueryComparisonOperator.Equal,
             parameterName,
             scalarKind
@@ -228,7 +303,7 @@ internal sealed class DescriptorQueryPageKeysetPlanner(SqlDialect dialect)
         short resourceKeyId,
         IReadOnlyList<PreprocessedDescriptorQueryElement> queryElementsInOrder,
         IReadOnlyList<string> parameterNamesByIndex,
-        PaginationParameters paginationParameters,
+        PlannedCandidateMode plannedMode,
         PageDocumentIdAuthorizationSpec? authorization,
         ChangeVersionRange? changeVersionRange
     )
@@ -236,9 +311,12 @@ internal sealed class DescriptorQueryPageKeysetPlanner(SqlDialect dialect)
         Dictionary<string, object?> parameterValues = new(StringComparer.Ordinal)
         {
             [ResourceKeyIdParameterName] = resourceKeyId,
-            [OffsetParameterName] = (long)(paginationParameters.Offset ?? 0),
-            [LimitParameterName] = (long)(paginationParameters.Limit ?? paginationParameters.MaximumPageSize),
         };
+
+        foreach (var (parameterName, parameterValue) in plannedMode.ParameterValues)
+        {
+            parameterValues[parameterName] = parameterValue;
+        }
 
         if (changeVersionRange?.MinChangeVersion is { } minChangeVersion)
         {
@@ -274,9 +352,15 @@ internal sealed class DescriptorQueryPageKeysetPlanner(SqlDialect dialect)
         return parameterValues;
     }
 
+    /// <summary>
+    /// Allocates filter parameter names, reserving only the names the active candidate mode actually
+    /// emits. Reserving another mode's names would suffix a filter parameter over a collision this
+    /// query does not have, which would move the SQL of a mode that has no stake in the name.
+    /// </summary>
     private static IReadOnlyList<string> DeriveParameterNames(
         IReadOnlyList<PreprocessedDescriptorQueryElement> queryElementsInOrder,
-        PageDocumentIdAuthorizationSpec? authorization
+        PageDocumentIdAuthorizationSpec? authorization,
+        IReadOnlyList<string> modeOwnedParameterNames
     )
     {
         var seeds = queryElementsInOrder
@@ -300,8 +384,7 @@ internal sealed class DescriptorQueryPageKeysetPlanner(SqlDialect dialect)
             seeds,
             [
                 ResourceKeyIdParameterName,
-                OffsetParameterName,
-                LimitParameterName,
+                .. modeOwnedParameterNames,
                 MinChangeVersionParameterName,
                 MaxChangeVersionParameterName,
                 .. QueryParameterNameAllocator.CollectAuthorizationParameterNames(authorization),

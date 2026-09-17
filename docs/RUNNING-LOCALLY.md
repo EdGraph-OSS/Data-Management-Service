@@ -40,6 +40,41 @@ different supported version, pass `-DataStandardVersion` (e.g. `6.1`) to
 [Data Standard Versions](./DATA-STANDARD-VERSIONS.md) for how version selection
 works and how to add or drop a version.
 
+## Running the Configuration Service
+
+The shipped `appsettings.json` for the Configuration Service leaves
+`DatabaseSettings:EncryptionKey` blank, and the service refuses to start until it
+is supplied. `IdentitySettings:ClientSecret` and `IdentitySettings:EncryptionKey`
+are blank as well; the service starts without those, but a blank `ClientSecret`
+makes it answer every request with a configuration report, and a blank
+`IdentitySettings:EncryptionKey` fails the first token request. Copy the starter
+file and adjust it for your machine:
+
+```shell
+# From base directory
+cd src/config/frontend/EdFi.DmsConfigurationService.Frontend.AspNetCore
+cp appsettings.Development.json.example appsettings.Development.json
+cd ../../../../
+./build-config.ps1 build
+./build-config.ps1 run
+```
+
+If you already have an `appsettings.Development.json`, add the missing values to
+it instead of copying over it. Replacing the file changes the derived encryption
+key, which orphans any connection strings already stored in your local
+Configuration Service database.
+
+`appsettings.Development.json` is gitignored, so the values stay on your
+machine. `DatabaseSettings:EncryptionKey` must be at least 32 ASCII characters;
+only the first 32 contribute to the AES-256 key that protects stored connection
+strings. The starter file uses the same value as the `eng/docker-compose`
+environment files, so a locally run
+Configuration Service and a Compose stack can read each other's encrypted
+connection strings. Replace it for any real deployment — see
+[Configuration](./CONFIGURATION.md#configurationservicesettings) for the full
+rules, and for what to do after changing a key that already has data encrypted
+under it.
+
 ## Running the EdFi.DataManagementService.Backend.Postgresql.Test.Integration
 
 To run the integration tests locally, execute the following command in a PowerShell
@@ -89,7 +124,7 @@ host port `14333` avoids collisions with a developer SQL Server on the default
 port:
 
 ```powershell
-docker run --name dms-mssql-integration -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='EdFi_Dms1!' -p 14333:1433 -d mcr.microsoft.com/mssql/server:2022-latest
+docker run --name dms-mssql-integration-2025 -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='EdFi_Dms1!' -p 14333:1433 -d mcr.microsoft.com/mssql/server:2025-latest
 $env:ConnectionStrings__MssqlAdmin = "Server=localhost,14333;User Id=sa;Password=EdFi_Dms1!;TrustServerCertificate=true"
 ```
 
@@ -100,12 +135,16 @@ skipping. Check the endpoint before treating the test failure as product code:
 ```powershell
 Get-ChildItem Env:ConnectionStrings__MssqlAdmin -ErrorAction SilentlyContinue
 Test-NetConnection -ComputerName localhost -Port 14333
-docker ps --filter name=dms-mssql-integration
-docker logs dms-mssql-integration --tail 80
+docker ps --filter name=dms-mssql-integration-2025
+docker logs dms-mssql-integration-2025 --tail 80
 ```
 
 If the named container already exists, restart it with
-`docker start dms-mssql-integration`. If `14333` is busy, map another host port
+`docker start dms-mssql-integration-2025`.
+The version-suffixed name keeps SQL Server 2025 separate from any `dms-mssql-integration` container created from the earlier SQL Server 2022 instructions.
+Do not reuse that legacy container: it still runs SQL Server 2022, so tests gated on SQL Server 2025 (such as the native-json evaluation fixture) silently skip.
+Remove it with `docker rm -f dms-mssql-integration` once anything you need from it is saved.
+If `14333` is busy, map another host port
 and use that port in `ConnectionStrings__MssqlAdmin`.
 
 ### Run
@@ -126,56 +165,37 @@ local setups still produce a useful test run.
 
 ## Running Unit Tests and Generate Code Coverage Report
 
-> [!CAUTION]
-> The DMS unit tests include code coverage analysis, which requires installation
-> of two additional tools:
+> [!NOTE]
+> The coverage tooling (ReportGenerator) is pinned in the repository tool
+> manifest (`.config/dotnet-tools.json`), so restore it once per clone:
 >
 > ```shell
-> dotnet tool install --global coverlet.console
-> dotnet tool install --global dotnet-reportgenerator-globaltool
+> dotnet tool restore
 > ```
 
-To run the unit tests locally, execute the following command in a PowerShell
-terminal:
+The unit test command runs the compiled assemblies without building them, so
+build first, then run the tests, in a PowerShell terminal:
 
 ```shell
 # From base directory
+./build-dms.ps1 Build -Configuration Debug
 ./build-dms.ps1 UnitTest -Configuration Debug
 ```
 
-The previous command should generate two files in the base directory, which
-contain all the merged results from the unit tests execution.
-
-```none
-coverage.cobertura.xml
-coverage.json
-```
+`UnitTest` runs every `*.Tests.Unit` project in a single `dotnet test` pass
+with the XPlat Code Coverage collector, merges the per-project results with
+ReportGenerator, and writes the merged Cobertura report to
+`coverage.cobertura.xml` in the base directory. The command fails if the merged
+`line` or `branch` coverage total falls below the threshold (currently 58%).
 
 After completing the Unit Tests execution, run the following command to generate
-the HTML coverage report.
+the HTML coverage report from the merged file.
 
 ```shell
 # From base directory
-reportgenerator -reports:"coverage.cobertura.xml" -targetdir:"coveragereport" -reporttypes:Html
+./build-dms.ps1 Coverage
 ```
 
-A Coverage Report folder will be created. Open that folder and look for the
+A `coveragereport` folder will be created. Open that folder and look for the
 index.html file, which should contain a detailed report with the coverage
 results.
-
-### Coverlet Parameters
-
-We are currently evaluating `line` and `branch` metrics from the Total
-coverage. If the total coverage is less than our threshold, the build will fail.
-
-Total: Ensures the total combined coverage result of all modules isn't less than
-the threshold
-
-```none
-    --threshold-type line
-    --threshold-type branch
-    --threshold-stat total
-```
-
-To evaluate coverage by modules, we need to remove the `--threshold-stat total`
-option. This will compare the threshold value by `line` and `branch` instead.

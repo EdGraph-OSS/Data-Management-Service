@@ -30,6 +30,7 @@ using FluentValidation;
 using FluentValidation.AspNetCore;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
 using Serilog;
@@ -80,7 +81,12 @@ public static class WebApplicationBuilderExtensions
                 ClientSecretValidationOptionsValidator
             >()
             .Configure<ClaimsOptions>(webApplicationBuilder.Configuration.GetSection("ClaimsOptions"))
-            .AddSingleton<IValidateOptions<ClaimsOptions>, ClaimsOptionsValidator>();
+            .AddSingleton<IValidateOptions<ClaimsOptions>, ClaimsOptionsValidator>()
+            .AddSingleton<IValidateOptions<ApplicationLockOptions>, ApplicationLockOptionsValidator>();
+        webApplicationBuilder
+            .Services.AddOptions<ApplicationLockOptions>()
+            .Bind(webApplicationBuilder.Configuration.GetSection("ApplicationLockSettings"))
+            .ValidateOnStart();
         ConfigureDatastore(webApplicationBuilder, logger);
         ConfigureIdentityProvider(webApplicationBuilder, logger);
 
@@ -107,8 +113,12 @@ public static class WebApplicationBuilderExtensions
         >();
         webApplicationBuilder.Services.AddSingleton<IClaimsValidator, ClaimsValidator>();
         webApplicationBuilder.Services.AddSingleton<IClaimsFragmentComposer, ClaimsFragmentComposer>();
-        webApplicationBuilder.Services.AddSingleton<IClaimsDataLoader, ClaimsDataLoader>();
-        webApplicationBuilder.Services.AddSingleton<IClaimsUploadService, ClaimsUploadService>();
+        // Scoped, not singleton: both depend (via IClaimSetRepository) on the scoped
+        // ITenantContextProvider below, and a singleton registration fails DI scope validation at
+        // startup in the Development environment. Neither holds state of its own — the shared
+        // in-memory claims state lives in the singleton IClaimsProvider.
+        webApplicationBuilder.Services.AddScoped<IClaimsDataLoader, ClaimsDataLoader>();
+        webApplicationBuilder.Services.AddScoped<IClaimsUploadService, ClaimsUploadService>();
         webApplicationBuilder.Services.AddSingleton<
             IConnectionStringEncryptionService,
             ConnectionStringEncryptionService
@@ -122,12 +132,11 @@ public static class WebApplicationBuilderExtensions
 
         Serilog.ILogger ConfigureLogging()
         {
-            var logger = new LoggerConfiguration()
-                .ReadFrom.Configuration(webApplicationBuilder.Configuration)
-                .Enrich.FromLogContext()
-                .CreateLogger();
+            var logger = LoggingConfigurator.ConfigureLogging(webApplicationBuilder.Configuration);
             webApplicationBuilder.Logging.ClearProviders();
-            webApplicationBuilder.Logging.AddSerilog(logger);
+            // dispose: true so host shutdown disposes the logger and flushes the OTLP sink's
+            // pending batch; without it, buffered events are dropped on exit.
+            webApplicationBuilder.Logging.AddSerilog(logger, dispose: true);
 
             return logger;
         }
@@ -138,13 +147,13 @@ public static class WebApplicationBuilderExtensions
         // Common service registration for all database backends
         webAppBuilder.Services.AddSingleton<IClaimsProvider, ClaimsProvider>();
 
-        if (
-            string.Equals(
-                webAppBuilder.Configuration.GetSection("AppSettings:Datastore").Value,
-                "postgresql",
-                StringComparison.OrdinalIgnoreCase
-            )
-        )
+        bool usePostgresql = string.Equals(
+            webAppBuilder.Configuration.GetSection("AppSettings:Datastore").Value,
+            "postgresql",
+            StringComparison.OrdinalIgnoreCase
+        );
+
+        if (usePostgresql)
         {
             logger.Information("Injecting PostgreSQL as the primary backend datastore");
             webAppBuilder.Services.AddPostgresqlDatastore(
@@ -152,10 +161,12 @@ public static class WebApplicationBuilderExtensions
                     ?? string.Empty
             );
             webAppBuilder.Services.AddSingleton<IDatabaseDeploy, Backend.Postgresql.Deploy.DatabaseDeploy>();
+            webAppBuilder.Services.AddPostgresqlApplicationLockManager();
             webAppBuilder.Services.AddTransient<IApplicationRepository, ApplicationRepository>();
             webAppBuilder.Services.AddTransient<IApiClientRepository, ApiClientRepository>();
             webAppBuilder.Services.AddTransient<IClaimsHierarchyRepository, ClaimsHierarchyRepository>();
             webAppBuilder.Services.AddTransient<IVendorRepository, VendorRepository>();
+            webAppBuilder.Services.AddTransient<IOwnershipTokenRepository, OwnershipTokenRepository>();
             webAppBuilder.Services.AddTransient<
                 IClaimSetDataProvider,
                 Backend.Postgresql.ClaimSetDataProvider
@@ -187,10 +198,36 @@ public static class WebApplicationBuilderExtensions
             webAppBuilder.Services.AddSingleton<IDatabaseDeploy, Backend.Mssql.Deploy.DatabaseDeploy>();
         }
 
+        AddDataStoreConnectionStringValidator(webAppBuilder.Services, usePostgresql);
+
         // Token management and client-secret hashing are datastore-agnostic and required
         // by both engines
         webAppBuilder.Services.AddTransient<ITokenManager, OpenIddictTokenManager>();
         webAppBuilder.Services.AddSingleton<IClientSecretHasher, ClientSecretHasher>();
+    }
+
+    /// <summary>
+    /// The one place that decides which engine a submitted data store connection string is validated
+    /// against. It follows the configured datastore because that is the engine this deployment runs,
+    /// and it is a single seam: a setting that names the target provider per data store replaces this
+    /// method and nothing else.
+    /// </summary>
+    private static void AddDataStoreConnectionStringValidator(IServiceCollection services, bool usePostgresql)
+    {
+        if (usePostgresql)
+        {
+            services.AddSingleton<
+                IDataStoreConnectionStringValidator,
+                PostgresqlDataStoreConnectionStringValidator
+            >();
+        }
+        else
+        {
+            services.AddSingleton<
+                IDataStoreConnectionStringValidator,
+                MssqlDataStoreConnectionStringValidator
+            >();
+        }
     }
 
     private static void ConfigureIdentityProvider(
@@ -341,6 +378,11 @@ public static class WebApplicationBuilderExtensions
                     identitySettings.Authority
                 );
             }
+
+            // Expired-token cleanup applies to both database engines above; the OpenIddict token
+            // store is not exposed through Keycloak, so this hosted service has no role there.
+            webApplicationBuilder.Services.TryAddSingleton(TimeProvider.System);
+            webApplicationBuilder.Services.AddHostedService<TokenCleanupService>();
         }
         else // Default to Keycloak
         {

@@ -5,14 +5,12 @@
 
 using System.Globalization;
 using System.Text.Json.Nodes;
-using EdFi.DataManagementService.Backend.External;
 
 namespace EdFi.DataManagementService.Backend;
 
 internal static class DescriptorDocumentMaterializer
 {
     private const string DateOnlyFormat = "yyyy-MM-dd";
-    private const string LastModifiedDateFormat = "yyyy-MM-ddTHH:mm:ss'Z'";
     private const string IdPropertyName = "id";
     private const string EtagPropertyName = "_etag";
     private const string LastModifiedDatePropertyName = "_lastModifiedDate";
@@ -20,13 +18,13 @@ internal static class DescriptorDocumentMaterializer
     /// <summary>
     /// Materializes a descriptor document. <paramref name="composedEtag"/> must be the fully composed
     /// served <c>_etag</c> string (see <see cref="EdFi.DataManagementService.Backend.Etag.IServedEtagComposer"/>)
-    /// for <see cref="RelationalGetRequestReadMode.ExternalResponse"/> reads; the caller decides the
+    /// for <see cref="RelationalReadMaterializationMode.ExternalResponse"/> reads; the caller decides the
     /// profile-sensitivity of that value, so this materializer performs no etag composition itself. Ignored
-    /// (and may be <see langword="null"/>) for <see cref="RelationalGetRequestReadMode.StoredDocument"/> reads.
+    /// (and may be <see langword="null"/>) for stored-document and cache-projection reads.
     /// </summary>
     public static JsonObject Materialize(
         DescriptorReadRow descriptorRow,
-        RelationalGetRequestReadMode readMode,
+        RelationalReadMaterializationMode materializationMode,
         string? composedEtag
     )
     {
@@ -34,29 +32,24 @@ internal static class DescriptorDocumentMaterializer
 
         var descriptorBody = BuildDescriptorBody(descriptorRow);
 
-        if (readMode == RelationalGetRequestReadMode.StoredDocument)
+        return materializationMode switch
         {
-            return descriptorBody;
-        }
-
-        if (composedEtag is null)
-        {
-            throw new InvalidOperationException(
-                "Descriptor external response materialization requires a composed etag."
-            );
-        }
-
-        var externalResponse = (JsonObject)descriptorBody.DeepClone();
-
-        externalResponse[IdPropertyName] = descriptorRow.DocumentUuid.ToString();
-        externalResponse[EtagPropertyName] = composedEtag;
-        externalResponse[LastModifiedDatePropertyName] =
-            descriptorRow.ContentLastModifiedAt.UtcDateTime.ToString(
-                LastModifiedDateFormat,
-                CultureInfo.InvariantCulture
-            );
-
-        return externalResponse;
+            RelationalReadMaterializationMode.StoredDocument => descriptorBody,
+            RelationalReadMaterializationMode.ExternalResponse => InjectExternalResponseMetadata(
+                descriptorBody,
+                descriptorRow,
+                composedEtag
+            ),
+            RelationalReadMaterializationMode.CacheProjection => InjectCacheProjectionMetadata(
+                descriptorBody,
+                descriptorRow
+            ),
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(materializationMode),
+                materializationMode,
+                "Unsupported descriptor read materialization mode."
+            ),
+        };
     }
 
     private static JsonObject BuildDescriptorBody(DescriptorReadRow descriptorRow)
@@ -91,4 +84,39 @@ internal static class DescriptorDocumentMaterializer
 
         return descriptorBody;
     }
+
+    private static JsonObject InjectExternalResponseMetadata(
+        JsonObject descriptorBody,
+        DescriptorReadRow descriptorRow,
+        string? composedEtag
+    )
+    {
+        if (composedEtag is null)
+        {
+            throw new InvalidOperationException(
+                "Descriptor external response materialization requires a composed etag."
+            );
+        }
+
+        descriptorBody[IdPropertyName] = descriptorRow.DocumentUuid.ToString();
+        descriptorBody[EtagPropertyName] = composedEtag;
+        descriptorBody[LastModifiedDatePropertyName] = FormatLastModifiedDate(descriptorRow);
+
+        return descriptorBody;
+    }
+
+    private static JsonObject InjectCacheProjectionMetadata(
+        JsonObject descriptorBody,
+        DescriptorReadRow descriptorRow
+    )
+    {
+        descriptorBody[IdPropertyName] = descriptorRow.DocumentUuid.ToString();
+        descriptorBody[LastModifiedDatePropertyName] = FormatLastModifiedDate(descriptorRow);
+        descriptorBody.Remove(EtagPropertyName);
+
+        return descriptorBody;
+    }
+
+    private static string FormatLastModifiedDate(DescriptorReadRow descriptorRow) =>
+        LastModifiedDateFormatter.Format(descriptorRow.ContentLastModifiedAt);
 }

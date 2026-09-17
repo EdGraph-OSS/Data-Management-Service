@@ -1119,13 +1119,14 @@ public static class DocumentReconstituter
         );
     }
 
+    // Reconstitution-only placeholder for callers that already have raw rows but no hydrated
+    // document metadata result set. Real hydration must supply ResourceKeyId through HydrationReader.
     private static DocumentMetadataRow CreatePlaceholderDocumentMetadataRow(long documentId) =>
         new(
             DocumentId: documentId,
             DocumentUuid: Guid.Empty,
             ContentVersion: 0L,
-            IdentityVersion: 0L,
             ContentLastModifiedAt: DateTimeOffset.UnixEpoch,
-            IdentityLastModifiedAt: DateTimeOffset.UnixEpoch
+            ResourceKeyId: 0
         );
 }

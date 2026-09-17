@@ -63,6 +63,48 @@ public class Given_RequestResponseLoggingMiddleware
     }
 
     [Test]
+    public async Task It_logs_the_real_verb_of_an_unsupported_method_request()
+    {
+        var requestInfo = No.RequestInfo("core-trace-id");
+        requestInfo.FrontendRequest = requestInfo.FrontendRequest with { Path = "/ed-fi/schools" };
+        requestInfo.Method = RequestMethod.UNSUPPORTED;
+        requestInfo.UnsupportedMethodName = "PATCH";
+        requestInfo.FrontendResponse = new FrontendResponse(405, Body: null, Headers: []);
+
+        await _middleware.Execute(requestInfo, TestHelper.NullNext);
+
+        // Operators search logs by HTTP verb, so the enum member name must never reach the log.
+        var record = _logger.Records.Single(log => log.EventId.Name == "HttpRequestCompleted");
+        record.Properties.Should().Contain("Method", "PATCH");
+        record.Properties.Should().NotContain("Method", "UNSUPPORTED");
+        var scope = record.ActiveScopes.Single();
+        scope.Should().Contain("Method", "PATCH");
+        _logger
+            .Records.Should()
+            .ContainSingle(log =>
+                log.Level == LogLevel.Debug
+                && log.Message == "Core pipeline started: PATCH /ed-fi/schools - TraceId: core-trace-id"
+            );
+    }
+
+    [Test]
+    public async Task It_sanitizes_the_client_supplied_method_name_of_an_unsupported_method_request()
+    {
+        var requestInfo = No.RequestInfo("core-trace-id");
+        requestInfo.FrontendRequest = requestInfo.FrontendRequest with { Path = "/ed-fi/schools" };
+        requestInfo.Method = RequestMethod.UNSUPPORTED;
+        requestInfo.UnsupportedMethodName = "PAT\r\nCH{unsafe}";
+        requestInfo.FrontendResponse = new FrontendResponse(405, Body: null, Headers: []);
+
+        await _middleware.Execute(requestInfo, TestHelper.NullNext);
+
+        // The method name is client-supplied on this path, so it must keep flowing through
+        // LoggingSanitizer rather than around it.
+        var record = _logger.Records.Single(log => log.EventId.Name == "HttpRequestCompleted");
+        record.Properties.Should().Contain("Method", "PATCHunsafe");
+    }
+
+    [Test]
     public async Task It_logs_request_start_as_debug_breadcrumb_only()
     {
         var requestInfo = No.RequestInfo("core-trace-id");
@@ -117,6 +159,26 @@ public class Given_RequestResponseLoggingMiddleware
     }
 
     [Test]
+    public async Task It_propagates_request_cancellation_without_failure_logging_or_wrapping()
+    {
+        using var cancellationSource = new CancellationTokenSource();
+        await cancellationSource.CancelAsync();
+        var requestInfo = No.RequestInfo("core-trace-id");
+        requestInfo.RequestCancellationToken = cancellationSource.Token;
+        requestInfo.FrontendRequest = requestInfo.FrontendRequest with { Path = "/ed-fi/students" };
+
+        Func<Task> act = async () =>
+            await _middleware.Execute(
+                requestInfo,
+                () => throw new OperationCanceledException(cancellationSource.Token)
+            );
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
+        _logger.Records.Should().NotContain(log => log.EventId.Name == "HttpRequestFailed");
+        _logger.Records.Should().NotContain(log => log.EventId.Name == "HttpRequestCompleted");
+    }
+
+    [Test]
     public async Task It_logs_5xx_responses_as_request_failures()
     {
         var requestInfo = No.RequestInfo("core-trace-id");
@@ -144,7 +206,7 @@ public class Given_RequestResponseLoggingMiddleware
         var requestInfo = No.RequestInfo("core-trace-id");
         requestInfo.FrontendRequest = requestInfo.FrontendRequest with { Path = "/ed-fi/students" };
         var requestLogging = new RequestResponseLoggingMiddleware(_logger);
-        var coreExceptionLogging = new CoreExceptionLoggingMiddleware(_logger);
+        var coreExceptionLogging = new CoreExceptionLoggingMiddleware(_logger, null);
 
         await requestLogging.Execute(
             requestInfo,
@@ -171,7 +233,7 @@ public class Given_RequestResponseLoggingMiddleware
         var requestInfo = No.RequestInfo("trace\r\nid\twith{unsafe}");
         requestInfo.FrontendRequest = requestInfo.FrontendRequest with { Path = "/ed-fi/student\r\ns/{id}" };
         var requestLogging = new RequestResponseLoggingMiddleware(_logger);
-        var coreExceptionLogging = new CoreExceptionLoggingMiddleware(_logger);
+        var coreExceptionLogging = new CoreExceptionLoggingMiddleware(_logger, null);
 
         await coreExceptionLogging.Execute(
             requestInfo,

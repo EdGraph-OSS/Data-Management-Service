@@ -3,6 +3,7 @@
 // The Ed-Fi Alliance licenses this file to you under the Apache License, Version 2.0.
 // See the LICENSE and NOTICES files in the project root for more information.
 
+using System.Data;
 using Dapper;
 using EdFi.DmsConfigurationService.Backend.Repositories;
 using EdFi.DmsConfigurationService.Backend.Services;
@@ -36,21 +37,22 @@ public class DataStoreRepository(
         try
         {
             var sql = """
-                INSERT INTO dmscs.DataStore (DataStoreType, Name, ConnectionString, CreatedBy, TenantId)
+                INSERT INTO dmscs.DataStore (DataStoreType, Name, Provider, ConnectionString, CreatedBy, TenantId)
                 OUTPUT INSERTED.Id
-                VALUES (@DataStoreType, @Name, @ConnectionString, @CreatedBy, @TenantId);
+                VALUES (@DataStoreType, @Name, @Provider, @ConnectionString, @CreatedBy, @TenantId);
                 """;
 
             var parameters = new
             {
                 command.DataStoreType,
                 command.Name,
+                command.Provider,
                 ConnectionString = encryptionService.Encrypt(command.ConnectionString),
                 CreatedBy = auditContext.GetCurrentUser(),
                 TenantId,
             };
 
-            var id = await connection.ExecuteScalarAsync<long>(sql, parameters);
+            var id = await connection.ExecuteScalarAsync<int>(sql, parameters);
             return new DataStoreInsertResult.Success(id);
         }
         catch (Exception ex)
@@ -105,7 +107,7 @@ public class DataStoreRepository(
             string orderByClause = BuildOrderByClause(query);
             string filterClause = BuildFilterClause(query);
             var sql = $"""
-                SELECT Id, DataStoreType, Name, ConnectionString, TenantId
+                SELECT Id, DataStoreType, Name, Provider, ConnectionString, TenantId
                 FROM dmscs.DataStore
                 WHERE {TenantContext.TenantWhereClause()}{filterClause}
                 {orderByClause}
@@ -113,9 +115,10 @@ public class DataStoreRepository(
                 """;
 
             var results = await connection.QueryAsync<(
-                long Id,
+                int Id,
                 string DataStoreType,
                 string Name,
+                string? Provider,
                 byte[]? ConnectionString,
                 long? TenantId
             )>(
@@ -155,7 +158,7 @@ public class DataStoreRepository(
                                 ))
                                 .ToList()
                     ),
-                _ => new Dictionary<long, List<DataStoreContextItem>>(),
+                _ => new Dictionary<int, List<DataStoreContextItem>>(),
             };
 
             var derivativesResult = await derivativeRepository.GetDataStoreDerivativesByDataStoreIds(
@@ -176,7 +179,7 @@ public class DataStoreRepository(
                                 ))
                                 .ToList()
                     ),
-                _ => new Dictionary<long, List<DataStoreDerivativeItem>>(),
+                _ => new Dictionary<int, List<DataStoreDerivativeItem>>(),
             };
 
             var dataStores = dataStoreList.Select(row => new DataStoreResponse
@@ -184,6 +187,7 @@ public class DataStoreRepository(
                 Id = row.Id,
                 DataStoreType = row.DataStoreType,
                 Name = row.Name,
+                Provider = row.Provider,
                 ConnectionString = row.ConnectionString is null
                     ? null
                     : Convert.ToBase64String(row.ConnectionString),
@@ -200,21 +204,22 @@ public class DataStoreRepository(
         }
     }
 
-    public async Task<DataStoreGetResult> GetDataStore(long id)
+    public async Task<DataStoreGetResult> GetDataStore(int id)
     {
         await using var connection = new SqlConnection(databaseOptions.Value.DatabaseConnection);
         try
         {
             var sql = $"""
-                SELECT Id, DataStoreType, Name, ConnectionString, TenantId
+                SELECT Id, DataStoreType, Name, Provider, ConnectionString, TenantId
                 FROM dmscs.DataStore
                 WHERE Id = @Id AND {TenantContext.TenantWhereClause()};
                 """;
 
             var result = await connection.QuerySingleOrDefaultAsync<(
-                long Id,
+                int Id,
                 string DataStoreType,
                 string Name,
+                string? Provider,
                 byte[]? ConnectionString,
                 long? TenantId
             )?>(sql, new { Id = id, TenantId });
@@ -254,6 +259,7 @@ public class DataStoreRepository(
                 Id = result.Value.Id,
                 DataStoreType = result.Value.DataStoreType,
                 Name = result.Value.Name,
+                Provider = result.Value.Provider,
                 ConnectionString = result.Value.ConnectionString is null
                     ? null
                     : Convert.ToBase64String(result.Value.ConnectionString),
@@ -275,23 +281,46 @@ public class DataStoreRepository(
         await using var connection = new SqlConnection(databaseOptions.Value.DatabaseConnection);
         try
         {
+            bool preserveConnectionString = ConnectionStringWrite.PreservesExistingValue(
+                command.ConnectionString
+            );
+
+            // Left out of the SET clause when the caller provided no connection string, so the row
+            // keeps the cipher text a reader can still decrypt.
+            string connectionStringAssignment = preserveConnectionString
+                ? string.Empty
+                : "ConnectionString = @ConnectionString, ";
+
             var sql = $"""
                 UPDATE dmscs.DataStore
-                SET DataStoreType = @DataStoreType, Name = @Name, ConnectionString = @ConnectionString,
+                SET DataStoreType = @DataStoreType, Name = @Name,
+                    Provider = COALESCE(@Provider, Provider), {connectionStringAssignment}
                     LastModifiedAt = @LastModifiedAt, ModifiedBy = @ModifiedBy
                 WHERE Id = @Id AND {TenantContext.TenantWhereClause()};
                 """;
 
-            var parameters = new
+            var parameters = new DynamicParameters(
+                new
+                {
+                    command.Id,
+                    command.DataStoreType,
+                    command.Name,
+                    command.Provider,
+                    LastModifiedAt = auditContext.GetCurrentTimestamp(),
+                    ModifiedBy = auditContext.GetCurrentUser(),
+                    TenantId,
+                }
+            );
+
+            if (!preserveConnectionString)
             {
-                command.Id,
-                command.DataStoreType,
-                command.Name,
-                ConnectionString = encryptionService.Encrypt(command.ConnectionString),
-                LastModifiedAt = auditContext.GetCurrentTimestamp(),
-                ModifiedBy = auditContext.GetCurrentUser(),
-                TenantId,
-            };
+                // Typed explicitly: a null byte[] carries no type the provider can infer.
+                parameters.Add(
+                    "ConnectionString",
+                    encryptionService.Encrypt(command.ConnectionString),
+                    DbType.Binary
+                );
+            }
 
             var affectedRows = await connection.ExecuteAsync(sql, parameters);
             if (affectedRows == 0)
@@ -307,7 +336,7 @@ public class DataStoreRepository(
         }
     }
 
-    public async Task<DataStoreDeleteResult> DeleteDataStore(long id)
+    public async Task<DataStoreDeleteResult> DeleteDataStore(int id)
     {
         await using var connection = new SqlConnection(databaseOptions.Value.DatabaseConnection);
         try
@@ -328,7 +357,7 @@ public class DataStoreRepository(
         }
     }
 
-    public async Task<DataStoreIdsExistResult> GetExistingDataStoreIds(long[] ids)
+    public async Task<DataStoreIdsExistResult> GetExistingDataStoreIds(int[] ids)
     {
         if (ids.Length == 0)
         {
@@ -344,7 +373,7 @@ public class DataStoreRepository(
                 WHERE Id IN @Ids AND {TenantContext.TenantWhereClause()};
                 """;
 
-            var existingIds = await connection.QueryAsync<long>(sql, new { Ids = ids, TenantId });
+            var existingIds = await connection.QueryAsync<int>(sql, new { Ids = ids, TenantId });
             return new DataStoreIdsExistResult.Success([.. existingIds]);
         }
         catch (Exception ex)
@@ -355,7 +384,7 @@ public class DataStoreRepository(
     }
 
     public async Task<ApplicationByDataStoreQueryResult> QueryApplicationByDataStore(
-        long dataStoreId,
+        int dataStoreId,
         PagingQuery query
     )
     {
@@ -396,13 +425,13 @@ public class DataStoreRepository(
             };
 
             var rows = await connection.QueryAsync<(
-                long Id,
+                int Id,
                 string ApplicationName,
                 string ClaimSetName,
-                long VendorId,
+                int VendorId,
                 bool Enabled,
                 long? EducationOrganizationId,
-                long DataStoreId
+                int DataStoreId
             )>(sql, parameters);
 
             var applications = rows.GroupBy(row => row.Id)
@@ -437,7 +466,7 @@ public class DataStoreRepository(
                         WHERE ap.ApplicationId IN @ApplicationIds;
                     """;
 
-                var profileRows = await connection.QueryAsync<(long ApplicationId, long ProfileId)>(
+                var profileRows = await connection.QueryAsync<(int ApplicationId, int ProfileId)>(
                     sqlProfiles,
                     new { ApplicationIds = applicationIds }
                 );

@@ -12,6 +12,7 @@ This document is the data-model deep dive for `overview.md`.
 - Extensions: [extensions.md](extensions.md)
 - Transactions, concurrency, and cascades: [transactions-and-concurrency.md](transactions-and-concurrency.md)
 - DDL Generation: [ddl-generation.md](ddl-generation.md)
+- Natural-key reference resolution: [natural-key-resolution.md](natural-key-resolution.md)
 - Strengths and risks: [strengths-risks.md](strengths-risks.md)
 
 ## Table of Contents
@@ -31,7 +32,7 @@ This document is the data-model deep dive for `overview.md`.
 
 Lookup table mapping `(ProjectName, ResourceName)` to a small surrogate id (`ResourceKeyId`) used in high-churn core tables.
 
-This reduces row width and index bloat (especially in `dms.Document` and `dms.ReferentialIdentity`) while keeping names available via join when needed for diagnostics.
+This reduces row width and index bloat while keeping names available via join when needed for diagnostics.
 
 Population/seeding:
 
@@ -85,17 +86,13 @@ CREATE TABLE dms.Document (
     -- Update tracking tokens (see reference/design/backend-redesign/design-docs/update-tracking.md)
     -- Note: emitted DDL must create dms.ChangeVersionSequence before dms.Document.
     ContentVersion bigint NOT NULL DEFAULT nextval('dms.ChangeVersionSequence'),
-    IdentityVersion bigint NOT NULL DEFAULT nextval('dms.ChangeVersionSequence'),
     ContentLastModifiedAt timestamp with time zone NOT NULL DEFAULT now(),
-    IdentityLastModifiedAt timestamp with time zone NOT NULL DEFAULT now(),
 
     CreatedAt timestamp with time zone NOT NULL DEFAULT now(),
 
-    CONSTRAINT UX_Document_DocumentUuid UNIQUE (DocumentUuid)
+    CONSTRAINT UX_Document_DocumentUuid UNIQUE (DocumentUuid),
+    CONSTRAINT UX_Document_DocumentId_ResourceKeyId UNIQUE (DocumentId, ResourceKeyId)
 );
-
-CREATE INDEX IX_Document_ResourceKeyId_DocumentId
-    ON dms.Document (ResourceKeyId, DocumentId);
 
 CREATE INDEX IX_Document_CreatedByOwnershipTokenId
     ON dms.Document (CreatedByOwnershipTokenId);
@@ -118,19 +115,15 @@ CREATE TABLE dms.Document (
     -- Update tracking tokens (see reference/design/backend-redesign/design-docs/update-tracking.md)
     -- Note: emitted DDL must create dms.ChangeVersionSequence before dms.Document.
     ContentVersion bigint NOT NULL CONSTRAINT DF_Document_ContentVersion DEFAULT (NEXT VALUE FOR dms.ChangeVersionSequence),
-    IdentityVersion bigint NOT NULL CONSTRAINT DF_Document_IdentityVersion DEFAULT (NEXT VALUE FOR dms.ChangeVersionSequence),
     ContentLastModifiedAt datetime2(7) NOT NULL CONSTRAINT DF_Document_ContentLastModifiedAt DEFAULT (sysutcdatetime()),
-    IdentityLastModifiedAt datetime2(7) NOT NULL CONSTRAINT DF_Document_IdentityLastModifiedAt DEFAULT (sysutcdatetime()),
 
     CreatedAt datetime2(7) NOT NULL CONSTRAINT DF_Document_CreatedAt DEFAULT (sysutcdatetime()),
 
     CONSTRAINT UX_Document_DocumentUuid UNIQUE (DocumentUuid),
+    CONSTRAINT UX_Document_DocumentId_ResourceKeyId UNIQUE (DocumentId, ResourceKeyId),
     CONSTRAINT FK_Document_ResourceKey FOREIGN KEY (ResourceKeyId)
         REFERENCES dms.ResourceKey (ResourceKeyId)
 );
-
-CREATE INDEX IX_Document_ResourceKeyId_DocumentId
-    ON dms.Document (ResourceKeyId, DocumentId);
 
 CREATE INDEX IX_Document_CreatedByOwnershipTokenId
     ON dms.Document (CreatedByOwnershipTokenId);
@@ -138,19 +131,23 @@ CREATE INDEX IX_Document_CreatedByOwnershipTokenId
 
 Notes:
 
-- `DocumentUuid` remains stable across identity updates; identity-based upserts map to it via `dms.ReferentialIdentity` for **all** identities (self-contained, reference-bearing, and abstract/superclass aliases), because `dms.ReferentialIdentity` is maintained transactionally (including cascades) on identity changes.
+- `DocumentUuid` remains stable across identity updates. POST upsert detection maps natural identity to the current document through the resource root's generated natural-key probe; reference resolution uses the generated natural-key resolver described in [natural-key-resolution.md](natural-key-resolution.md).
 - `ResourceKeyId` identifies the document’s concrete resource type; use `dms.ResourceKey` for `(ProjectName, ResourceName)` when needed (diagnostics, CDC metadata).
+- `UX_Document_DocumentId_ResourceKeyId` exists only as the parent key for descriptor and abstract identity document/resource invariants. It must not be used as a resource-type scan path; `dms.Document` deliberately carries no `(ResourceKeyId, DocumentId)` index. Descriptor paging — the only query path that filtered documents by resource type — roots on `dms.Descriptor` via its denormalized `ResourceKeyId` (see §2), and every other `ResourceKeyId` filter rides a `DocumentUuid` unique probe. `FK_Document_ResourceKey` needs no referencing-side index either, because `dms.ResourceKey` rows are seeded at provisioning and never deleted or updated at runtime.
+- `dms.Document` has no `(ContentVersion, DocumentId)` projector-discovery index. Durable
+  projection work is paged through `dms.DocumentProjectionWork`; explicit baseline,
+  rebuild, and scrub scans use the `DocumentId` primary-key order.
 - `CreatedByOwnershipTokenId` is stamped from the authenticated client context on create and is used by the ownership-based authorization strategy; it is not client-writable (see [auth.md](auth.md)).
 - Update tracking columns (brief semantics; see `reference/design/backend-redesign/design-docs/update-tracking.md` for the normative rules):
   - `ContentVersion` / `ContentLastModifiedAt`: bump when the document's full resource-state representation changes (local write, or cascaded update to reference-identity storage columns and any dependent generated aliases).
-  - `IdentityVersion` / `IdentityLastModifiedAt`: bump when the document’s identity/URI projection changes (directly or via cascaded updates to identity-component reference identity columns).
-  - API `_lastModifiedDate` and per-item `ChangeVersion` are served from these stored stamps. API `_etag` is composed from `ContentVersion` plus a representation `variantKey` (schema epoch, format, profile code, link flag, and content-coding code); the document body is not hashed for etag construction.
-- Time semantics: store timestamps as UTC instants. In PostgreSQL, use `timestamp with time zone` and format response values as UTC (e.g., `...Z`). In SQL Server, use `datetime2` with UTC writers (e.g., `sysutcdatetime()`).
+  - Identity-projection changes that alter the stored representation are reflected through the same content stamps.
+  - API `_lastModifiedDate` and per-item `ChangeVersion` are served from these stored stamps. `_lastModifiedDate` uses the existing DMS whole-second UTC `yyyy-MM-ddTHH:mm:ssZ` formatter, discarding fractional seconds without rounding. API `_etag` is composed from `ContentVersion` plus a representation `variantKey` (schema epoch, format, profile code, link flag, and content-coding code); the document body is not hashed for etag construction.
+- Time semantics: store timestamps as UTC instants at provider precision. In PostgreSQL, use `timestamp with time zone`; in SQL Server, use `datetime2` with UTC writers (e.g., `sysutcdatetime()`). Public `_lastModifiedDate` formatting is the whole-second UTC representation defined above.
 - Authorization is addressed separately in [auth.md](auth.md).
 
 ##### 1a) `dms.ChangeVersionSequence`
 
-Global monotonic `bigint` sequence used to allocate update tracking stamps (for `ContentVersion` and `IdentityVersion`). See `reference/design/backend-redesign/design-docs/update-tracking.md` for stamping rules.
+Global monotonic `bigint` sequence used to allocate update tracking stamps for `ContentVersion`. See `reference/design/backend-redesign/design-docs/update-tracking.md` for stamping rules.
 
 **PostgreSQL**
 
@@ -186,80 +183,7 @@ CREATE SEQUENCE dms.CollectionItemIdSequence
     INCREMENT BY 1;
 ```
 
-##### 2) `dms.ReferentialIdentity`
-
-Maps `ReferentialId` → `DocumentId` (replaces today’s `dms.Alias`), including superclass aliases used for polymorphic references.
-
-Rationale for retaining `ReferentialId` in this redesign: see [overview.md#Why keep ReferentialId](overview.md#why-keep-referentialid).
-
-`ReferentialId` hash input is always the Core/API `DocumentIdentity` value domain, not the raw relational storage domain.
-For descriptor-valued identity elements, relational tables store `..._DescriptorId` FKs to `dms.Descriptor(DocumentId)`,
-but `dms.ReferentialIdentity` maintenance must hash the normalized descriptor URI (`lower(dms.Descriptor.Uri)`) for that identity element.
-This keeps trigger-computed referential ids aligned with Core descriptor extraction and `ReferentialId` computation,
-where descriptor identity values are lowercased descriptor URIs rather than descriptor document ids.
-This rule applies model-wide to every resource whose natural identity includes a descriptor reference.
-
-**PostgreSQL**
-
-```sql
-CREATE TABLE dms.ReferentialIdentity (
-    ReferentialId uuid NOT NULL,
-    DocumentId bigint NOT NULL,
-    ResourceKeyId smallint NOT NULL REFERENCES dms.ResourceKey (ResourceKeyId),
-    CONSTRAINT PK_ReferentialIdentity PRIMARY KEY (ReferentialId),
-    CONSTRAINT FK_ReferentialIdentity_Document FOREIGN KEY (DocumentId)
-        REFERENCES dms.Document (DocumentId) ON DELETE CASCADE,
-    CONSTRAINT UX_ReferentialIdentity_DocumentId_ResourceKey UNIQUE (DocumentId, ResourceKeyId)
-);
-
-CREATE INDEX IX_ReferentialIdentity_DocumentId ON dms.ReferentialIdentity (DocumentId);
-```
-
-**SQL Server**
-
-```sql
-CREATE TABLE dms.ReferentialIdentity (
-    ReferentialId uniqueidentifier NOT NULL,
-    DocumentId bigint NOT NULL,
-    ResourceKeyId smallint NOT NULL,
-    CONSTRAINT PK_ReferentialIdentity PRIMARY KEY NONCLUSTERED (ReferentialId),
-    CONSTRAINT FK_ReferentialIdentity_Document FOREIGN KEY (DocumentId)
-        REFERENCES dms.Document (DocumentId) ON DELETE CASCADE,
-    CONSTRAINT FK_ReferentialIdentity_ResourceKey FOREIGN KEY (ResourceKeyId)
-        REFERENCES dms.ResourceKey (ResourceKeyId),
-    CONSTRAINT UX_ReferentialIdentity_DocumentId_ResourceKey UNIQUE CLUSTERED (DocumentId, ResourceKeyId)
-);
-```
-
-Database Specific Differences:
-
-- The logical shape is identical across engines (UUID `ReferentialId` → `DocumentId` + `ResourceKeyId`).
-- The physical DDL will differ slightly for performance: SQL Server should not cluster on a randomly-distributed UUID.
-
-Operational considerations:
-
-- `ReferentialId` is a deterministic UUIDv5 and is effectively randomly distributed for index insertion. The primary operational concern is **write amplification** (page splits, fragmentation/bloat), not point-lookup speed.
-- **SQL Server**:
-  - Keep the UUID key as **NONCLUSTERED** (as shown) and use a sequential clustered key (e.g., `(DocumentId, ResourceKeyId)`).
-  - Consider a lower `FILLFACTOR` (e.g., 80–90) on the UUID index to reduce page splits; monitor fragmentation and rebuild/reorganize as needed.
-- **PostgreSQL**:
-  - B-tree point lookups on UUID are fine; manage bloat under high write rates with index/table `fillfactor` (e.g., 80–90), healthy autovacuum settings/monitoring, and periodic `REINDEX` when warranted.
-  - If sustained ingest is extreme, consider hash partitioning `dms.ReferentialIdentity` by `ReferentialId` (e.g., 8–32 partitions) to reduce contention and make maintenance cheaper.
-
-Critical invariants:
-
-- **Uniqueness** of `ReferentialId` enforces “one natural identity maps to one document” for **all** identities (self-contained identities, reference-bearing identities, and descriptor URIs). This requires `dms.ReferentialIdentity` to be maintained transactionally on identity changes, including cascading recompute when upstream identity components change.
-- The resource root table’s natural-key unique constraint (binding/path columns for `identityJsonPaths`, including reference-site `..._DocumentId` and identity-part binding columns) remains a recommended relational guardrail; under key unification, some identity-part binding columns may be generated/persisted aliases of canonical storage columns. Identity-based resolution/upsert uses `dms.ReferentialIdentity`.
-- A document has **at most 2** referential ids:
-  - the **primary** referential id for the document’s concrete `ResourceKeyId` (`(ProjectName, ResourceName)` in `dms.ResourceKey`)
-  - an optional **superclass/abstract alias** referential id for polymorphic references (when `isSubclass: true`) using the superclass/abstract `ResourceKeyId`
-- Subclass writes insert both:
-  - primary `ReferentialId` (subclass resource name)
-  - superclass alias `ReferentialId` (superclass resource name)
-
-This preserves current polymorphic reference behavior without a separate Alias table.
-
-##### 3) `dms.Descriptor` (unified)
+##### 2) `dms.Descriptor` (unified)
 
 Descriptors are still documents, but we maintain a unified descriptor table keyed by the descriptor document’s `DocumentId`. This makes descriptor FK enforcement possible without per-descriptor tables.
 
@@ -268,6 +192,7 @@ Descriptors are still documents, but we maintain a unified descriptor table keye
 ```sql
 CREATE TABLE dms.Descriptor (
     DocumentId bigint NOT NULL,
+    ResourceKeyId smallint NOT NULL,
     Namespace varchar(255) NOT NULL,
     CodeValue varchar(50) NOT NULL,
     ShortDescription varchar(75) NOT NULL,
@@ -276,31 +201,106 @@ CREATE TABLE dms.Descriptor (
     EffectiveEndDate date NULL,
     Discriminator varchar(128) NOT NULL,
     Uri varchar(306) NOT NULL,
+    ContentVersion bigint NOT NULL DEFAULT 0,
+    ContentLastModifiedAt timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT PK_Descriptor PRIMARY KEY (DocumentId),
-    CONSTRAINT FK_Descriptor_Document FOREIGN KEY (DocumentId)
-        REFERENCES dms.Document (DocumentId) ON DELETE CASCADE,
-    CONSTRAINT UX_Descriptor_Uri_Discriminator UNIQUE (Uri, Discriminator)
+    CONSTRAINT FK_Descriptor_DocumentResourceKey FOREIGN KEY (DocumentId, ResourceKeyId)
+        REFERENCES dms.Document (DocumentId, ResourceKeyId) ON DELETE CASCADE
 );
 
-CREATE INDEX IX_Descriptor_Uri_Discriminator ON dms.Descriptor (Uri, Discriminator);
+CREATE UNIQUE INDEX UX_Descriptor_UriLowered_ResourceKeyId
+    ON dms.Descriptor (lower(Uri COLLATE "pg_c_utf8"), ResourceKeyId);
+
+CREATE INDEX IX_Descriptor_ResourceKeyId_DocumentId
+    ON dms.Descriptor (ResourceKeyId, DocumentId);
+
+-- Serves change-version-windowed descriptor page selection: ResourceKeyId equality, ContentVersion range/order, trailing DocumentId for index-only page and count reads.
+CREATE INDEX IX_Descriptor_ResourceKeyId_ContentVersion_DocumentId
+    ON dms.Descriptor (ResourceKeyId, ContentVersion, DocumentId);
 ```
+
+Descriptor identity lookups are served by `UX_Descriptor_UriLowered_ResourceKeyId`. PostgreSQL emits the expression index shown above and uses the same `lower(<uri> COLLATE "pg_c_utf8")` expression in descriptor probes so folding is pinned to the builtin collation (PostgreSQL 17+) rather than inherited from the database default. SQL Server emits the same logical unique index over a non-persisted computed column, `UriLowered AS LOWER([Uri])`, plus `ResourceKeyId`, under the explicitly emitted CI identity collation. Case folding is engine-owned: the application never lowercases descriptor values (see `natural-key-resolution.md`).
+
+`ResourceKeyId` is denormalized from `dms.Document` at insert time (same transaction, same value) and is immutable thereafter, mirroring the immutability of a document's resource type. `FK_Descriptor_DocumentResourceKey` enforces that the descriptor row's authoritative descriptor-type key matches the owning `dms.Document.ResourceKeyId`; `dms.Document.ResourceKeyId` remains the FK-constrained path to `dms.ResourceKey`. The denormalized column exists so descriptor GET-all/GET-by-query paging and totalCount can root entirely on `dms.Descriptor` through `IX_Descriptor_ResourceKeyId_DocumentId` — an index over only the descriptor rows — instead of maintaining a `(ResourceKeyId, DocumentId)` index across every row of `dms.Document`. The stamping trigger's no-op diff deliberately excludes it, so a migration backfill of the column does not bump change versions.
 
 The effective date columns are part of the descriptor field contract. This matches legacy ODS behavior, where `edfi.Descriptor` includes nullable `EffectiveBeginDate` and `EffectiveEndDate` columns. DMS differs from ODS by using a single shared `dms.Descriptor` keyed by `DocumentId` and by not creating per-descriptor marker tables.
 
 Descriptor references (recommended base design):
 
 - Use an FK directly to `dms.Descriptor(DocumentId)` to guarantee “this is a descriptor” at the DB level.
-- Resolve descriptor URI strings by computing the descriptor `ReferentialId` (descriptor resource type from `ApiSchema` + normalized URI, per Core) and looking up `DocumentId` via `dms.ReferentialIdentity` (use `dms.Descriptor` for expansion/type diagnostics, not for resolution).
+- Resolve descriptor URI strings only after request validation has rejected NUL input at its
+  source path (unpaired-surrogate JSON escapes are rejected earlier, body-wide, at parse). Probe `dms.Descriptor` by
+  `(UriLowered, ResourceKeyId)` with the raw validated URI — the probe folds it in SQL;
+  `ResourceKeyId`, not `Discriminator`, is the descriptor-type authority for lookup and
+  uniqueness. A NUL or malformed value is a 400 validation failure before the descriptor probe,
+  not a lookup miss.
 
-If DB-level enforcement of “descriptor must be of type X” becomes necessary later we can add checks that the referenced `dms.Descriptor.Discriminator` is the expected type for that FK column (derived from `ApiSchema`).
+If DB-level enforcement of “descriptor must be of type X” becomes necessary later, it must compare the referenced `dms.Descriptor.ResourceKeyId` with the expected compile-time resource key derived from `ApiSchema`. `Discriminator` must not become a second descriptor-type authority.
 
 Descriptor update semantics:
 
-- Descriptor identity is immutable after creation: `Namespace`, `CodeValue`, and the derived `Uri` must not change on PUT.
+- For descriptor POST/PUT, derive `Uri` from the canonicalized `Namespace` + `#` + `CodeValue`.
+  Validate the two client-supplied components as well-formed without NUL before upsert detection
+  or persistence — the application does not lowercase; attribute a validation failure to
+  `$.namespace` and/or `$.codeValue` as applicable.
+- Descriptor identity is immutable after creation: a PUT whose derived `Uri` is not equal to the
+  persisted descriptor `Uri` under the descriptor identity contract is rejected as a real identity
+  change. Case-only differences in `Namespace`, `CodeValue`, or the derived `Uri` are not real
+  identity changes; the descriptor write path accepts them, rebinds identity fields to the persisted
+  casing before persistence/no-op detection, and updates only mutable representation fields.
+- `ResourceKeyId` and `Discriminator` are set at insert and never updated (a document's resource type is immutable).
 - Descriptor representation fields can be updated: `ShortDescription`, `Description`, `EffectiveBeginDate`, and `EffectiveEndDate`.
 - Descriptor endpoint query fields map to shared descriptor columns with root-table-only semantics, including `namespace`, `codeValue`, `shortDescription`, `description`, `effectiveBeginDate`, and `effectiveEndDate`.
 - Descriptor references remain stable because other resources reference the descriptor document by resolved descriptor identity/URI, not by copied descriptor metadata.
 - Therefore descriptor metadata updates do not participate in identity-propagation cascades for referring resources.
+
+##### 3) `dms.DataStoreIdentity`
+
+Always-provisioned singleton physical identity for the logical database source.
+Provisioning inserts one random UUID only when the singleton row is absent; ordinary
+provisioning reruns do not update it. CDC binding, replacement, and recovery semantics are
+owned by
+[`cdc-streaming.md`](cdc/cdc-streaming.md#deployment-owned-cdc-target-and-physical-source-binding).
+
+**PostgreSQL**
+
+```sql
+CREATE TABLE dms.DataStoreIdentity (
+    DataStoreIdentitySingletonId smallint NOT NULL PRIMARY KEY,
+    SourceIdentity uuid NOT NULL,
+    CONSTRAINT CK_DataStoreIdentity_Singleton
+        CHECK (DataStoreIdentitySingletonId = 1)
+);
+
+INSERT INTO dms.DataStoreIdentity (DataStoreIdentitySingletonId, SourceIdentity)
+VALUES (1, gen_random_uuid())
+ON CONFLICT (DataStoreIdentitySingletonId) DO NOTHING;
+```
+
+**SQL Server**
+
+```sql
+CREATE TABLE dms.DataStoreIdentity (
+    DataStoreIdentitySingletonId smallint NOT NULL
+        CONSTRAINT PK_DataStoreIdentity PRIMARY KEY CLUSTERED,
+    SourceIdentity uniqueidentifier NOT NULL,
+    CONSTRAINT CK_DataStoreIdentity_Singleton
+        CHECK (DataStoreIdentitySingletonId = 1)
+);
+
+IF NOT EXISTS (
+    SELECT 1
+    FROM dms.DataStoreIdentity
+    WHERE DataStoreIdentitySingletonId = 1
+)
+BEGIN
+    INSERT INTO dms.DataStoreIdentity (DataStoreIdentitySingletonId, SourceIdentity)
+    VALUES (1, NEWID());
+END;
+```
+
+The emitted SQL text remains deterministic even though the UUID is generated when the
+script is applied.
 
 ##### 4) `dms.EffectiveSchema` + `dms.SchemaComponent`
 
@@ -403,7 +403,7 @@ Canonical JSON contract (normative for `canonicalizeJson(...)`):
 
 `RelationalMappingVersion` contract:
 
-- `RelationalMappingVersion` is a single DMS-owned string constant (recommended: a short value like `v2`).
+- `RelationalMappingVersion` is a single DMS-owned string constant (recommended: a short value like `v3`).
 - The value used in the `EffectiveSchemaHash` manifest MUST match the value used for mapping pack selection (`relational_mapping_version` in `.mpack`).
 - Changing mapping rules requires bumping `RelationalMappingVersion` (or, if the hash algorithm itself changes, bump the hash header/version).
 
@@ -417,7 +417,7 @@ Algorithm (suggested):
 4. Compute `ProjectHash = SHA-256(canonicalJson(projectSchema))` for each project.
 5. Compute `EffectiveSchemaHash = SHA-256(manifestString)` where `manifestString` is:
    - a constant header (e.g., `dms-effective-schema-hash:v1`)
-   - a constant mapping version (e.g., `relationalMappingVersion=v2`)
+   - a constant mapping version (e.g., `relationalMappingVersion=v3`)
    - `ApiSchemaFormatVersion`
    - one line per project: `ProjectEndpointName|ProjectName|ProjectVersion|IsExtensionProject|ProjectHash`
 
@@ -425,7 +425,7 @@ Pseudocode:
 
 ```text
 const HashVersion = "dms-effective-schema-hash:v1"
-const RelationalMappingVersion = "v2"
+const RelationalMappingVersion = "v3"
 
 projects = []
 apiSchemaFormatVersion = null
@@ -469,35 +469,42 @@ Conformance tests (required):
   - and deterministic inclusion of `RelationalMappingVersion`.
 - Any intentional change to canonicalization or the hashed schema surface must update fixtures in a controlled “bless” workflow (see `ddl-generator-testing.md`).
 
-##### 5) `dms.DocumentCache` (optional, eventually consistent projection)
+##### 5) `dms.DocumentCache` (always-provisioned optional projection)
 
-Optional materialized JSON representation of the document (as returned by GET/query), stored as a convenience **projection**.
-
-This table is intentionally designed to support **CDC streaming** (e.g., Debezium → Kafka) and downstream indexing:
-
-- it is not purely a “cache-aside” optimization
-- when enabled, DMS should materialize documents into this table via a write-driven/background projector
-
-Prefer **eventual consistency** (background/write-driven projection) where rows may be rebuilt asynchronously. For rationale and projector/refresh semantics, see [transactions-and-concurrency.md](transactions-and-concurrency.md) (`dms.DocumentCache` section).
-
-The cached `DocumentJson` is the caller-agnostic pre-profile document emitted by reconstitution,
-with `link` subtrees already present when link injection is compiled into the read plan.
-Readable-profile projection runs after cache retrieval; the `DataManagement:ResourceLinks:Enabled`
-strip pass runs on the projected document immediately before serialization. The served `_etag` is
-then specific to that representation context: `profileCode`, `linkFlag`, and `contentCoding`
-participate in the request's `variantKey` (see
-[link-injection.md](link-injection.md#cache-and-etag)).
-
-Update tracking note: `dms.DocumentCache` stores the `ContentVersion` associated with the cached
-document, not one reusable `_etag`. Cache reads validate freshness against the current
-`dms.Document.ContentVersion`; the server composes `_etag` per request from that version and the
-request's `variantKey`. `LastModifiedAt` remains denormalized for the materialized projection and
-CDC/indexing consumers.
+This section is the sole owner of the table's physical row shape, column types, keys,
+constraints, indexes, and triggers. It does not define projection or streaming behavior.
+The [projector/source ADR](cdc/0001-relational-cdc-projector-and-sources.md#cached-document-contract)
+owns cached-document semantics, freshness, reconciliation, and lifecycle. The
+[topic/message ADR](cdc/0002-kafka-topic-and-message-contract.md) owns public stream
+mapping and compatibility. [`cdc-streaming.md`](cdc/cdc-streaming.md) owns configuration,
+deployment, readiness, and operations.
 
 Denormalized resource naming:
 
-- `ProjectName`/`ResourceName` are denormalized copies (from `dms.ResourceKey`) kept for CDC/streaming consumers and ad-hoc diagnostics.
-- `ResourceVersion` is the schema/project version (SemVer) from `ApiSchema.json` (`projectSchema.projectVersion`), stored canonically on `dms.ResourceKey` and denormalized here for CDC/streaming convenience.
+- `ProjectName`/`ResourceName` are denormalized copies from `dms.ResourceKey`.
+- `ResourceVersion` is the schema/project version (SemVer) from `ApiSchema.json`
+  (`projectSchema.projectVersion`), stored canonically on `dms.ResourceKey` and
+  denormalized here.
+
+Denormalized document identity:
+
+- `DocumentId` remains the compact cache primary key and the `ON DELETE CASCADE`
+  foreign key to `dms.Document`. SQL Server keeps it as the clustered key.
+- `DocumentUuid` is a non-indexed denormalized copy. `dms.DocumentCache` has no unique
+  constraint or index on `DocumentUuid`.
+- Provider-specific `DocumentCache` insert/update validation triggers join the incoming
+  `DocumentId` to `dms.Document` through its existing primary key and reject the statement
+  unless the incoming `DocumentUuid` exactly equals the canonical row's `DocumentUuid`.
+  The existing foreign key remains responsible for rejecting a missing parent and fencing
+  deletion.
+- Canonical `dms.Document.DocumentUuid` is immutable after document creation. DMS update
+  plans never assign it; identity changes do not change the public document UUID.
+
+This implies one cache row per canonical `DocumentId`, with a UUID matching its canonical
+parent, without adding a composite or UUID index to `dms.Document`. The canonical table's
+existing `UX_Document_DocumentUuid` continues to own public-ID lookup and uniqueness.
+Because every cache UUID is trigger-validated against that unique canonical value, another
+cache UUID index would be redundant.
 
 **PostgreSQL**
 
@@ -510,15 +517,12 @@ CREATE TABLE dms.DocumentCache (
     ResourceName varchar(256) NOT NULL,
     ResourceVersion varchar(32) NOT NULL,
     ContentVersion bigint NOT NULL,
+    StreamEtag varchar(64) NOT NULL,
     LastModifiedAt timestamp with time zone NOT NULL,
     DocumentJson jsonb NOT NULL,
     ComputedAt timestamp with time zone NOT NULL DEFAULT now(),
-    CONSTRAINT CK_DocumentCache_JsonObject CHECK (jsonb_typeof(DocumentJson) = 'object'),
-    CONSTRAINT UX_DocumentCache_DocumentUuid UNIQUE (DocumentUuid)
+    CONSTRAINT CK_DocumentCache_JsonObject CHECK (jsonb_typeof(DocumentJson) = 'object')
 );
-
-CREATE INDEX IX_DocumentCache_ProjectName_ResourceName_LastModifiedAt
-    ON dms.DocumentCache (ProjectName, ResourceName, LastModifiedAt, DocumentId);
 ```
 
 **SQL Server**
@@ -531,24 +535,240 @@ CREATE TABLE dms.DocumentCache (
     ResourceName nvarchar(256) NOT NULL,
     ResourceVersion nvarchar(32) NOT NULL,
     ContentVersion bigint NOT NULL,
+    StreamEtag varchar(64) NOT NULL,
     LastModifiedAt datetime2(7) NOT NULL,
     DocumentJson nvarchar(max) NOT NULL,
     ComputedAt datetime2(7) NOT NULL CONSTRAINT DF_DocumentCache_ComputedAt DEFAULT (sysutcdatetime()),
     CONSTRAINT PK_DocumentCache PRIMARY KEY CLUSTERED (DocumentId),
     CONSTRAINT FK_DocumentCache_Document FOREIGN KEY (DocumentId)
         REFERENCES dms.Document (DocumentId) ON DELETE CASCADE,
-    CONSTRAINT CK_DocumentCache_IsJsonObject CHECK (ISJSON(DocumentJson) = 1 AND LEFT(LTRIM(DocumentJson), 1) = '{'),
-    CONSTRAINT UX_DocumentCache_DocumentUuid UNIQUE (DocumentUuid)
+    CONSTRAINT CK_DocumentCache_IsJsonObject CHECK (ISJSON(DocumentJson) = 1 AND LEFT(LTRIM(DocumentJson), 1) = '{')
 );
-
-CREATE INDEX IX_DocumentCache_ProjectName_ResourceName_LastModifiedAt
-    ON dms.DocumentCache (ProjectName, ResourceName, LastModifiedAt, DocumentId);
 ```
 
-Uses:
+The DDL emitter also creates the provider-equivalent identity validation trigger. The
+stable trigger name is `TR_DocumentCache_ValidateDocumentUuid`; PostgreSQL uses the stable
+function name `TF_DocumentCache_ValidateDocumentUuid`:
 
-- Faster GET/query responses (skip reconstitution)
-- Easier CDC streaming (Debezium) / OpenSearch indexing / external integrations
+- PostgreSQL uses a `BEFORE INSERT OR UPDATE` trigger on `dms.DocumentCache`. It reads the
+  canonical UUID by `NEW.DocumentId`, returns the row when they match, and raises an
+  integrity error when they differ. The subsequent foreign-key check handles a missing
+  canonical row.
+- SQL Server uses one set-based `AFTER INSERT, UPDATE` trigger. It joins `inserted` to
+  `dms.Document` by `DocumentId` and throws when any UUID differs, rolling back the
+  statement. The foreign key is checked independently for a missing canonical row.
+
+The trigger compares only fixed-width identity values and uses the existing canonical
+`DocumentId` primary-key access path. It does not parse `DocumentJson`, add work to normal
+canonical document writes, or require a `DocumentCache.DocumentUuid` index. Projector
+writer behavior is owned by the projector/source ADR; this trigger is only its physical
+database backstop.
+
+##### 5a) `dms.DocumentProjectionWork` (always-provisioned durable projection work)
+
+This table is the coalesced completeness inventory for optional `DocumentCache`
+projection. Runtime enqueue, acknowledgement, fairness, rebuild, and scrub behavior is
+owned by the
+[projector/source ADR](cdc/0001-relational-cdc-projector-and-sources.md#durable-work-and-lifecycle).
+
+**PostgreSQL**
+
+```sql
+CREATE TABLE dms.DocumentProjectionWork (
+    DocumentId bigint NOT NULL,
+    RequiredContentVersion bigint NOT NULL,
+    FirstEnqueuedAt timestamp with time zone NOT NULL,
+    LastEnqueuedAt timestamp with time zone NOT NULL,
+    CONSTRAINT PK_DocumentProjectionWork PRIMARY KEY (DocumentId),
+    CONSTRAINT FK_DocumentProjectionWork_Document FOREIGN KEY (DocumentId)
+        REFERENCES dms.Document (DocumentId) ON DELETE CASCADE
+);
+
+CREATE INDEX IX_DocumentProjectionWork_FirstEnqueuedAt_DocumentId
+    ON dms.DocumentProjectionWork (FirstEnqueuedAt, DocumentId);
+```
+
+**SQL Server**
+
+```sql
+CREATE TABLE dms.DocumentProjectionWork (
+    DocumentId bigint NOT NULL,
+    RequiredContentVersion bigint NOT NULL,
+    FirstEnqueuedAt datetime2(7) NOT NULL,
+    LastEnqueuedAt datetime2(7) NOT NULL,
+    CONSTRAINT PK_DocumentProjectionWork PRIMARY KEY CLUSTERED (DocumentId),
+    CONSTRAINT FK_DocumentProjectionWork_Document FOREIGN KEY (DocumentId)
+        REFERENCES dms.Document (DocumentId) ON DELETE CASCADE
+);
+
+CREATE INDEX IX_DocumentProjectionWork_FirstEnqueuedAt_DocumentId
+    ON dms.DocumentProjectionWork (FirstEnqueuedAt, DocumentId);
+```
+
+V1 deliberately defines no claim, lease, worker-owner, attempt-count, dead-letter, epoch,
+or baseline-cursor columns.
+
+The stable PostgreSQL trigger/function inventory is:
+
+- `TR_Document_EnqueueProjectionInsert` using
+  `TF_Document_EnqueueProjectionInsert`, an `AFTER INSERT` statement trigger with a
+  `NEW TABLE` transition relation; and
+- `TR_Document_EnqueueProjectionUpdate` using
+  `TF_Document_EnqueueProjectionUpdate`, an `AFTER UPDATE` statement trigger with
+  `OLD TABLE` and `NEW TABLE` transition relations that selects only rows whose
+  `ContentVersion` changed.
+
+The stable SQL Server inventory is one set-based
+`TR_Document_EnqueueProjectionWork` `AFTER INSERT, UPDATE` trigger over `inserted` and
+`deleted`. It enqueues every inserted row and, for updates, only rows whose
+`inserted.ContentVersion` differs from `deleted.ContentVersion`; an update that leaves
+`ContentVersion` unchanged performs no work-table DML and does not change either enqueue
+timestamp. A SQL Server projection target requires server-level `nested triggers` with
+`value_in_use = 1` so indirect resource `*_Stamp` trigger updates to `dms.Document` reach
+this trigger.
+
+Each implementation reads exactly the `StateId = 1` lifecycle row once per statement. A
+missing row or unreadable/invalid lifecycle raises an enqueue error rather than being
+treated as `Disabled`. In `Tracking`, `Resetting`, or `Rebuilding`, it upserts every
+changed document, keeps the greater current or incoming `RequiredContentVersion`,
+preserves `FirstEnqueuedAt` while work remains, and advances `LastEnqueuedAt` only when the
+required version advances. In `Disabled`, it performs no work-table DML. Errors are not
+suppressed: any enqueue failure rolls back the complete canonical statement and
+transaction.
+
+Runtime target initialization and activation from `Disabled` validate the SQL Server
+nested-trigger prerequisite. Generated `*_Stamp` triggers do not read
+`sys.configurations`. Runtime validation and the unsupported-change boundary are owned by
+[`cdc-streaming.md`](cdc/cdc-streaming.md#configuration-and-projection-target-selection).
+
+Trigger execution has a narrow encapsulation boundary without creating separate runtime
+DMS database identities:
+
+- PostgreSQL functions are hardened `SECURITY DEFINER` functions owned by a dedicated
+  non-login projection-enqueue owner. They set a fixed safe `search_path` containing only
+  `pg_catalog` and explicitly schema-qualify every DMS object. The owner receives only the
+  state read and work-table DML needed by the trigger. `PUBLIC` receives no function
+  execution or work-table mutation rights. Test-only restricted canonical-writer
+  principals prove that ordinary DML on `dms.Document` can fire the trigger without a
+  direct `INSERT`, `UPDATE`, or `DELETE` grant on `dms.DocumentProjectionWork`.
+- SQL Server uses the same-owner ownership chain with static schema-qualified references
+  and no `EXECUTE AS` principal. Test-only restricted canonical-writer principals prove
+  the equivalent trigger-encapsulation property without direct work-table permission.
+- Production uses one deployment-supplied DMS data-store credential with the union of
+  canonical write, projection, and projection-administration permissions. DDL creates no
+  separate runtime identities, role switching, connection strings, or grant matrix for
+  those application capabilities; narrow application interfaces enforce their use.
+  E19 owns the separate deployment-supplied CDC credential and ensures it receives no
+  `DocumentProjectionWork` capture or DML access.
+
+Provider DB-apply tests and introspection must prove trigger counts/names, set-based
+multi-row behavior, lifecycle gating, complete-transaction rollback, direct-DML denial for
+the test-only restricted writer, missing-singleton failure, and delete cascade. Runtime
+and activation tests own the SQL Server nested-trigger prerequisite.
+
+##### 6) `dms.DocumentCacheState` (singleton projection state)
+
+Always-provisioned singleton physical state for the projection lifecycle and orthogonal
+cache-ahead invariant. Its runtime meaning and legal transitions are owned by the
+projector/source ADR.
+
+**PostgreSQL**
+
+```sql
+CREATE TABLE dms.DocumentCacheState (
+    StateId smallint NOT NULL,
+    ProjectionLifecycleState varchar(16) NOT NULL,
+    CacheAheadRecoveryRequired boolean NOT NULL,
+    CONSTRAINT PK_DocumentCacheState PRIMARY KEY (StateId),
+    CONSTRAINT CK_DocumentCacheState_Singleton CHECK (StateId = 1),
+    CONSTRAINT CK_DocumentCacheState_Lifecycle CHECK (
+        ProjectionLifecycleState IN ('Disabled', 'Resetting', 'Rebuilding', 'Tracking')
+    )
+);
+
+INSERT INTO dms.DocumentCacheState
+    (StateId, ProjectionLifecycleState, CacheAheadRecoveryRequired)
+VALUES (1, 'Disabled', false)
+ON CONFLICT (StateId) DO NOTHING;
+```
+
+**SQL Server**
+
+```sql
+CREATE TABLE dms.DocumentCacheState (
+    StateId smallint NOT NULL,
+    ProjectionLifecycleState varchar(16) COLLATE Latin1_General_100_BIN2 NOT NULL,
+    CacheAheadRecoveryRequired bit NOT NULL,
+    CONSTRAINT PK_DocumentCacheState PRIMARY KEY CLUSTERED (StateId),
+    CONSTRAINT CK_DocumentCacheState_Singleton CHECK (StateId = 1),
+    CONSTRAINT CK_DocumentCacheState_Lifecycle CHECK (
+        (ProjectionLifecycleState = 'Disabled' AND DATALENGTH(ProjectionLifecycleState) = 8)
+        OR (ProjectionLifecycleState = 'Resetting' AND DATALENGTH(ProjectionLifecycleState) = 9)
+        OR (ProjectionLifecycleState = 'Rebuilding' AND DATALENGTH(ProjectionLifecycleState) = 10)
+        OR (ProjectionLifecycleState = 'Tracking' AND DATALENGTH(ProjectionLifecycleState) = 8)
+    )
+);
+
+IF NOT EXISTS (SELECT 1 FROM dms.DocumentCacheState WHERE StateId = 1)
+    INSERT INTO dms.DocumentCacheState
+        (StateId, ProjectionLifecycleState, CacheAheadRecoveryRequired)
+    VALUES (1, 'Disabled', 0);
+```
+
+Provisioning creates exactly the `StateId = 1` row in `Disabled` with the latch clear.
+Ordinary provisioning reruns never change lifecycle, latch, cache, or pending work. The
+binary SQL Server collation plus explicit byte lengths makes the four ASCII lifecycle
+tokens exact even when the database default collation is case-insensitive or a comparison
+would otherwise ignore trailing spaces. Provider constraint tests reject casing variants,
+leading/trailing whitespace, empty strings, and every other unknown value. The check
+constraint validates the stored token; it does not encode the transition graph, and no
+database trigger changes lifecycle state autonomously. Serialized administrative commands
+enforce and test the supported transition edges. The
+[projector/source ADR](cdc/0001-relational-cdc-projector-and-sources.md#durable-work-and-lifecycle)
+owns the supported transitions, shared/exclusive state-row locking, administrative mutex,
+and recovery behavior.
+
+##### 7) `dms.CdcHeartbeat` (opt-in CDC integration object)
+
+Provider CDC setup provisions this singleton only when CDC is selected. It is not part of
+ordinary relational provisioning.
+
+**PostgreSQL**
+
+```sql
+CREATE TABLE dms.CdcHeartbeat (
+    HeartbeatId smallint PRIMARY KEY,
+    HeartbeatSequence bigint NOT NULL,
+    HeartbeatAt timestamp with time zone NOT NULL,
+    CONSTRAINT CK_CdcHeartbeat_Singleton CHECK (HeartbeatId = 1),
+    CONSTRAINT CK_CdcHeartbeat_Sequence CHECK (HeartbeatSequence >= 0)
+);
+
+INSERT INTO dms.CdcHeartbeat (HeartbeatId, HeartbeatSequence, HeartbeatAt)
+VALUES (1, 0, now())
+ON CONFLICT (HeartbeatId) DO NOTHING;
+```
+
+**SQL Server**
+
+```sql
+CREATE TABLE dms.CdcHeartbeat (
+    HeartbeatId smallint NOT NULL,
+    HeartbeatSequence bigint NOT NULL,
+    HeartbeatAt datetime2(7) NOT NULL,
+    CONSTRAINT PK_CdcHeartbeat PRIMARY KEY CLUSTERED (HeartbeatId),
+    CONSTRAINT CK_CdcHeartbeat_Singleton CHECK (HeartbeatId = 1),
+    CONSTRAINT CK_CdcHeartbeat_Sequence CHECK (HeartbeatSequence >= 0)
+);
+
+IF NOT EXISTS (SELECT 1 FROM dms.CdcHeartbeat WHERE HeartbeatId = 1)
+    INSERT INTO dms.CdcHeartbeat (HeartbeatId, HeartbeatSequence, HeartbeatAt)
+    VALUES (1, 0, sysutcdatetime());
+```
+
+The integration design owns the provider action query, capture enablement, source-position
+barrier, and operational use of this physical row; see
+[`cdc-streaming.md`](cdc/cdc-streaming.md#provider-source-position-barrier).
 
 ### Authorization companion objects (schema: `auth`)
 
@@ -579,10 +799,13 @@ Typical structure:
 
 - `DocumentId BIGINT` **PK/FK** → `dms.Document(DocumentId)` ON DELETE CASCADE
   - The `ON DELETE CASCADE` action is a referential-integrity safety net, not the primary deletion path. The DMS write path deletes the concrete resource row before deleting the corresponding `dms.Document` row (within the same transaction) so that the resource's `_Stamp` trigger can read `DocumentUuid` and `ContentVersion` from `dms.Document` before the parent row is removed. See [change-queries.md](change-queries.md) §"Cascade-ordering requirement for deletes" for the trigger-side rationale.
-- Natural key columns (from `identityJsonPaths`) → **API-semantic** unique constraint over the identity **binding/path** columns.
-  - For identity elements that come from a document reference object, the unique constraint uses the corresponding `..._DocumentId` FK column (stable) plus the per-site identity-part binding columns.
-  - Under key unification, per-site identity-part binding columns may be generated/persisted aliases of canonical storage columns; the natural-key unique constraint remains defined over binding columns to preserve API path/presence semantics.
-- Reference key columns → **FK-supporting** unique constraint over `(DocumentId, <StorageIdentityParts...>)` (the referenced key used by composite reference FKs).
+- Natural key columns (from `identityJsonPaths`) → **API-semantic** unique constraint derived from the identity endpoint bindings.
+  - Scalar identity elements map to scalar path/binding columns.
+  - Descriptor identity elements map to resolved `..._DescriptorId` FK columns.
+  - Identity elements that come from document reference objects map to the corresponding resolved `..._DocumentId` FK columns only; propagated per-site identity-part binding columns do not participate in `UX_<R>_NK`.
+  - Under key unification, per-site identity-part binding columns may be generated/persisted aliases of canonical storage columns. Those columns preserve path semantics for FK/cascade consistency, query binding, and reconstitution, but root natural-key uniqueness for a reference-sourced part is by resolved `..._DocumentId`.
+- Reference key columns → **FK- and probe-supporting** unique constraint over `(<StorageIdentityParts...>, DocumentId)` (the referenced key used by composite reference FKs and natural-key probes).
+  - Emit `UX_<R>_RefKey` for every concrete resource root that some other resource in the effective schema references (the existing `EnsureTargetUnique` rule). Emission stays conditional: reference resolution can only target referenced resources, and never-referenced roots (dominated by high-volume leaf tables) do not carry a wide identity index they cannot be probed through. Change Query `/deletes` recreated-row detection uses the RefKey where present and otherwise keeps its `UX_<R>_NK`-based plan; see `natural-key-resolution.md` § "`/deletes` recreated-row detection on never-referenced resources".
   - Under key unification, `<StorageIdentityParts...>` uses canonical storage columns (never per-site `UnifiedAlias` binding columns); see `key-unification.md`.
 - Scalar columns for top-level non-collection properties
 - Reference columns (document references):
@@ -591,7 +814,7 @@ Typical structure:
     - one **binding/path** column per referenced identity field (e.g., `{RefBaseName}_{IdentityPart}`).
       - Under key unification, these per-site columns remain in the table shape but may be generated/persisted `UnifiedAlias` columns of canonical storage columns; see `key-unification.md`.
   - Enforce a composite reference FK using only stored/writable **storage** columns:
-    - `FOREIGN KEY (..._DocumentId, <StorageIdentityParts...>) REFERENCES <TargetRefKey>(DocumentId, <TargetStorageIdentityParts...>)`
+    - `FOREIGN KEY (<StorageIdentityParts...>, ..._DocumentId) REFERENCES <TargetRefKey>(<TargetStorageIdentityParts...>, DocumentId)`
       - For each referenced identity part, derive the referencing-side storage column by mapping the per-site binding column through `DbColumnModel.Storage` (i.e., when the binding column is a `UnifiedAlias`, use its canonical column).
       - FKs MUST NOT be defined over `UnifiedAlias` columns (generated columns are not cascade targets).
       - PostgreSQL:
@@ -653,37 +876,57 @@ This redesign provisions an **identity table per abstract resource**:
 
 - Table name: `{schema}.{AbstractResource}Identity` (deterministic; provisioned with the rest of the schema).
 - Columns:
-  - `DocumentId` (PK; FK to `dms.Document(DocumentId)` ON DELETE CASCADE)
+  - `DocumentId` (PK; paired with `ResourceKeyId` in the composite FK to `dms.Document(DocumentId, ResourceKeyId)` ON DELETE CASCADE)
   - abstract identity fields in `abstractResources[A].identityJsonPaths` order
-  - `Discriminator` (NOT NULL; last; concrete member discriminator literal in `ProjectName:ResourceName` format; useful for diagnostics)
+  - `ResourceKeyId` (NOT NULL; paired with `DocumentId` in the composite FK to `dms.Document(DocumentId, ResourceKeyId)`; concrete member resource key projected for abstract reference compatibility checks)
+  - `Discriminator` (NOT NULL; concrete member discriminator literal in `ProjectName:ResourceName` format; useful for diagnostics)
+- Unique constraints:
+  - `UX_<AbstractResource>Identity_NK UNIQUE (<AbstractIdentityFields...>)`
+    - columns are exactly the abstract identity fields in `abstractResources[A].identityJsonPaths` order
+    - excludes `DocumentId`, `ResourceKeyId`, and `Discriminator`; these columns are payload or row identity, not abstract identity equality
+    - enforces cross-subclass abstract identity uniqueness after `dms.ReferentialIdentity` is removed
+  - `UX_<AbstractResource>Identity_RefKey UNIQUE (<AbstractIdentityFields...>, DocumentId)`
+    - uses the same abstract identity-field order with `DocumentId` last
+    - excludes `ResourceKeyId` and `Discriminator`; the resolver may project `ResourceKeyId` from the matched row, but it is not part of the key
+    - serves as the composite FK target and natural-key probe target for abstract reference sites
+- Document/resource FK:
+  - `FK_<AbstractResource>Identity_DocumentResourceKey FOREIGN KEY (DocumentId, ResourceKeyId) REFERENCES dms.Document(DocumentId, ResourceKeyId) ON DELETE CASCADE`.
+  - This constrains the authoritative abstract-reference compatibility key to the owning document's concrete resource key while keeping `ResourceKeyId` out of abstract identity equality. `dms.Document.ResourceKeyId` remains the FK-constrained path to the seeded `dms.ResourceKey` mapping.
 - Maintenance:
-  - triggers on each concrete member root table upsert the corresponding `{AbstractResource}Identity` row on insert/update of the concrete identity fields (including identity renames).
+  - triggers on each concrete member root table upsert the corresponding `{AbstractResource}Identity` row on insert/update of the concrete identity fields (including identity renames), populating `ResourceKeyId` from compile-time concrete-member metadata.
+  - root deletes do not generate a separate abstract-identity delete trigger. The identity row is owned by
+    `dms.Document` and is removed by `FK_<AbstractResource>Identity_DocumentResourceKey ... ON DELETE CASCADE`
+    when the write path deletes the owning `dms.Document` row in the same transaction after deleting the concrete
+    root row.
 - FKs for abstract reference sites:
-  - referencing tables use composite FKs to `{schema}.{AbstractResource}Identity(DocumentId, <AbstractIdentityFields...>)`.
+  - referencing tables use composite FKs to `{schema}.{AbstractResource}Identity(<AbstractIdentityFields...>, DocumentId)`, backed by `UX_<AbstractResource>Identity_RefKey`.
     - PostgreSQL: `ON UPDATE CASCADE`.
     - SQL Server: native full-composite `ON UPDATE CASCADE` where retained by
       [SQL Server foreign-key pruning](sql-server-pruning.md), otherwise a safe `ON UPDATE NO ACTION` cut.
 
-Required: `{schema}.{AbstractResource}_View` union view
+Diagnostic/integration view: `{schema}.{AbstractResource}_View`
 
-Also provision a union view per abstract resource for diagnostics/ad-hoc querying:
+A union view may also be provisioned per abstract resource for diagnostics/ad-hoc querying:
 
 - View name: `{schema}.{AbstractResource}_View`
-- Columns: `DocumentId`, abstract identity fields in `identityJsonPaths` order, `Discriminator` (NOT NULL; last; literal format `ProjectName:ResourceName`)
-- Rows: `UNION ALL` over concrete member root tables, projecting `DocumentId` and the abstract identity fields (including identity renames)
+- Columns: `DocumentId`, abstract identity fields in `identityJsonPaths` order, `ResourceKeyId`, `Discriminator` (NOT NULL; literal format `ProjectName:ResourceName`)
+- Rows: `UNION ALL` over concrete member root tables, projecting `DocumentId`, the abstract identity fields (including identity renames), and compile-time concrete-member literals for `ResourceKeyId` and `Discriminator`; `ResourceKeyId` is not derived from `Discriminator`
 
 Usage:
 
-- Not required for write-time reference resolution (still via `dms.ReferentialIdentity` alias rows).
+- Not required for abstract write-time reference resolution: the natural-key resolver probes the required `{AbstractResource}Identity` table by `UX_<AbstractResource>Identity_RefKey` and projects `DocumentId` plus concrete `ResourceKeyId`.
 - Not required for read-time reference identity projection (reference identity fields are stored locally on the referrer and
   kept consistent via database propagation: PostgreSQL cascades and SQL Server native cascades/cuts governed by
   [SQL Server foreign-key pruning](sql-server-pruning.md)).
 - Not required for membership/type validation (enforced by the composite FK to `{AbstractResource}Identity`).
+- Not required for API correctness; implementations must not make successful writes or reference compatibility checks depend on this view.
 
-DDL generation requirement:
+DDL generation requirement when emitted:
 
 - View SQL must be deterministic and canonicalized: stable `UNION ALL` arm ordering, stable select-list ordering from `identityJsonPaths` order, and explicit casts where needed for cross-engine union compatibility.
 - `Discriminator` literals are emitted as `ProjectName:ResourceName`; derivation fails fast when any value exceeds 256 characters.
+
+The examples below use `<...ResourceKeyId>` placeholders for the generated smallint literals assigned by `dms.ResourceKey`.
 
 **PostgreSQL example: `EducationOrganization_View`**
 
@@ -692,18 +935,21 @@ CREATE OR REPLACE VIEW edfi.EducationOrganization_View AS
 SELECT
     s.DocumentId,
     s.SchoolId AS EducationOrganizationId,
+    CAST(<SchoolResourceKeyId> AS smallint) AS ResourceKeyId,
     'Ed-Fi:School'::varchar(256) AS Discriminator
 FROM edfi.School s
 UNION ALL
 SELECT
     lea.DocumentId,
     lea.LocalEducationAgencyId AS EducationOrganizationId,
+    CAST(<LocalEducationAgencyResourceKeyId> AS smallint) AS ResourceKeyId,
     'Ed-Fi:LocalEducationAgency'::varchar(256) AS Discriminator
 FROM edfi.LocalEducationAgency lea
 UNION ALL
 SELECT
     sea.DocumentId,
     sea.StateEducationAgencyId AS EducationOrganizationId,
+    CAST(<StateEducationAgencyResourceKeyId> AS smallint) AS ResourceKeyId,
     'Ed-Fi:StateEducationAgency'::varchar(256) AS Discriminator
 FROM edfi.StateEducationAgency sea;
 ```
@@ -715,18 +961,21 @@ CREATE OR ALTER VIEW edfi.EducationOrganization_View AS
 SELECT
     s.DocumentId,
     s.SchoolId AS EducationOrganizationId,
+    CAST(<SchoolResourceKeyId> AS smallint) AS ResourceKeyId,
     CAST('Ed-Fi:School' AS nvarchar(256)) AS Discriminator
 FROM edfi.School s
 UNION ALL
 SELECT
     lea.DocumentId,
     lea.LocalEducationAgencyId AS EducationOrganizationId,
+    CAST(<LocalEducationAgencyResourceKeyId> AS smallint) AS ResourceKeyId,
     CAST('Ed-Fi:LocalEducationAgency' AS nvarchar(256)) AS Discriminator
 FROM edfi.LocalEducationAgency lea
 UNION ALL
 SELECT
     sea.DocumentId,
     sea.StateEducationAgencyId AS EducationOrganizationId,
+    CAST(<StateEducationAgencyResourceKeyId> AS smallint) AS ResourceKeyId,
     CAST('Ed-Fi:StateEducationAgency' AS nvarchar(256)) AS Discriminator
 FROM edfi.StateEducationAgency sea;
 ```
@@ -751,11 +1000,12 @@ CREATE TABLE IF NOT EXISTS edfi.Student (
     BirthDate        date         NULL,
 
     CONSTRAINT UX_Student_NK UNIQUE (StudentUniqueId),
-    CONSTRAINT UX_Student_RefKey UNIQUE (DocumentId, StudentUniqueId)
+    CONSTRAINT UX_Student_RefKey UNIQUE (StudentUniqueId, DocumentId)
 );
 
 -- Descriptor references are stored as FKs directly to dms.Descriptor.
--- The expected descriptor type is validated via dms.Descriptor.Discriminator (application-level, or triggers if desired).
+-- The expected descriptor type is validated via dms.Descriptor.ResourceKeyId
+-- using the compile-time resource key (application-level, or triggers if desired).
 
 CREATE TABLE IF NOT EXISTS edfi.School (
     DocumentId             bigint PRIMARY KEY
@@ -768,7 +1018,7 @@ CREATE TABLE IF NOT EXISTS edfi.School (
                            REFERENCES dms.Descriptor(DocumentId),
 
     CONSTRAINT UX_School_NK UNIQUE (SchoolId),
-    CONSTRAINT UX_School_RefKey UNIQUE (DocumentId, SchoolId)
+    CONSTRAINT UX_School_RefKey UNIQUE (SchoolId, DocumentId)
 );
 
 -- Example collection table: School has a collection of GradeLevelDescriptor values
@@ -838,12 +1088,12 @@ CREATE TABLE IF NOT EXISTS edfi.StudentSchoolAssociation (
     EntryDate          date   NOT NULL,
     ExitWithdrawDate   date   NULL,
 
-    CONSTRAINT FK_StudentSchoolAssociation_Student_RefKey FOREIGN KEY (Student_DocumentId, Student_StudentUniqueId)
-        REFERENCES edfi.Student (DocumentId, StudentUniqueId),
-    CONSTRAINT FK_StudentSchoolAssociation_School_RefKey FOREIGN KEY (School_DocumentId, School_SchoolId)
-        REFERENCES edfi.School (DocumentId, SchoolId),
+    CONSTRAINT FK_StudentSchoolAssociation_Student_RefKey FOREIGN KEY (Student_StudentUniqueId, Student_DocumentId)
+        REFERENCES edfi.Student (StudentUniqueId, DocumentId),
+    CONSTRAINT FK_StudentSchoolAssociation_School_RefKey FOREIGN KEY (School_SchoolId, School_DocumentId)
+        REFERENCES edfi.School (SchoolId, DocumentId),
     CONSTRAINT UX_StudentSchoolAssociation_NK UNIQUE (Student_DocumentId, School_DocumentId, EntryDate),
-    CONSTRAINT UX_StudentSchoolAssociation_RefKey UNIQUE (DocumentId, Student_StudentUniqueId, School_SchoolId, EntryDate)
+    CONSTRAINT UX_StudentSchoolAssociation_RefKey UNIQUE (Student_StudentUniqueId, School_SchoolId, EntryDate, DocumentId)
 );
 
 CREATE INDEX IF NOT EXISTS IX_SSA_StudentDocumentId ON edfi.StudentSchoolAssociation(Student_DocumentId);
@@ -920,7 +1170,7 @@ Note: SQL examples in this directory may omit quoting for readability. The DDL g
     - extension collection tables: `{ResourceBaseName}Extension{CollectionSuffix}`
 - Abstract identity artifacts:
   - `{ProjectSchema}.{AbstractResource}Identity` (tables; FK targets for polymorphic references)
-  - `{ProjectSchema}.{AbstractResource}_View` (union views for diagnostics/ad-hoc querying)
+  - `{ProjectSchema}.{AbstractResource}_View` (optional union views for diagnostics/ad-hoc querying)
 
 ### 4) Column names (PascalCase + stable suffixes)
 
@@ -977,19 +1227,21 @@ Object names are deterministic and derived from the owning table plus purpose to
 - Primary key constraints: `PK_{TableName}`
 - Unique constraints:
   - Natural key (API semantics; binding/path columns from `identityJsonPaths`): `UX_{TableName}_NK`
-  - Reference key (FK target; `DocumentId` + storage identity columns, using canonical columns under key unification): `UX_{TableName}_RefKey`
+  - Reference key (FK/probe target; storage identity columns + `DocumentId`, using canonical columns under key unification): `UX_{TableName}_RefKey`
   - Array uniqueness: `UX_{TableName}_{Tokens}` where tokens are the constrained column names with shared
     prefixes collapsed (e.g., `Assessment_DocumentId_AssessmentIdentifier_Namespace`)
 - Foreign keys: `FK_{TableName}_{Token}`, where `Token` is:
-  - `Document` for FKs to `dms.Document`
+  - `Document` for single-column `(DocumentId)` FKs to `dms.Document`
+  - `DocumentResourceKey` for composite `(DocumentId, ResourceKeyId)` FKs to
+    `dms.Document(DocumentId, ResourceKeyId)` (descriptor and abstract identity tables)
   - `{DescriptorBaseName}` for descriptor FKs (no `_DescriptorId` suffix)
   - `{ReferenceBaseName}` for single-column reference FKs
-  - `{ReferenceBaseName}_RefKey` for composite reference FKs (document id + storage identity columns; canonicalized under key unification)
+  - `{ReferenceBaseName}_RefKey` for composite reference FKs (storage identity columns + document id; canonicalized under key unification)
   - `{ParentTableName}` for parent/extension table links
 - All-or-none checks: `CK_{TableName}_{ReferenceBaseName}_AllNone`
 - Indexes: `IX_{TableName}_{Column1}_{Column2}_...` (columns in index key order)
 - Triggers: `TR_{TableName}_{Purpose}`
-  - `Purpose` is a small stable token such as `Stamp`, `Journal`, `ReferentialIdentity`, `AbstractIdentity`
+  - `Purpose` is a small stable token such as `Stamp`, `Journal`, `AbstractIdentity`
   - PostgreSQL trigger functions (when used): `TF_{TableName}_{Purpose}`
 
 Uniqueness scope (dialect-specific):
@@ -1031,10 +1283,17 @@ Alignment note:
 Rules:
 
 - Scalar strings should have `maxLength`. When `maxLength` is omitted, PostgreSQL emits `varchar` (unbounded) and SQL Server emits `nvarchar(max)`.
+- SQL Server `nvarchar(n)` / `nvarchar(max)` are base storage types. Generated string columns that store or copy identity values MUST add the DMS identity collation:
+  `COLLATE SQL_Latin1_General_CP1_CI_AS`. This column-role overlay applies to canonical natural-key
+  string columns on resource roots, flattened `RefKey` string copies, abstract-identity string columns,
+  descriptor identity source/copy columns, tracked-change old/new string copies whose origin includes
+  identity, and local string identity members used by child or extension collection uniqueness. Ordinary
+  non-identity scalar payload strings continue to inherit the database default unless another explicit
+  contract applies.
 - Decimals must have `(totalDigits, decimalPlaces)` from `decimalPropertyValidationInfos`; missing info is an error.
 - `date-time` values are treated as UTC instants at the application boundary. SQL Server storage uses `datetime2(7)` (no offset), so any incoming offset is normalized to UTC at write time.
 
-| ApiSchema JSON schema | PostgreSQL type | SQL Server type |
+| ApiSchema JSON schema | PostgreSQL type | SQL Server base type |
 | --- | --- | --- |
 | `type: "string"` (no `format`, with `maxLength`) | `varchar(n)` | `nvarchar(n)` |
 | `type: "string"` (no `format`, no `maxLength`) | `varchar` | `nvarchar(max)` |

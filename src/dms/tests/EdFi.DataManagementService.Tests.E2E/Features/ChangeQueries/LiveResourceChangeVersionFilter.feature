@@ -11,6 +11,101 @@ Feature: Live resource endpoints filter by change version.
                   | schoolId  | nameOfInstitution    | gradeLevels                                                                      | educationOrganizationCategories                                                                                   |
                   | 920100001 | Live Filter School   | [ {"gradeLevelDescriptor": "uri://ed-fi.org/GradeLevelDescriptor#Tenth Grade"} ] | [ {"educationOrganizationCategoryDescriptor": "uri://ed-fi.org/EducationOrganizationCategoryDescriptor#School"} ] |
 
+        @e2e-ci-shard-1 @PostgresqlRepresentative @MssqlRepresentative
+        Scenario: A representation restamp admits a current resource into a later live Change Query window without delete or key-change history
+             When a POST request is made to "/ed-fi/students" with
+                  """
+                  {
+                    "studentUniqueId": "1318002",
+                    "birthDate": "2014-08-14",
+                    "firstName": "Change",
+                    "lastSurname": "Query Student"
+                  }
+                  """
+             Then it should respond with 201
+             When the resulting id is stored in the "restampChangeQueryStudentId" variable
+             When a POST request is made to "/ed-fi/students" with
+                  """
+                  {
+                    "studentUniqueId": "1318003",
+                    "birthDate": "2014-08-14",
+                    "firstName": "Change",
+                    "lastSurname": "Query Floor"
+                  }
+                  """
+             Then it should respond with 201
+             When a GET request is made to "/changeQueries/v1/availableChangeVersions"
+             Then it should respond with 200
+              And the response body path "newestChangeVersion" is stored in request variable "restampChangeQueryFloor"
+             When a GET request is made to "/ed-fi/students?studentUniqueId=1318002&minChangeVersion={restampChangeQueryFloor}&totalCount=true"
+             Then it should respond with 200
+              And total of records should be 0
+             When representation restamp completes for document variable "restampChangeQueryStudentId" in tracking mode
+             When a GET request is made to "/changeQueries/v1/availableChangeVersions"
+             Then it should respond with 200
+              And the response body path "newestChangeVersion" is stored in request variable "restampChangeQueryAfter"
+             When a GET request is made to "/ed-fi/students?studentUniqueId=1318002&minChangeVersion={restampChangeQueryFloor}&totalCount=true"
+             Then it should respond with 200
+              And total of records should be 1
+              And the response body path "0.id" should equal request variable "restampChangeQueryStudentId"
+              And the response body path "0.firstName" should have value "Change"
+             When a GET request is made to "/ed-fi/students/deletes?minChangeVersion={restampChangeQueryFloor}&maxChangeVersion={restampChangeQueryAfter}&totalCount=true"
+             Then it should respond with 200
+              And total of records should be 0
+             When a GET request is made to "/ed-fi/students/keyChanges?minChangeVersion={restampChangeQueryFloor}&maxChangeVersion={restampChangeQueryAfter}&totalCount=true"
+             Then it should respond with 200
+              And total of records should be 0
+
+        # Disabled completion asserts canonicalOnlyComplete and no projection work in the harness.
+        # Live-resource visibility makes no cache or Kafka publication claim.
+        @e2e-ci-shard-1 @PostgresqlRepresentative @MssqlRepresentative
+        Scenario: A disabled representation restamp admits a current resource into a later live Change Query window without delete or key-change history
+             When a POST request is made to "/ed-fi/students" with
+                  """
+                  {
+                    "studentUniqueId": "1318005",
+                    "birthDate": "2014-08-14",
+                    "firstName": "Disabled Change",
+                    "lastSurname": "Query Student"
+                  }
+                  """
+             Then it should respond with 201
+             When the resulting id is stored in the "disabledRestampStudentId" variable
+             When a POST request is made to "/ed-fi/students" with
+                  """
+                  {
+                    "studentUniqueId": "1318006",
+                    "birthDate": "2014-08-14",
+                    "firstName": "Disabled Change",
+                    "lastSurname": "Query Floor"
+                  }
+                  """
+             Then it should respond with 201
+             When a GET request is made to "/changeQueries/v1/availableChangeVersions"
+             Then it should respond with 200
+              And the response body path "newestChangeVersion" is stored in request variable "disabledRestampFloor"
+             When a GET request is made to "/ed-fi/students?studentUniqueId=1318005&minChangeVersion={disabledRestampFloor}&totalCount=true"
+             Then it should respond with 200
+              And total of records should be 0
+             When representation restamp completes for document variable "disabledRestampStudentId" in disabled mode
+             When a GET request is made to "/changeQueries/v1/availableChangeVersions"
+             Then it should respond with 200
+              And the response body path "newestChangeVersion" is stored in request variable "disabledRestampAfter"
+             When a GET request is made to "/ed-fi/students?studentUniqueId=1318005&minChangeVersion={disabledRestampFloor}&maxChangeVersion={disabledRestampAfter}&totalCount=true"
+             Then it should respond with 200
+              And total of records should be 1
+              And the response body path "0.id" should equal request variable "disabledRestampStudentId"
+              And the response body path "0.studentUniqueId" should have value "1318005"
+              And the response body path "0.birthDate" should have value "2014-08-14"
+              And the response body path "0.firstName" should have value "Disabled Change"
+              And the response body path "0.lastSurname" should have value "Query Student"
+             When a GET request is made to "/ed-fi/students/deletes?minChangeVersion={disabledRestampFloor}&maxChangeVersion={disabledRestampAfter}&totalCount=true"
+             Then it should respond with 200
+              And total of records should be 0
+             When a GET request is made to "/ed-fi/students/keyChanges?minChangeVersion={disabledRestampFloor}&maxChangeVersion={disabledRestampAfter}&totalCount=true"
+             Then it should respond with 200
+              And total of records should be 0
+
         @ods-migrated
         @e2e-ci-shard-3
         @reset-data-before-scenario
@@ -26,7 +121,11 @@ Feature: Live resource endpoints filter by change version.
              Then it should respond with 201
              When a GET request is made to "/changeQueries/v1/availableChangeVersions"
              Then it should respond with 200
-              And the response body path "newestChangeVersion" is stored in request variable "liveMidVersion"
+              And the response body path "newestChangeVersion" is stored in request variable "liveProgramAVersion"
+             When a GET request is made to "/ed-fi/programs?minChangeVersion={liveProgramAVersion}&totalCount=true"
+             Then it should respond with 200
+              And total of records should be 1
+              And the response body path "0.programName" should have value "Live Filter Program A"
              When a POST request is made to "/ed-fi/programs" with
                   """
                   {
@@ -36,7 +135,10 @@ Feature: Live resource endpoints filter by change version.
                   }
                   """
              Then it should respond with 201
-             When a GET request is made to "/ed-fi/programs?minChangeVersion={liveMidVersion}&totalCount=true"
+             When a GET request is made to "/changeQueries/v1/availableChangeVersions"
+             Then it should respond with 200
+              And the response body path "newestChangeVersion" is stored in request variable "liveProgramBVersion"
+             When a GET request is made to "/ed-fi/programs?minChangeVersion={liveProgramBVersion}&totalCount=true"
              Then it should respond with 200
               And total of records should be 1
               And the response body path "0.programName" should have value "Live Filter Program B"
@@ -78,9 +180,19 @@ Feature: Live resource endpoints filter by change version.
         @e2e-ci-shard-3
         @reset-data-before-scenario
         Scenario: 03 Live programs collection filters by a change version window
-             # The window relies on the ContentVersion-advances-per-write invariant: each write gets a
-             # strictly greater newestChangeVersion, so afterA < B's version <= afterB and the
-             # (afterA, afterB] window contains only Program B.
+             # The window relies on one ContentVersion allocation per write. Guard programs before and
+             # after the captured bounds prove the range is exact: liveWindowAfterA includes Program A
+             # at the inclusive lower bound, and liveWindowAfterB includes Program B at the inclusive
+             # upper bound, while the guard writes fall outside the range.
+             When a POST request is made to "/ed-fi/programs" with
+                  """
+                  {
+                    "programName": "Live Window Program Before",
+                    "programTypeDescriptor": "uri://ed-fi.org/ProgramTypeDescriptor#Bilingual",
+                    "educationOrganizationReference": { "educationOrganizationId": 920100001 }
+                  }
+                  """
+             Then it should respond with 201
              When a POST request is made to "/ed-fi/programs" with
                   """
                   {
@@ -105,10 +217,20 @@ Feature: Live resource endpoints filter by change version.
              When a GET request is made to "/changeQueries/v1/availableChangeVersions"
              Then it should respond with 200
               And the response body path "newestChangeVersion" is stored in request variable "liveWindowAfterB"
+             When a POST request is made to "/ed-fi/programs" with
+                  """
+                  {
+                    "programName": "Live Window Program After",
+                    "programTypeDescriptor": "uri://ed-fi.org/ProgramTypeDescriptor#Bilingual",
+                    "educationOrganizationReference": { "educationOrganizationId": 920100001 }
+                  }
+                  """
+             Then it should respond with 201
              When a GET request is made to "/ed-fi/programs?minChangeVersion={liveWindowAfterA}&maxChangeVersion={liveWindowAfterB}&totalCount=true"
              Then it should respond with 200
-              And total of records should be 1
-              And the response body path "0.programName" should have value "Live Window Program B"
+              And total of records should be 2
+              And the response body path "0.programName" should have value "Live Window Program A"
+              And the response body path "1.programName" should have value "Live Window Program B"
 
         @e2e-ci-shard-3
         @reset-data-before-scenario

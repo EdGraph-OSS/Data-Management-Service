@@ -3,22 +3,72 @@
 // The Ed-Fi Alliance licenses this file to you under the Apache License, Version 2.0.
 // See the LICENSE and NOTICES files in the project root for more information.
 
-using System.Globalization;
-using System.Text.Json.Nodes;
-using EdFi.DataManagementService.Core.ApiSchema.Model;
 using EdFi.DataManagementService.Core.ChangeQueries;
+using EdFi.DataManagementService.Core.Configuration;
 using EdFi.DataManagementService.Core.External.Model;
 using EdFi.DataManagementService.Core.Model;
+using EdFi.DataManagementService.Core.Paging;
 using EdFi.DataManagementService.Core.Pipeline;
 using EdFi.DataManagementService.Core.Response;
+using EdFi.DataManagementService.Core.Telemetry;
+using EdFi.DataManagementService.Core.Validation;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using static EdFi.DataManagementService.Core.Response.FailureResponse;
 
 namespace EdFi.DataManagementService.Core.Middleware;
 
-internal class ValidateQueryMiddleware(ILogger _logger, int _maximumPageSize) : IPipelineStep
+/// <summary>
+/// Validates the paging, change-version, and resource-filter query parameters of a request.
+/// </summary>
+/// <param name="_cursorParametersRecognized">
+/// Whether this pipeline's operation supports cursor paging. True for live GET-many, false for
+/// Change Query endpoints, which must reject the cursor parameters rather than acquire them.
+/// Recognition is a property of pipeline composition rather than something inferred at run time, so
+/// a reader can see at the composition site which operations page by cursor.
+/// </param>
+/// <param name="_collectionPagingTelemetry">
+/// Where a rejection is counted. Required rather than defaulted to the no-op because this step is
+/// composed into the Change Query pipeline as well, whose endpoints do not page by cursor and whose
+/// faults are therefore not collection-paging events. A required parameter makes that second site a
+/// compile error that forces an explicit choice, where a default would quietly pick one.
+/// </param>
+/// <param name="_useLegacyDocumentIdOrderingForChangeQueries">
+/// The deployment-wide kill switch that restores <c>DocumentId</c> page-selection ordering for every
+/// change-version window. Supplied at composition rather than read here, so the configured value
+/// enters request handling at the pipeline that serves the request.
+/// </param>
+internal class ValidateQueryMiddleware(
+    ILogger _logger,
+    int _maximumPageSize,
+    bool _cursorParametersRecognized,
+    ICollectionPagingTelemetry _collectionPagingTelemetry,
+    bool _useLegacyDocumentIdOrderingForChangeQueries
+) : IPipelineStep
 {
-    private static readonly string[] _paginationQueryParameters = ["limit", "offset", "totalCount"];
+    /// <summary>
+    /// Resolves the page anchor from the request's change-version window and the effective data-store
+    /// target serving it. Core owns that resolution because both sides of the request need the anchor
+    /// and there is only one rule: this step stamps it on the request, and the backend compiles page
+    /// selection against the column it names.
+    /// </summary>
+    private readonly ChangeQueryPageOrderingPolicy _orderingPolicy = new(
+        _useLegacyDocumentIdOrderingForChangeQueries
+    );
+
+    /// <summary>
+    /// The paging names this operation parses and excludes from filter matching. Spelled from the
+    /// constants the cursor validator reads, because <see cref="Paging.PartitionRequestValidator" />
+    /// reserves the same five names from the same constants: matching filters over a different set of
+    /// names than /partitions rejects would let one operation filter on a resource property the other
+    /// treats as paging.
+    /// </summary>
+    private static readonly string[] _paginationQueryParameters =
+    [
+        CursorRequestValidator.LimitParameter,
+        CursorRequestValidator.OffsetParameter,
+        CursorRequestValidator.TotalCountParameter,
+    ];
 
     /// <summary>
     /// Finds and sets PaginationParameters on the requestInfo by parsing the client request.
@@ -62,21 +112,15 @@ internal class ValidateQueryMiddleware(ILogger _logger, int _maximumPageSize) : 
             }
         }
 
-        if (requestInfo.FrontendRequest.QueryParameters.ContainsKey("totalCount"))
+        // Unlike offset and limit, a parsed value needs no separate assignment: TryParse writes it
+        // straight to totalCount, and a failed parse writes false, which is also the value used when
+        // the parameter is omitted. The error recorded below stops the parameters being applied at all.
+        if (
+            requestInfo.FrontendRequest.QueryParameters.ContainsKey("totalCount")
+            && !bool.TryParse(requestInfo.FrontendRequest.QueryParameters["totalCount"], out totalCount)
+        )
         {
-            if (!bool.TryParse(requestInfo.FrontendRequest.QueryParameters["totalCount"], out totalCount))
-            {
-                errors.Add("TotalCount must be a boolean value.");
-            }
-            else
-            {
-                totalCount = bool.TryParse(
-                    requestInfo.FrontendRequest.QueryParameters["totalCount"],
-                    out bool totalValue
-                )
-                    ? totalValue
-                    : totalCount;
-            }
+            errors.Add("TotalCount must be a boolean value.");
         }
 
         if (errors.Count == 0)
@@ -91,59 +135,6 @@ internal class ValidateQueryMiddleware(ILogger _logger, int _maximumPageSize) : 
         return errors;
     }
 
-    /// <summary>
-    /// Returns a QueryElement for the given client query term using the list of possible query fields,
-    /// or null if there is not a match with a valid query field name.
-    /// </summary>
-    private static QueryElementAndType? QueryElementFrom(
-        KeyValuePair<string, string> clientQueryTerm,
-        QueryField[] possibleQueryFields
-    )
-    {
-        QueryField? matchingQueryField = possibleQueryFields.FirstOrDefault(
-            queryField =>
-                queryField is not null
-                && string.Equals(
-                    queryField.QueryFieldName,
-                    clientQueryTerm.Key,
-                    StringComparison.OrdinalIgnoreCase
-                ),
-            null
-        );
-
-        if (matchingQueryField is null)
-        {
-            return null;
-        }
-
-        if (
-            matchingQueryField.DocumentPathsWithType[0].Type == "date-time"
-            && DateTime.TryParse(
-                clientQueryTerm.Value,
-                CultureInfo.InvariantCulture,
-                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
-                out DateTime dateTimeValue
-            )
-        )
-        {
-            string fullDateTimeString = dateTimeValue
-                .ToUniversalTime()
-                .ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture);
-
-            return new QueryElementAndType(
-                QueryFieldName: clientQueryTerm.Key,
-                DocumentPathsAndTypes: matchingQueryField.DocumentPathsWithType,
-                Value: fullDateTimeString
-            );
-        }
-
-        return new QueryElementAndType(
-            QueryFieldName: clientQueryTerm.Key,
-            DocumentPathsAndTypes: matchingQueryField.DocumentPathsWithType,
-            Value: clientQueryTerm.Value
-        );
-    }
-
     public async Task Execute(RequestInfo requestInfo, Func<Task> next)
     {
         _logger.LogDebug(
@@ -151,31 +142,115 @@ internal class ValidateQueryMiddleware(ILogger _logger, int _maximumPageSize) : 
             requestInfo.FrontendRequest.TraceId.Value
         );
 
-        List<string> errors = SetPaginationParametersOn(requestInfo, _maximumPageSize);
-
-        if (errors.Count > 0)
+        // All three parameter faults below - cursor, traditional pagination, and change-version -
+        // answer with the same shell, so they share one construction rather than three copies that
+        // have to be kept in step, and counting the rejection here covers all three for the same
+        // reason. The media type is not stated here at all, because it comes from the FrontendResponse
+        // default.
+        FrontendResponse ParameterValidationFailed(string[] errors)
         {
-            JsonNode failureResponse = FailureResponse.ForBadRequest(
-                "The request could not be processed. See 'errors' for details.",
-                requestInfo.FrontendRequest.TraceId,
-                [],
-                errors.ToArray()
-            );
+            RecordValidationRejected(requestInfo);
 
-            _logger.LogDebug(
-                "'{Status}'.'{EndpointName}' - {TraceId}",
-                "400",
-                requestInfo.PathComponents.EndpointName,
-                requestInfo.FrontendRequest.TraceId.Value
+            return new(
+                StatusCode: 400,
+                Body: ForParameterValidation(errors, requestInfo.FrontendRequest.TraceId),
+                Headers: []
             );
-
-            requestInfo.FrontendResponse = new FrontendResponse(StatusCode: 400, Body: failureResponse, []);
-            return;
         }
 
+        // The change-version window is parsed ahead of every paging check because the page anchor is
+        // resolved from it, and cursor validation needs the anchor: a continuation token carries the
+        // anchor it was issued for, and a token whose anchor disagrees with this request's window is
+        // not replayable. Only the parsing moves. This result's errors are still reported from the
+        // position they were reported from before - after cursor and traditional pagination faults -
+        // so the messages a client sees, and their precedence, are unchanged.
         ChangeVersionValidationResult changeVersionResult = ChangeVersionParameterValidator.Validate(
             requestInfo.FrontendRequest.QueryParameters
         );
+
+        // Resolved from the parsed window rather than from parameter presence: '?maxChangeVersion='
+        // parses to null, so it is not a max-bearing window and does not move the anchor.
+        //
+        // The window alone does not decide it. A frozen snapshot cannot move a row later within a
+        // still-open window, so the hazard that keeps a live min-only walk on DocumentId does not
+        // exist there and every windowed shape can take the ContentVersion anchor. Only a snapshot
+        // qualifies: a read replica keeps applying changes, so it stays on the live rule along with
+        // the primary. The target is read, never re-derived - target selection is composed ahead of
+        // this step in every pipeline that reaches it, and GetEffectiveTarget throwing when unset is
+        // the documented behavior, so a pipeline that skipped selection fails loudly here rather than
+        // quietly anchoring a snapshot walk as if it were live.
+        PageOrderingMode pageOrderingMode = _orderingPolicy.ResolveFor(
+            changeVersionResult.Range,
+            requestInfo
+                .ScopedServiceProvider.GetRequiredService<IDataStoreSelection>()
+                .GetEffectiveTarget()
+                .Kind
+        );
+
+        // A faulty window resolves no anchor at all, rather than whichever one its surviving bounds
+        // happen to imply. An unparseable maximum parses to null exactly as an empty one does, and an
+        // inverted window parses both bounds cleanly, so in either case the anchor above describes a
+        // window this step is about to reject. Comparing a token against it would tell a mid-walk
+        // client that the token it is holding is invalid - the one piece of state it cannot rebuild -
+        // when the fault is the parameter beside it, and the natural response, discarding the token
+        // and restarting the walk, is the expensive one. Only the marker comparison is skipped: an
+        // undecodable token is still reported as one, and the window's own error is reported below.
+        PageOrderingMode? resolvedPageOrderingMode =
+            changeVersionResult.Errors.Count == 0 ? pageOrderingMode : null;
+
+        // A request that supplied either cursor parameter is validated by the cursor precedence.
+        // Everything else keeps the traditional parsing and its existing messages. Both paths answer
+        // a pagination fault with the parameter-validation shell, matching ODS/API.
+        CursorValidationResult cursorResult = _cursorParametersRecognized
+            ? CursorRequestValidator.Validate(
+                requestInfo.FrontendRequest.QueryParameters,
+                _maximumPageSize,
+                resolvedPageOrderingMode
+            )
+            : CursorValidationResult.NotCursorRequest.Instance;
+
+        if (cursorResult is CursorValidationResult.Invalid invalidCursorRequest)
+        {
+            _logger.LogDebug(
+                "Cursor parameter validation error - {TraceId}",
+                requestInfo.FrontendRequest.TraceId.Value
+            );
+
+            requestInfo.FrontendResponse = ParameterValidationFailed([invalidCursorRequest.Error]);
+            return;
+        }
+
+        // Determined here, but the typed collection-paging choice reaches request state only at the
+        // accepting exit below, its single assignment site: the change-version and query-field steps
+        // that follow can still answer the request, and a request they reject must not carry a paging
+        // mode a handler could act on. That deferral covers the typed choice. The traditional branch
+        // assigns pagination parameters as soon as they parse cleanly, which is ahead of those later
+        // steps, so a request one of them rejects does keep parsed pagination parameters.
+        CollectionPaging collectionPaging;
+
+        if (cursorResult is CursorValidationResult.Valid validCursorRequest)
+        {
+            collectionPaging = validCursorRequest.Paging;
+        }
+        else
+        {
+            List<string> errors = SetPaginationParametersOn(requestInfo, _maximumPageSize);
+
+            if (errors.Count > 0)
+            {
+                _logger.LogDebug(
+                    "'{Status}'.'{EndpointName}' - {TraceId}",
+                    "400",
+                    requestInfo.PathComponents.EndpointName,
+                    requestInfo.FrontendRequest.TraceId.Value
+                );
+
+                requestInfo.FrontendResponse = ParameterValidationFailed([.. errors]);
+                return;
+            }
+
+            collectionPaging = new CollectionPaging.Traditional(requestInfo.PaginationParameters);
+        }
 
         if (changeVersionResult.Errors.Count > 0)
         {
@@ -184,194 +259,135 @@ internal class ValidateQueryMiddleware(ILogger _logger, int _maximumPageSize) : 
                 requestInfo.FrontendRequest.TraceId.Value
             );
 
-            requestInfo.FrontendResponse = new FrontendResponse(
-                StatusCode: 400,
-                Body: ForParameterValidation(
-                    [.. changeVersionResult.Errors],
-                    requestInfo.FrontendRequest.TraceId
-                ),
-                Headers: []
-            );
+            requestInfo.FrontendResponse = ParameterValidationFailed([.. changeVersionResult.Errors]);
             return;
         }
 
+        // The window and the anchor it resolves to are assigned together: the anchor is a function of
+        // the window and of the data store serving the request, so a request carrying the window
+        // without the anchor it resolved would describe a page selection that cannot exist.
         requestInfo.ChangeVersionRange = changeVersionResult.Range;
+        requestInfo.PageOrderingMode = pageOrderingMode;
 
         // Pagination parameters are matched case-sensitively, consistent with how they are
         // parsed above; change-version parameters are matched case-insensitively, consistent
         // with how the validator looks them up.
-        IEnumerable<KeyValuePair<string, string>> nonPaginationQueryTerms = requestInfo
-            .FrontendRequest.QueryParameters.ExceptBy(_paginationQueryParameters, (term) => term.Key)
-            .ExceptBy(
-                ChangeVersionParameterValidator.ReservedParameterNames,
-                (term) => term.Key,
-                StringComparer.OrdinalIgnoreCase
-            );
+        //
+        // The cursor parameters are excluded in both modes, for different reasons. Where they are
+        // recognized, the cursor validation above has already consumed them. Where they are not,
+        // excluding them here is what lets the Change Query step reject them by name instead of the
+        // filter validator answering first with the resource-field wording. Excluding a name is not
+        // accepting it: an operation that does not recognize these rejects them in the step that
+        // follows.
+        ResourceQueryFilterResult filterResult = ResourceQueryFilterValidator.Validate(
+            requestInfo.FrontendRequest.QueryParameters,
+            requestInfo.ResourceSchema.QueryFields.ToArray(),
+            ordinalExcludedNames: [.. _paginationQueryParameters, .. CursorRequestValidator.CursorParameters],
+            ignoreCaseExcludedNames: ChangeVersionParameterValidator.ReservedParameterNames
+        );
 
-        QueryField[] possibleQueryFields = requestInfo.ResourceSchema.QueryFields.ToArray();
-
-        List<QueryElement> queryElements = [];
-
-        Dictionary<string, string[]> validationErrors = [];
-
-        foreach (KeyValuePair<string, string> clientQueryTerm in nonPaginationQueryTerms)
+        switch (filterResult)
         {
-            QueryElementAndType? queryElementAndType = QueryElementFrom(clientQueryTerm, possibleQueryFields);
-
-            if (queryElementAndType == null)
-            {
-                JsonNode failureResponse = FailureResponse.ForBadRequest(
-                    "The request could not be processed. See 'errors' for details.",
-                    requestInfo.FrontendRequest.TraceId,
-                    [],
-                    [$@"The query field '{clientQueryTerm.Key}' is not valid for this resource."]
-                );
+            case ResourceQueryFilterResult.UnknownQueryField unknownQueryField:
+                RecordValidationRejected(requestInfo);
 
                 requestInfo.FrontendResponse = new FrontendResponse(
                     StatusCode: 400,
-                    Body: failureResponse,
+                    Body: FailureResponse.ForBadRequest(
+                        "The request could not be processed. See 'errors' for details.",
+                        requestInfo.FrontendRequest.TraceId,
+                        [],
+                        [
+                            $@"The query field '{unknownQueryField.QueryFieldName}' is not valid for this resource.",
+                        ]
+                    ),
                     []
                 );
                 return;
-            }
 
-            string jsonPathString = queryElementAndType.DocumentPathsAndTypes[0].JsonPathString;
-            string queryFieldName = queryElementAndType.QueryFieldName;
-            string queryFieldValue = queryElementAndType.Value;
-            string type = queryElementAndType.DocumentPathsAndTypes[0].Type;
+            case ResourceQueryFilterResult.InvalidValues invalidValues:
+                _logger.LogDebug(
+                    "Query parameter format error - {TraceId}",
+                    requestInfo.FrontendRequest.TraceId.Value
+                );
 
-            switch (type)
-            {
-                case "boolean":
-                    if (!bool.TryParse(queryFieldValue, out _))
-                    {
-                        AddValidationError(validationErrors, jsonPathString, queryFieldValue, queryFieldName);
-                    }
-                    queryFieldValue = queryFieldValue.ToLower();
-                    break;
-                case "date":
-                    if (
-                        DateTime.TryParse(
-                            queryFieldValue,
-                            CultureInfo.InvariantCulture,
-                            DateTimeStyles.None,
-                            out var dateTime
-                        )
-                    )
-                    {
-                        // query parameter was valid but ensure we only pass the date portion downstream to queries
-                        queryFieldValue = dateTime.ToString("yyyy-MM-dd");
-                    }
-                    else
-                    {
-                        AddValidationError(validationErrors, jsonPathString, queryFieldValue, queryFieldName);
-                    }
-                    break;
-                case "date-time":
-                    if (
-                        !DateTime.TryParse(
-                            queryFieldValue,
-                            CultureInfo.InvariantCulture,
-                            DateTimeStyles.None,
-                            out _
-                        )
-                    )
-                    {
-                        AddValidationError(validationErrors, jsonPathString, queryFieldValue, queryFieldName);
-                    }
-                    break;
+                RecordValidationRejected(requestInfo);
 
-                case "number":
-                    if (!decimal.TryParse(queryFieldValue, out _))
-                    {
-                        AddValidationError(validationErrors, jsonPathString, queryFieldValue, queryFieldName);
-                    }
-                    break;
+                requestInfo.FrontendResponse = new FrontendResponse(
+                    StatusCode: 400,
+                    Body: ForDataValidation(
+                        "Data validation failed. See 'validationErrors' for details.",
+                        traceId: requestInfo.FrontendRequest.TraceId,
+                        invalidValues.ValidationErrors,
+                        []
+                    ),
+                    Headers: []
+                );
+                return;
 
-                case "string":
-                    if (queryFieldValue is not string)
-                    {
-                        AddValidationError(validationErrors, jsonPathString, queryFieldValue, queryFieldName);
-                    }
-                    break;
+            case ResourceQueryFilterResult.Valid valid:
+                requestInfo.CollectionPaging = collectionPaging;
+                requestInfo.QueryElements = valid.QueryElements;
 
-                case "time":
-                    if (
-                        !DateTime.TryParseExact(
-                            queryFieldValue,
-                            "HH:mm:ss",
-                            CultureInfo.InvariantCulture,
-                            DateTimeStyles.None,
-                            out _
-                        )
-                    )
-                    {
-                        AddValidationError(validationErrors, jsonPathString, queryFieldValue, queryFieldName);
-                    }
-                    break;
-                default:
-                    throw new InvalidOperationException(
-                        $"ValidateQueryMiddleware found an unsupported type {type}"
-                    );
-            }
+                await next();
+                return;
 
-            // Convert QueryElementAndType to QueryElement
-            queryElements.Add(
-                new(
-                    queryElementAndType.QueryFieldName,
-                    queryElementAndType
-                        .DocumentPathsAndTypes.Select(x => new JsonPath(x.JsonPathString))
-                        .ToArray(),
-                    queryFieldValue,
-                    type
+            default:
+                throw new InvalidOperationException(
+                    $"ValidateQueryMiddleware received an unhandled resource query filter result "
+                        + $"'{filterResult.GetType().Name}'."
+                );
+        }
+    }
+
+    /// <summary>
+    /// Counts a request this step answered. No duration is recorded: nothing executed.
+    /// </summary>
+    /// <remarks>
+    /// A telemetry fault never reaches the client. Counting runs ahead of the rejection this step is
+    /// about to answer with, so an escaping throw would replace a 400 that names what the client got
+    /// wrong with a system error that names nothing. Recording is not free of throwing code: an
+    /// instrument invokes whatever measurement callbacks the host has subscribed, which is third-party
+    /// code on this thread.
+    /// </remarks>
+    private void RecordValidationRejected(RequestInfo requestInfo)
+    {
+        try
+        {
+            _collectionPagingTelemetry.RecordValidationRejected(
+                CollectionPagingTelemetryContext.ForPagingMode(
+                    RejectedPagingMode(requestInfo),
+                    CollectionPagingTelemetryLabel.NoCommandCategory,
+                    requestInfo.MappingSet?.Key.Dialect,
+                    CollectionPagingTelemetryLabel.ValidationRejectedOutcome
                 )
             );
         }
-
-        if (validationErrors.Count != 0)
+        catch (Exception ex)
         {
-            _logger.LogDebug(
-                "Query parameter format error - {TraceId}",
+            _logger.LogWarning(
+                ex,
+                "Collection paging telemetry was not recorded for a validation rejection - {TraceId}",
                 requestInfo.FrontendRequest.TraceId.Value
             );
-
-            requestInfo.FrontendResponse = new FrontendResponse(
-                StatusCode: 400,
-                Body: ForDataValidation(
-                    "Data validation failed. See 'validationErrors' for details.",
-                    traceId: requestInfo.FrontendRequest.TraceId,
-                    validationErrors,
-                    []
-                ),
-                Headers: []
-            );
-            return;
-        }
-        else
-        {
-            requestInfo.QueryElements = queryElements.ToArray();
-
-            await next();
         }
     }
 
-    private static void AddValidationError(
-        Dictionary<string, string[]> errors,
-        string jsonPathString,
-        object queryValue,
-        string queryFieldName
-    )
-    {
-        if (!errors.ContainsKey(jsonPathString))
-        {
-            errors[jsonPathString] = [];
-        }
-
-        string errorMessage = $"The value '{queryValue}' is not valid for {queryFieldName}.";
-        string[] updatedErrors = new string[errors[jsonPathString].Length + 1];
-        errors[jsonPathString].CopyTo(updatedErrors, 0);
-        updatedErrors[^1] = errorMessage;
-
-        errors[jsonPathString] = updatedErrors;
-    }
+    /// <summary>
+    /// The paging mode of a request this step is rejecting, read from the query string rather than from
+    /// request state.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="RequestInfo.CollectionPaging" /> is assigned only at the accepting exit, so a rejected
+    /// cursor request still carries the traditional default and would be counted as traditional traffic.
+    /// The same constant array the cursor validator reads is used here, so the two cannot disagree about
+    /// what makes a request a cursor request.
+    /// </remarks>
+    private static string RejectedPagingMode(RequestInfo requestInfo) =>
+        Array.Exists(
+            CursorRequestValidator.CursorParameters,
+            requestInfo.FrontendRequest.QueryParameters.ContainsKey
+        )
+            ? CollectionPagingTelemetryLabel.CursorPagingMode
+            : CollectionPagingTelemetryLabel.TraditionalPagingMode;
 }

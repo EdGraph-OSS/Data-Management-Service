@@ -52,7 +52,7 @@ file static class MssqlProfileIfMatchEtagTestSupport
         services.AddSingleton<IReadableProfileProjector, ReadableProfileProjector>();
         services.AddNoOpDocumentLinkSlugResolver();
         services.AddScoped<RelationalDocumentStoreRepository>();
-        services.AddMssqlReferenceResolver();
+        services.AddMssqlBackendIntegrationTestServices();
 
         return services.BuildServiceProvider(
             new ServiceProviderOptions { ValidateOnBuild = true, ValidateScopes = true }
@@ -157,13 +157,16 @@ file static class MssqlProfileIfMatchEtagTestSupport
             MappingSet: mappingSet,
             QueryElements: [],
             AuthorizationStrategyEvaluators: [],
-            PaginationParameters: new PaginationParameters(
-                Limit: MaximumPageSize,
-                Offset: 0,
-                TotalCount: false,
-                MaximumPageSize: MaximumPageSize
+            Paging: new CollectionPaging.Traditional(
+                new PaginationParameters(
+                    Limit: MaximumPageSize,
+                    Offset: 0,
+                    TotalCount: false,
+                    MaximumPageSize: MaximumPageSize
+                )
             ),
             TraceId: new TraceId(traceId),
+            PageOrderingMode: PageOrderingMode.DocumentId,
             ReadableProfileProjectionContext: readableProfileProjectionContext
         );
 

@@ -4,13 +4,24 @@
 // See the LICENSE and NOTICES files in the project root for more information.
 
 using EdFi.DataManagementService.Core.External.Backend;
-using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
 
 namespace EdFi.DataManagementService.Backend.Mssql;
 
-public class MssqlResourceKeyRowReader(ILogger<MssqlResourceKeyRowReader> logger) : IResourceKeyRowReader
+public class MssqlResourceKeyRowReader : IResourceKeyRowReader
 {
+    private readonly IMssqlConnectionAcquisition _acquisition;
+    private readonly ILogger<MssqlResourceKeyRowReader> _logger;
+
+    public MssqlResourceKeyRowReader(
+        IMssqlConnectionAcquisition acquisition,
+        ILogger<MssqlResourceKeyRowReader> logger
+    )
+    {
+        _acquisition = acquisition ?? throw new ArgumentNullException(nameof(acquisition));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    }
+
     private const string ResourceKeySelectSql = """
         SELECT [ResourceKeyId], [ProjectName], [ResourceName], [ResourceVersion]
         FROM [dms].[ResourceKey]
@@ -18,16 +29,29 @@ public class MssqlResourceKeyRowReader(ILogger<MssqlResourceKeyRowReader> logger
         """;
 
     public async Task<IReadOnlyList<ResourceKeyRow>> ReadResourceKeyRowsAsync(
-        string connectionString,
+        EffectiveDataStoreTarget target,
         CancellationToken cancellationToken = default
     )
     {
-        logger.LogDebug("Reading resource key rows from dms.ResourceKey");
+        ArgumentNullException.ThrowIfNull(target);
 
-        await using var connection = new SqlConnection(connectionString);
-        await connection.OpenAsync(cancellationToken);
+        _logger.LogDebug("Reading resource key rows from dms.ResourceKey");
 
-        await using var command = connection.CreateCommand();
+        // The guard covers taking the lease as well as the open, because the connection string is
+        // parsed twice before the open - once realizing the derivative's effective string, once in the
+        // SqlConnection constructor - so a provider-invalid string fails at one of those rather than at
+        // the open. Command execution below is deliberately outside it; a failure reading the rows is
+        // not an unreachable database.
+        await using MssqlLeasedConnection leased = await ConnectionAcquisition.GuardAsync(
+            () => MssqlLeasedConnection.OpenAsync(_acquisition, target, cancellationToken),
+            target.Kind,
+            MssqlConnectionAcquisitionFailure.IsExpected,
+            MssqlConnectionAcquisitionFailure.Describe,
+            _logger,
+            cancellationToken
+        );
+
+        await using var command = leased.Connection.CreateCommand();
         command.CommandText = ResourceKeySelectSql;
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
@@ -46,7 +70,7 @@ public class MssqlResourceKeyRowReader(ILogger<MssqlResourceKeyRowReader> logger
             );
         }
 
-        logger.LogDebug("Read {Count} resource key rows", rows.Count);
+        _logger.LogDebug("Read {Count} resource key rows", rows.Count);
 
         return rows;
     }

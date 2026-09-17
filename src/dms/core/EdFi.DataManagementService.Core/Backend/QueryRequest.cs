@@ -24,8 +24,9 @@ namespace EdFi.DataManagementService.Core.Backend;
 /// <param name="AuthorizationStrategyEvaluators">
 /// Collection of authorization strategy filters, each specifying collection of filters and filter operator.
 /// </param>
-/// <param name="PaginationParameters">The pagination parameters for this query.</param>
+/// <param name="Paging">The paging mode and its inputs for this query.</param>
 /// <param name="TraceId">The request TraceId.</param>
+/// <param name="TenantKey">The normalized request tenant key.</param>
 /// <param name="ReadableProfileProjectionContext">
 /// Optional readable-profile projection inputs when a readable profile applies to the request.
 /// </param>
@@ -33,17 +34,27 @@ namespace EdFi.DataManagementService.Core.Backend;
 /// Optional validated minChangeVersion / maxChangeVersion window. Null is normalized to
 /// <see cref="External.Model.ChangeVersionRange.None"/> on the relational seam.
 /// </param>
+/// <param name="PageOrderingMode">
+/// The page anchor Core resolved from the change-version window and the data store serving the
+/// request. Required rather than defaulted, and
+/// placed ahead of the optional parameters to stay that way: a default would let a construction site
+/// that forgot it keep compiling while anchoring a ContentVersion-ordered page on DocumentId, which
+/// hands out a continuation that skips rows. This is the same rule the descriptor request records
+/// carry, so neither contract family fails more quietly than the other.
+/// </param>
 internal sealed record RelationalQueryRequest(
     ResourceInfo ResourceInfo,
     RelationalAuthorizationContext AuthorizationContext,
     MappingSet MappingSet,
     QueryElement[] QueryElements,
     AuthorizationStrategyEvaluator[] AuthorizationStrategyEvaluators,
-    PaginationParameters PaginationParameters,
+    CollectionPaging Paging,
     TraceId TraceId,
+    PageOrderingMode PageOrderingMode,
     ReadableProfileProjectionContext? ReadableProfileProjectionContext = null,
     ChangeVersionRange? ChangeVersionRange = null,
-    ResponseContentCoding ResponseContentCoding = ResponseContentCoding.Identity
+    ResponseContentCoding ResponseContentCoding = ResponseContentCoding.Identity,
+    string TenantKey = ""
 ) : IQueryRequest
 {
     ChangeVersionRange IQueryRequest.ChangeVersionRange =>

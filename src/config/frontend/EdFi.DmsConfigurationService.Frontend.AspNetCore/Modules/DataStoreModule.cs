@@ -12,8 +12,6 @@ using EdFi.DmsConfigurationService.DataModel.Model.DataStore;
 using EdFi.DmsConfigurationService.Frontend.AspNetCore.Infrastructure;
 using EdFi.DmsConfigurationService.Frontend.AspNetCore.Infrastructure.Authorization;
 using EdFi.DmsConfigurationService.Frontend.AspNetCore.Models;
-using FluentValidation;
-using FluentValidation.Results;
 
 namespace EdFi.DmsConfigurationService.Frontend.AspNetCore.Modules;
 
@@ -74,7 +72,7 @@ public class DataStoreModule : IEndpointModule
     }
 
     private static async Task<IResult> GetById(
-        long id,
+        int id,
         HttpContext httpContext,
         IDataStoreRepository repository
     )
@@ -95,21 +93,16 @@ public class DataStoreModule : IEndpointModule
     }
 
     private static async Task<IResult> Update(
-        long id,
+        int id,
         DataStoreUpdateCommand command,
         DataStoreUpdateCommand.Validator validator,
         HttpContext httpContext,
         IDataStoreRepository repository
     )
     {
-        await validator.GuardAsync(command);
+        PutGuards.GuardRouteIdMatchesBodyId(id, command.Id);
 
-        if (command.Id != id)
-        {
-            throw new ValidationException(
-                new[] { new ValidationFailure("Id", "Request body id must match the id in the url.") }
-            );
-        }
+        await validator.GuardAsync(command);
 
         var updateResult = await repository.UpdateDataStore(command);
 
@@ -128,7 +121,7 @@ public class DataStoreModule : IEndpointModule
     }
 
     private static async Task<IResult> Delete(
-        long id,
+        int id,
         HttpContext httpContext,
         IDataStoreRepository repository
     )
@@ -149,7 +142,7 @@ public class DataStoreModule : IEndpointModule
     }
 
     private static async Task<IResult> GetApplicationsByDataStore(
-        long id,
+        int id,
         IDataStoreRepository repository,
         [AsParameters] PagingQuery query,
         HttpContext httpContext

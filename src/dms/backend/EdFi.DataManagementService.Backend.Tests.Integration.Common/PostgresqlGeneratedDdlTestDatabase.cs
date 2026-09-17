@@ -23,6 +23,8 @@ public sealed class PostgresqlGeneratedDdlTestDatabase : IAsyncDisposable
     private const int DefaultCommandTimeoutSeconds = 300;
     private static readonly string[] _generatedDdlBaselineTables =
     [
+        "DataStoreIdentity",
+        "DocumentCacheState",
         "EffectiveSchema",
         "ResourceKey",
         "SchemaComponent",
@@ -97,6 +99,14 @@ public sealed class PostgresqlGeneratedDdlTestDatabase : IAsyncDisposable
     public string DatabaseName { get; }
 
     public string ConnectionString { get; }
+
+    /// <summary>
+    /// Per-statement timeout used by the query and execute helpers. The default is deliberately short enough
+    /// that a hung statement fails fast; bulk-generation fixtures raise it for the duration of generation,
+    /// because one set-based statement over six figures of rows fires two row-level triggers per row and runs
+    /// well past it.
+    /// </summary>
+    public int CommandTimeoutSeconds { get; set; } = DefaultCommandTimeoutSeconds;
 
     public static async Task<PostgresqlGeneratedDdlTestDatabase> CreateEmptyAsync()
     {
@@ -317,7 +327,7 @@ public sealed class PostgresqlGeneratedDdlTestDatabase : IAsyncDisposable
         await using var connection = await _dataSource.OpenConnectionAsync();
         await using var command = connection.CreateCommand();
         command.CommandText = sql;
-        command.CommandTimeout = DefaultCommandTimeoutSeconds;
+        command.CommandTimeout = CommandTimeoutSeconds;
         command.Parameters.AddRange(parameters);
 
         var rows = new List<IReadOnlyDictionary<string, object?>>();
@@ -349,7 +359,7 @@ public sealed class PostgresqlGeneratedDdlTestDatabase : IAsyncDisposable
         command.CommandText = sql;
         // Single-row dms.Document deletes cascade across the full FK graph; keep the
         // generous shared timeout so cold CI runners don't trip the driver default.
-        command.CommandTimeout = DefaultCommandTimeoutSeconds;
+        command.CommandTimeout = CommandTimeoutSeconds;
         command.Parameters.AddRange(parameters);
 
         return await command.ExecuteNonQueryAsync();
@@ -372,7 +382,7 @@ public sealed class PostgresqlGeneratedDdlTestDatabase : IAsyncDisposable
         await using var connection = await _dataSource.OpenConnectionAsync();
         await using var command = connection.CreateCommand();
         command.CommandText = sql;
-        command.CommandTimeout = DefaultCommandTimeoutSeconds;
+        command.CommandTimeout = CommandTimeoutSeconds;
         command.Parameters.AddRange(parameters);
 
         var result = await command.ExecuteScalarAsync();

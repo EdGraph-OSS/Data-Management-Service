@@ -1,0 +1,105 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <IsPackable>false</IsPackable>
+        <IsTestProject>true</IsTestProject>
+    </PropertyGroup>
+    <!--
+        Fixtures/ holds whole plugin projects that are published as test assets, several of them
+        deliberately malformed. They are not part of this assembly and must not be compiled into it,
+        embedded in it, or copied by its default None glob; the staging target below is the only thing
+        that builds them.
+    -->
+    <ItemGroup>
+        <Compile Remove="Fixtures/**" />
+        <EmbeddedResource Remove="Fixtures/**" />
+        <None Remove="Fixtures/**" />
+    </ItemGroup>
+    <!--
+        The staging regressions run PluginFixtures.targets against a temporary output tree of their own,
+        so they need the path of that file. A compiled test cannot otherwise know where its own sources
+        are, and deriving it by walking up from the output directory would encode this project's build
+        layout in a test about something else.
+    -->
+    <ItemGroup>
+        <AssemblyMetadata
+            Include="PluginFixtureTargetsFile"
+            Value="$(MSBuildThisFileDirectory)PluginFixtures.targets"
+        />
+    </ItemGroup>
+    <ItemGroup>
+        <PackageReference Include="FluentAssertions" />
+        <PackageReference Include="Microsoft.Extensions.Configuration" />
+        <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" />
+        <PackageReference Include="Microsoft.Extensions.Configuration.Json" />
+        <!--
+            The host side of the isolation regressions. A plugin's ContributeServices registers into a
+            real ServiceCollection and the options it binds are resolved from a real provider, so this
+            project has to be able to build one and to name IOptions<T>. Both also put the host's own
+            copies of Microsoft.Extensions.Options and Microsoft.Extensions.Primitives in the default
+            context, which is what host-first then serves to the plugin in place of its own.
+        -->
+        <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+        <!--
+            The wrapper's logging carve-out is asserted against the real calls a plugin would make,
+            AddLogging and ClearProviders, over descriptors a real AddConsole registered. Both live in
+            these two packages rather than in the abstractions the loader names its four service types
+            from, and imitating either would prove nothing about the helper a plugin actually calls.
+        -->
+        <!--
+            Only to name IHostedService, which one fixture registers beside a declared contract and the
+            audit cases assert appears in that plugin's record. The design permits such a registration
+            and the record is the only visibility it offers into one, so the test has to be able to say
+            what it is looking for.
+        -->
+        <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+        <PackageReference Include="Microsoft.Extensions.Logging" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Console" />
+        <PackageReference Include="Microsoft.Extensions.Options" />
+        <PackageReference Include="Microsoft.NET.Test.Sdk" />
+        <PackageReference Include="NUnit" />
+        <PackageReference Include="NUnit3TestAdapter" />
+        <PackageReference Include="NUnit.Analyzers" />
+        <PackageReference Include="coverlet.collector">
+            <PrivateAssets>all</PrivateAssets>
+            <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+        </PackageReference>
+        <PackageReference Include="coverlet.msbuild" />
+    </ItemGroup>
+    <ItemGroup>
+        <ProjectReference
+            Include="..\EdFi.Api.Plugins.Hosting\EdFi.Api.Plugins.Hosting.csproj"
+        />
+        <!--
+            The one fixture project this project references, and therefore the one inside the solution
+            build graph. The skew checks compare a plugin's declaration against what the host carries, so
+            the host has to carry something: this puts Acme.HostShared 1.0.0 in the test process, against
+            which the fixtures that declare 2.0.0 are refused. It commits a lock file for that reason.
+        -->
+        <ProjectReference
+            Include="Fixtures\Support\AcmeHostShared1\Acme.HostShared.v1.csproj"
+        />
+        <!--
+            The second, for the same reason. The wrapper's host-owned rule keys on an assembly name
+            carrying an Ed-Fi host prefix, and the cases that exercise it call the generic RemoveAll<T>
+            and Replace helpers a plugin would call, which need a type known at compile time. It
+            commits a lock file because this reference puts it in the solution build graph.
+        -->
+        <ProjectReference
+            Include="Fixtures\Support\FixtureHost\EdFi.DataManagementService.FixtureHost.csproj"
+        />
+        <!--
+            The third, and the reason it is referenced here rather than only by the fixtures: the
+            composition cases assert on the service types a hook registered, so the test and the plugin
+            have to mean the same types. Referencing it puts it in the host, and host-first then serves
+            the plugins this copy instead of their own. It commits a lock file for the same reason as
+            the two above.
+        -->
+        <ProjectReference
+            Include="Fixtures\Support\AcmeFixtureContracts\Acme.FixtureContracts.csproj"
+        />
+    </ItemGroup>
+    <Import Project="PluginFixtures.targets" />
+</Project>

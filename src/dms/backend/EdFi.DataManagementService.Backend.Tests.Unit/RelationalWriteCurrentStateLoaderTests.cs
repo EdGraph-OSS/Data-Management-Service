@@ -29,9 +29,8 @@ public class Given_Relational_Write_Current_State_Loader
                         345L,
                         Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"),
                         44L,
-                        45L,
                         new DateTimeOffset(2026, 4, 2, 12, 0, 0, TimeSpan.Zero),
-                        new DateTimeOffset(2026, 4, 2, 12, 1, 0, TimeSpan.Zero)
+                        (short)1
                     )
                 ),
                 CreateRootTableRows((345L, "Lincoln High"))
@@ -70,9 +69,8 @@ public class Given_Relational_Write_Current_State_Loader
                         345L,
                         Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"),
                         44L,
-                        45L,
                         new DateTimeOffset(2026, 4, 2, 12, 0, 0, TimeSpan.Zero),
-                        new DateTimeOffset(2026, 4, 2, 12, 1, 0, TimeSpan.Zero)
+                        (short)1
                     )
                 ),
                 CreateDescriptorRootTableRows((345L, 601L)),
@@ -117,17 +115,15 @@ public class Given_Relational_Write_Current_State_Loader
                             345L,
                             Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"),
                             44L,
-                            45L,
                             new DateTimeOffset(2026, 4, 2, 12, 0, 0, TimeSpan.Zero),
-                            new DateTimeOffset(2026, 4, 2, 12, 1, 0, TimeSpan.Zero)
+                            (short)1
                         ),
                         (
                             345L,
                             Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"),
                             44L,
-                            45L,
                             new DateTimeOffset(2026, 4, 2, 12, 0, 0, TimeSpan.Zero),
-                            new DateTimeOffset(2026, 4, 2, 12, 1, 0, TimeSpan.Zero)
+                            (short)1
                         )
                     ),
                     CreateRootTableRows()
@@ -165,9 +161,8 @@ public class Given_Relational_Write_Current_State_Loader
                         345L,
                         Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"),
                         44L,
-                        45L,
                         new DateTimeOffset(2026, 4, 2, 12, 0, 0, TimeSpan.Zero),
-                        new DateTimeOffset(2026, 4, 2, 12, 1, 0, TimeSpan.Zero)
+                        (short)1
                     )
                 ),
                 CreateRootTableRows((345L, "Lincoln High"))
@@ -200,9 +195,8 @@ public class Given_Relational_Write_Current_State_Loader
                         345L,
                         Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"),
                         44L,
-                        45L,
                         new DateTimeOffset(2026, 4, 2, 12, 0, 0, TimeSpan.Zero),
-                        new DateTimeOffset(2026, 4, 2, 12, 1, 0, TimeSpan.Zero)
+                        (short)1
                     )
                 ),
                 CreateRootTableRows((345L, "Lincoln High"))
@@ -481,9 +475,8 @@ public class Given_Relational_Write_Current_State_Loader
             long DocumentId,
             Guid DocumentUuid,
             long ContentVersion,
-            long IdentityVersion,
             DateTimeOffset ContentLastModifiedAt,
-            DateTimeOffset IdentityLastModifiedAt
+            short ResourceKeyId
         )[] rows
     )
     {
@@ -491,9 +484,8 @@ public class Given_Relational_Write_Current_State_Loader
         table.Columns.Add("DocumentId", typeof(long));
         table.Columns.Add("DocumentUuid", typeof(Guid));
         table.Columns.Add("ContentVersion", typeof(long));
-        table.Columns.Add("IdentityVersion", typeof(long));
         table.Columns.Add("ContentLastModifiedAt", typeof(DateTimeOffset));
-        table.Columns.Add("IdentityLastModifiedAt", typeof(DateTimeOffset));
+        table.Columns.Add("ResourceKeyId", typeof(short));
 
         foreach (var row in rows)
         {
@@ -501,9 +493,8 @@ public class Given_Relational_Write_Current_State_Loader
                 row.DocumentId,
                 row.DocumentUuid,
                 row.ContentVersion,
-                row.IdentityVersion,
                 row.ContentLastModifiedAt,
-                row.IdentityLastModifiedAt
+                row.ResourceKeyId
             );
         }
 
@@ -561,7 +552,19 @@ public class Given_Relational_Write_Current_State_Loader
 
         public DbTransaction Transaction { get; } = transaction;
 
-        public DbCommand CreateCommand(RelationalCommand command) => throw new NotSupportedException();
+        /// <summary>
+        /// Mirrors the production session: builds a command bound to this session's connection and
+        /// transaction. The hydration batch now routes through here, so this can no longer throw.
+        /// </summary>
+        public DbCommand CreateCommand(RelationalCommand command)
+        {
+            ArgumentNullException.ThrowIfNull(command);
+
+            var dbCommand = Connection.CreateCommand();
+            dbCommand.Transaction = Transaction;
+            dbCommand.CommandText = command.CommandText;
+            return dbCommand;
+        }
 
         public Task CommitAsync(CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
@@ -575,19 +578,17 @@ public class Given_Relational_Write_Current_State_Loader
     private sealed class HydrationBackedSessionDocumentHydrator : ISessionDocumentHydrator
     {
         public Task<HydratedPage> HydrateAsync(
-            DbConnection connection,
-            DbTransaction transaction,
+            IRelationalWriteSession writeSession,
             ResourceReadPlan plan,
             PageKeysetSpec keyset,
             HydrationExecutionOptions executionOptions,
             CancellationToken cancellationToken = default
         ) =>
             HydrationExecutor.ExecuteAsync(
-                connection,
+                batchSql => writeSession.CreateCommand(new RelationalCommand(batchSql)),
                 plan,
                 keyset,
                 SqlDialect.Pgsql,
-                transaction,
                 executionOptions,
                 cancellationToken
             );
@@ -599,8 +600,7 @@ public class Given_Relational_Write_Current_State_Loader
         public HydrationExecutionOptions? CapturedExecutionOptions { get; private set; }
 
         public Task<HydratedPage> HydrateAsync(
-            DbConnection connection,
-            DbTransaction transaction,
+            IRelationalWriteSession writeSession,
             ResourceReadPlan plan,
             PageKeysetSpec keyset,
             HydrationExecutionOptions executionOptions,
@@ -608,14 +608,7 @@ public class Given_Relational_Write_Current_State_Loader
         )
         {
             CapturedExecutionOptions = executionOptions;
-            return inner.HydrateAsync(
-                connection,
-                transaction,
-                plan,
-                keyset,
-                executionOptions,
-                cancellationToken
-            );
+            return inner.HydrateAsync(writeSession, plan, keyset, executionOptions, cancellationToken);
         }
     }
 }

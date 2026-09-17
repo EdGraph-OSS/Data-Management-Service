@@ -6,6 +6,7 @@
 using EdFi.DataManagementService.Backend.Ddl;
 using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Backend.External.Plans;
+using EdFi.DataManagementService.Core.External.Model;
 
 namespace EdFi.DataManagementService.Backend.Plans;
 
@@ -18,18 +19,28 @@ namespace EdFi.DataManagementService.Backend.Plans;
 /// </remarks>
 public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
 {
+    private const int CursorBoundCount = 2;
     private const string DocumentIdColumnName = "DocumentId";
+    private const string ContentVersionColumnName = "ContentVersion";
     private const string DocumentUuidColumnName = "DocumentUuid";
     private const string MissingPresenceColumnSortValue = "";
     private static readonly string _rootAlias = PlanNamingConventions.GetFixedAlias(PlanSqlAliasRole.Root);
     private static readonly string _documentAlias = PlanNamingConventions.GetFixedAlias(
         PlanSqlAliasRole.Document
     );
-    private static readonly string _descriptorAlias = PlanNamingConventions.GetFixedAlias(
-        PlanSqlAliasRole.Descriptor
-    );
     private static readonly DbTableName _documentTable = new(new DbSchemaName("dms"), "Document");
-    private static readonly DbTableName _descriptorTable = new(new DbSchemaName("dms"), "Descriptor");
+    private static readonly DbColumnName _ownershipTokenColumn = new("CreatedByOwnershipTokenId");
+
+    private abstract record OrderedPageAuthorizationAndFilter(int RawConfiguredIndex, int StableTieBreaker)
+    {
+        public sealed record Namespace(NamespaceAuthorizationCheckSpec Check, int StableTieBreaker)
+            : OrderedPageAuthorizationAndFilter(Check.RawConfiguredIndex, StableTieBreaker);
+
+        public sealed record CustomView(
+            PageDocumentIdAuthorizationCustomViewCheck Check,
+            int StableTieBreaker
+        ) : OrderedPageAuthorizationAndFilter(Check.RawConfiguredIndex, StableTieBreaker);
+    }
 
     private readonly SqlDialect _dialect = dialect;
     private readonly ISqlDialect _sqlDialect = SqlDialectFactory.Create(dialect);
@@ -51,15 +62,10 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
             throw CreateNullPredicateEntryException();
         }
 
-        PlanSqlWriterExtensions.ValidateBareParameterName(
-            spec.OffsetParameterName,
-            nameof(spec.OffsetParameterName)
-        );
-        PlanSqlWriterExtensions.ValidateBareParameterName(
-            spec.LimitParameterName,
-            nameof(spec.LimitParameterName)
-        );
-        ValidatePagingParameterNamesAreDistinct(spec.OffsetParameterName, spec.LimitParameterName);
+        var mode = spec.Mode ?? new PageCandidateMode.Traditional();
+        var modeParameters = PageCandidateModeParameters.For(mode);
+
+        ValidateModeParameterNames(modeParameters);
 
         var rewrittenPredicates = RewriteAndSortPredicates(
             spec.Predicates,
@@ -68,59 +74,49 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         var authorization = NormalizeAuthorization(spec.Authorization);
         var authorizationClaimParameterization = authorization?.ClaimEducationOrganizationIdParameterization;
         var namespacePrefixParameterization = authorization?.NamespacePrefixParameterization;
-        var requiresDocumentUuidJoin = rewrittenPredicates.Any(static predicate =>
-            predicate.Target is QueryPredicateTarget.DocumentUuid
-        );
-        // The descriptor join also covers the descriptor-alias namespace check used by descriptor
-        // queries: the page subquery roots on dms.Document for ResourceKeyId paging, while the
-        // Namespace column lives on the joined dms.Descriptor row.
-        var requiresDescriptorJoin =
-            rewrittenPredicates.Any(static predicate =>
-                predicate.Target is QueryPredicateTarget.DescriptorColumn
-            )
-            || (
-                authorization?.NamespaceChecks?.Any(check => check.RootTable.Equals(_descriptorTable))
-                ?? false
-            );
+        var ownershipTokenParameterization = authorization?.OwnershipTokenParameterization;
+
+        // One dms.Document join serves both consumers: the ?id= predicate reads DocumentUuid from it and
+        // the ownership filter reads CreatedByOwnershipTokenId from it. The join is on the primary key, so
+        // it never adds rows.
+        var requiresDocumentJoin =
+            rewrittenPredicates.Any(static predicate => predicate.Target is QueryPredicateTarget.DocumentUuid)
+            || ownershipTokenParameterization is not null;
         var filterParametersInOrder = BuildFilterParametersInOrder(
             rewrittenPredicates,
             authorizationClaimParameterization,
-            namespacePrefixParameterization
+            namespacePrefixParameterization,
+            ownershipTokenParameterization
         );
         var filterParameterNamesInOrder = filterParametersInOrder
             .Select(static parameter => parameter.ParameterName)
             .ToArray();
-        ValidateFilterParameterNamesDoNotCollideWithPaging(
+        ValidateFilterParameterNamesDoNotCollideWithModeParameters(
             filterParameterNamesInOrder,
-            spec.OffsetParameterName,
-            spec.LimitParameterName
+            modeParameters
         );
         ValidateFilterParameterNamesAreUnique(filterParameterNamesInOrder);
 
         var pageSql = BuildPageDocumentIdSql(
             spec,
+            mode,
             rewrittenPredicates,
             authorization,
             authorizationClaimParameterization,
-            requiresDocumentUuidJoin,
-            requiresDescriptorJoin
+            requiresDocumentJoin
         );
-        var totalCountSql = spec.IncludeTotalCountSql
+        var includeTotalCountSql = mode is PageCandidateMode.Traditional { IncludeTotalCountSql: true };
+        var totalCountSql = includeTotalCountSql
             ? BuildTotalCountSql(
                 spec.RootTable,
                 rewrittenPredicates,
                 authorization,
                 authorizationClaimParameterization,
-                requiresDocumentUuidJoin,
-                requiresDescriptorJoin
+                requiresDocumentJoin
             )
             : null;
-        var pageParametersInOrder = BuildPageParametersInOrder(
-            filterParametersInOrder,
-            spec.OffsetParameterName,
-            spec.LimitParameterName
-        );
-        var totalCountParametersInOrder = spec.IncludeTotalCountSql
+        var pageParametersInOrder = BuildPageParametersInOrder(filterParametersInOrder, modeParameters);
+        var totalCountParametersInOrder = includeTotalCountSql
             ? BuildTotalCountParametersInOrder(filterParametersInOrder)
             : null;
 
@@ -209,19 +205,6 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
             );
         }
 
-        if (predicate.Target is QueryPredicateTarget.DescriptorColumn(var descriptorColumn))
-        {
-            return new RewrittenPredicate(
-                predicate.Target,
-                descriptorColumn,
-                descriptorColumn,
-                null,
-                predicate.Operator,
-                predicate.ParameterName,
-                predicate.ScalarKind
-            );
-        }
-
         if (predicate.Target is not QueryPredicateTarget.RootColumn(var originalColumn))
         {
             throw new InvalidOperationException(
@@ -254,52 +237,63 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
     }
 
     /// <summary>
-    /// Ensures filter-parameter names do not collide with paging parameter names.
+    /// Ensures every mode-owned parameter name is a valid bare name and that the names are mutually
+    /// distinct (case-insensitive).
     /// </summary>
-    private static void ValidateFilterParameterNamesDoNotCollideWithPaging(
-        IReadOnlyList<string> filterParameterNames,
-        string offsetParameterName,
-        string limitParameterName
-    )
+    private static void ValidateModeParameterNames(IReadOnlyList<PageCandidateModeParameter> modeParameters)
     {
-        foreach (var parameterName in filterParameterNames)
+        foreach (var modeParameter in modeParameters)
         {
-            if (string.Equals(parameterName, offsetParameterName, StringComparison.OrdinalIgnoreCase))
-            {
-                throw CreateFilterPagingCollisionException(
-                    parameterName,
-                    offsetParameterName,
-                    nameof(PageDocumentIdQuerySpec.OffsetParameterName),
-                    nameof(PageDocumentIdQuerySpec.Predicates)
-                );
-            }
+            PlanSqlWriterExtensions.ValidateBareParameterName(modeParameter.Name, modeParameter.PropertyName);
+        }
 
-            if (string.Equals(parameterName, limitParameterName, StringComparison.OrdinalIgnoreCase))
+        for (var index = 0; index < modeParameters.Count; index++)
+        {
+            for (var otherIndex = index + 1; otherIndex < modeParameters.Count; otherIndex++)
             {
-                throw CreateFilterPagingCollisionException(
-                    parameterName,
-                    limitParameterName,
-                    nameof(PageDocumentIdQuerySpec.LimitParameterName),
-                    nameof(PageDocumentIdQuerySpec.Predicates)
-                );
+                if (
+                    string.Equals(
+                        modeParameters[index].Name,
+                        modeParameters[otherIndex].Name,
+                        StringComparison.OrdinalIgnoreCase
+                    )
+                )
+                {
+                    throw CreateModeParameterCollisionException(
+                        modeParameters[index],
+                        modeParameters[otherIndex]
+                    );
+                }
             }
         }
     }
 
     /// <summary>
-    /// Ensures paging parameter names are distinct (case-insensitive).
+    /// Ensures no filter-parameter name equals a mode-owned parameter name (case-insensitive).
     /// </summary>
-    private static void ValidatePagingParameterNamesAreDistinct(
-        string offsetParameterName,
-        string limitParameterName
+    /// <remarks>
+    /// Keying the mode names requires them to be mutually distinct, which
+    /// <see cref="ValidateModeParameterNames" /> has already established by the time this runs.
+    /// </remarks>
+    private static void ValidateFilterParameterNamesDoNotCollideWithModeParameters(
+        IReadOnlyList<string> filterParameterNames,
+        IReadOnlyList<PageCandidateModeParameter> modeParameters
     )
     {
-        if (string.Equals(offsetParameterName, limitParameterName, StringComparison.OrdinalIgnoreCase))
+        var modeParametersByName = modeParameters.ToDictionary(
+            static modeParameter => modeParameter.Name,
+            StringComparer.OrdinalIgnoreCase
+        );
+        var collidingFilterParameterName = filterParameterNames.FirstOrDefault(
+            modeParametersByName.ContainsKey
+        );
+
+        if (collidingFilterParameterName is not null)
         {
-            throw CreatePagingParameterCollisionException(
-                offsetParameterName,
-                limitParameterName,
-                nameof(PageDocumentIdQuerySpec.OffsetParameterName)
+            throw CreateFilterModeParameterCollisionException(
+                collidingFilterParameterName,
+                modeParametersByName[collidingFilterParameterName],
+                nameof(PageDocumentIdQuerySpec.Predicates)
             );
         }
     }
@@ -337,7 +331,8 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
     private static IReadOnlyList<QuerySqlParameter> BuildFilterParametersInOrder(
         IReadOnlyList<RewrittenPredicate> predicates,
         AuthorizationClaimEducationOrganizationIdParameterization? authorizationClaimParameterization,
-        NamespacePrefixParameterization? namespacePrefixParameterization
+        NamespacePrefixParameterization? namespacePrefixParameterization,
+        OwnershipTokenParameterization? ownershipTokenParameterization
     )
     {
         List<QuerySqlParameter> filterParametersInOrder =
@@ -352,6 +347,15 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         {
             filterParametersInOrder.AddRange(
                 NamespacePrefixSqlHelper.BuildFilterParametersInOrder(namespacePrefixParameterization)
+            );
+        }
+
+        if (ownershipTokenParameterization is not null)
+        {
+            // Empty for an empty token list: the emitted predicate is then a constant that references no
+            // parameter, and the inventory must not declare a parameter the SQL never mentions.
+            filterParametersInOrder.AddRange(
+                OwnershipTokenSqlHelper.BuildFilterParametersInOrder(ownershipTokenParameterization)
             );
         }
 
@@ -372,14 +376,23 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
     /// </summary>
     private static IReadOnlyList<QuerySqlParameter> BuildPageParametersInOrder(
         IReadOnlyList<QuerySqlParameter> filterParametersInOrder,
-        string offsetParameterName,
-        string limitParameterName
+        IReadOnlyList<PageCandidateModeParameter> modeParameters
     )
     {
-        var pageParametersInOrder = new List<QuerySqlParameter>(filterParametersInOrder.Count + 2);
+        var boundModeParameters = modeParameters
+            .Where(static modeParameter => modeParameter.IsBound)
+            .ToArray();
+        var pageParametersInOrder = new List<QuerySqlParameter>(
+            filterParametersInOrder.Count + boundModeParameters.Length
+        );
+
         pageParametersInOrder.AddRange(filterParametersInOrder);
-        pageParametersInOrder.Add(new QuerySqlParameter(QuerySqlParameterRole.Offset, offsetParameterName));
-        pageParametersInOrder.Add(new QuerySqlParameter(QuerySqlParameterRole.Limit, limitParameterName));
+        pageParametersInOrder.AddRange(
+            boundModeParameters.Select(static modeParameter => new QuerySqlParameter(
+                modeParameter.Role,
+                modeParameter.Name
+            ))
+        );
 
         return pageParametersInOrder;
     }
@@ -456,9 +469,28 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
 
         var normalizedNamespaceChecks = (authorization.NamespaceChecks ?? []).ToArray();
 
-        if (normalizedStrategies.Length == 0 && normalizedNamespaceChecks.Length == 0)
+        var hasCustomViewChecks =
+            authorization.CustomViewChecks is not null && authorization.CustomViewChecks.Count > 0;
+        var hasOwnershipFilter = authorization.OwnershipTokenParameterization is not null;
+
+        if (
+            normalizedStrategies.Length == 0
+            && normalizedNamespaceChecks.Length == 0
+            && !hasCustomViewChecks
+            && !hasOwnershipFilter
+        )
         {
             return null;
+        }
+
+        if (authorization.OwnershipTokenParameterization is { } ownershipTokenParameterization)
+        {
+            OwnershipTokenParameterizationValidator.ValidateOrThrow(
+                ownershipTokenParameterization,
+                _dialect,
+                nameof(PageDocumentIdAuthorizationSpec.OwnershipTokenParameterization),
+                "Page document-id SQL compilation"
+            );
         }
 
         if (normalizedStrategies.Length > 0)
@@ -480,10 +512,24 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
             );
         }
 
+        if (
+            authorization.CustomViewChecks is not null
+            && authorization.CustomViewChecks.Any(static c => c is null)
+        )
+        {
+            throw new ArgumentException(
+                $"{nameof(PageDocumentIdAuthorizationSpec.CustomViewChecks)} must not contain null entries.",
+                nameof(authorization)
+            );
+        }
+
         return authorization with
         {
             Strategies = normalizedStrategies,
             NamespaceChecks = normalizedNamespaceChecks,
+            CustomViewChecks = authorization.CustomViewChecks is null
+                ? null
+                : authorization.CustomViewChecks.ToArray(),
         };
     }
 
@@ -504,40 +550,173 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
     /// </summary>
     private string BuildPageDocumentIdSql(
         PageDocumentIdQuerySpec spec,
+        PageCandidateMode mode,
         IReadOnlyList<RewrittenPredicate> predicates,
         PageDocumentIdAuthorizationSpec? authorization,
         AuthorizationClaimEducationOrganizationIdParameterization? authorizationClaimParameterization,
-        bool requiresDocumentUuidJoin,
-        bool requiresDescriptorJoin
+        bool requiresDocumentJoin
     )
     {
         var writer = new SqlWriter(_sqlDialect);
+        var cursor = mode as PageCandidateMode.Cursor;
+
+        writer.Append("SELECT ");
+
+        if (cursor is not null)
+        {
+            _planSqlDialect.AppendCursorSelectRowLimitPrefix(writer, cursor.PageSizeParameterName);
+        }
+
+        AppendCandidateProjectionSql(writer, mode);
 
         writer
-            .Append($"SELECT {_rootAlias}.")
-            .AppendQuoted(DocumentIdColumnName)
             .AppendLine()
             .Append("FROM ")
             .AppendRelation(new SqlRelationRef.PhysicalTable(spec.RootTable))
             .AppendLine($" {_rootAlias}");
 
-        AppendDocumentJoin(writer, requiresDocumentUuidJoin);
-        AppendDescriptorJoin(writer, requiresDescriptorJoin);
+        AppendDocumentJoin(writer, requiresDocumentJoin);
         AppendWhereClause(
             writer,
             spec.RootTable,
             predicates,
             authorization,
-            authorizationClaimParameterization
+            authorizationClaimParameterization,
+            cursor
         );
 
-        writer.Append($"ORDER BY {_rootAlias}.").AppendQuoted(DocumentIdColumnName).AppendLine(" ASC");
+        // The unpaged candidate relation is deliberately unordered. Its consumer wraps it in a common
+        // table expression and applies its own row numbering, and SQL Server rejects ORDER BY in a CTE
+        // that has no TOP or OFFSET.
+        if (mode is PageCandidateMode.UnpagedCandidates)
+        {
+            writer.AppendLine(";");
 
-        _planSqlDialect.AppendPagingClause(writer, spec.OffsetParameterName, spec.LimitParameterName);
+            return writer.ToString();
+        }
+
+        writer
+            .Append($"ORDER BY {_rootAlias}.")
+            .AppendQuoted(ResolveOrderingColumnName(mode))
+            .AppendLine(" ASC");
+
+        switch (mode)
+        {
+            case PageCandidateMode.Cursor cursorMode:
+                _planSqlDialect.AppendCursorPagingClause(writer, cursorMode.PageSizeParameterName);
+                break;
+
+            case PageCandidateMode.Traditional traditionalMode:
+                _planSqlDialect.AppendPagingClause(
+                    writer,
+                    traditionalMode.OffsetParameterName,
+                    traditionalMode.LimitParameterName
+                );
+                break;
+
+            default:
+                throw new ArgumentOutOfRangeException(
+                    nameof(mode),
+                    mode.GetType().Name,
+                    "Unsupported page candidate mode."
+                );
+        }
+
         writer.AppendLine(";");
 
         return writer.ToString();
     }
+
+    /// <summary>
+    /// Emits the candidate projection list, which is asymmetric by design.
+    /// </summary>
+    /// <remarks>
+    /// A <c>DocumentId</c>-anchored mode projects <c>DocumentId</c> alone, exactly as before, so its
+    /// emitted SQL is unchanged.
+    /// <para>
+    /// Under a <c>ContentVersion</c> anchor the two shapes differ, and the difference is load-bearing.
+    /// The unpaged candidate relation projects the anchor alone: its consumer ranks and cuts boundaries
+    /// on that column and hands the value back, so the anchor is the whole result. A page cannot do
+    /// that. <c>DocumentId</c> feeds the keyset insert and every downstream hydration join, while
+    /// <c>ContentVersion</c> is the continuation anchor, and hydration can only read columns this
+    /// embedded SQL projects — so a page projects both. Projecting <c>DocumentId</c> alone would
+    /// compile and then force a second lookup after selection to recover the anchor, which is the
+    /// concurrent-delete stall cursor paging was designed against: a page whose rows are all deleted
+    /// between selection and hydration must still report where it ended.
+    /// </para>
+    /// </remarks>
+    private static void AppendCandidateProjectionSql(SqlWriter writer, PageCandidateMode mode)
+    {
+        if (ResolveOrderingMode(mode) is PageOrderingMode.DocumentId)
+        {
+            writer.Append($"{_rootAlias}.").AppendQuoted(DocumentIdColumnName);
+
+            return;
+        }
+
+        if (mode is PageCandidateMode.UnpagedCandidates)
+        {
+            writer.Append($"{_rootAlias}.").AppendQuoted(ContentVersionColumnName);
+
+            return;
+        }
+
+        writer
+            .Append($"{_rootAlias}.")
+            .AppendQuoted(DocumentIdColumnName)
+            .Append($", {_rootAlias}.")
+            .AppendQuoted(ContentVersionColumnName);
+    }
+
+    /// <summary>
+    /// Resolves the anchor column of the supplied mode: the column page selection is ordered by, the
+    /// column a cursor's bounds are compared against, and the column whose maximum anchors the
+    /// continuation token issued for the page.
+    /// </summary>
+    /// <remarks>
+    /// Every mode resolves through here, so ordering, bounds, and projection cannot name different
+    /// columns for one plan. Core resolves which anchor a request gets; this only maps that choice to a
+    /// column name.
+    /// <para>
+    /// <see cref="PartitionWindowSqlCompiler" /> resolves through here too, rather than repeating the
+    /// mapping. It ranks and cuts boundaries over the single column an unpaged candidate relation
+    /// projects, so a second mapping that drifted from this one would name a column that relation does
+    /// not have.
+    /// </para>
+    /// </remarks>
+    internal static string ResolveOrderingColumnName(PageCandidateMode mode) =>
+        ResolveOrderingMode(mode) switch
+        {
+            PageOrderingMode.DocumentId => DocumentIdColumnName,
+            PageOrderingMode.ContentVersion => ContentVersionColumnName,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(mode),
+                ResolveOrderingMode(mode),
+                "Unsupported page ordering mode."
+            ),
+        };
+
+    /// <summary>
+    /// Reads the anchor off whichever mode this is. Every candidate mode carries one.
+    /// </summary>
+    /// <remarks>
+    /// Public because candidate planning asks the same question before this compiler ever runs, when it
+    /// stamps the anchor onto the plan a partition-boundary statement is later compiled against. Asking
+    /// here rather than keeping a copy beside the mode is what keeps the anchor a plan is stamped with
+    /// and the anchor its SQL is compiled from the same value.
+    /// </remarks>
+    public static PageOrderingMode ResolveOrderingMode(PageCandidateMode mode) =>
+        mode switch
+        {
+            PageCandidateMode.Traditional traditional => traditional.OrderingMode,
+            PageCandidateMode.Cursor cursor => cursor.OrderingMode,
+            PageCandidateMode.UnpagedCandidates unpaged => unpaged.OrderingMode,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(mode),
+                mode.GetType().Name,
+                "Unsupported page candidate mode."
+            ),
+        };
 
     /// <summary>
     /// Emits canonical SQL for total-row count selection.
@@ -547,8 +726,7 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         IReadOnlyList<RewrittenPredicate> predicates,
         PageDocumentIdAuthorizationSpec? authorization,
         AuthorizationClaimEducationOrganizationIdParameterization? authorizationClaimParameterization,
-        bool requiresDocumentUuidJoin,
-        bool requiresDescriptorJoin
+        bool requiresDocumentJoin
     )
     {
         var writer = new SqlWriter(_sqlDialect);
@@ -559,20 +737,28 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
             .AppendRelation(new SqlRelationRef.PhysicalTable(rootTable))
             .AppendLine($" {_rootAlias}");
 
-        AppendDocumentJoin(writer, requiresDocumentUuidJoin);
-        AppendDescriptorJoin(writer, requiresDescriptorJoin);
-        AppendWhereClause(writer, rootTable, predicates, authorization, authorizationClaimParameterization);
+        AppendDocumentJoin(writer, requiresDocumentJoin);
+        AppendWhereClause(
+            writer,
+            rootTable,
+            predicates,
+            authorization,
+            authorizationClaimParameterization,
+            cursor: null
+        );
         writer.AppendLine(";");
 
         return writer.ToString();
     }
 
     /// <summary>
-    /// Emits the optional <c>dms.Document</c> join required for <c>?id=</c> filtering.
+    /// Emits the optional <c>dms.Document</c> join required for <c>?id=</c> filtering and for the
+    /// <c>OwnershipBased</c> page filter. Both read the joined row under the same alias, so a query that needs
+    /// both still joins once, on the primary key.
     /// </summary>
-    private static void AppendDocumentJoin(SqlWriter writer, bool requiresDocumentUuidJoin)
+    private static void AppendDocumentJoin(SqlWriter writer, bool requiresDocumentJoin)
     {
-        if (!requiresDocumentUuidJoin)
+        if (!requiresDocumentJoin)
         {
             return;
         }
@@ -588,26 +774,6 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
     }
 
     /// <summary>
-    /// Emits the optional shared <c>dms.Descriptor</c> join required for descriptor-column filtering.
-    /// </summary>
-    private static void AppendDescriptorJoin(SqlWriter writer, bool requiresDescriptorJoin)
-    {
-        if (!requiresDescriptorJoin)
-        {
-            return;
-        }
-
-        writer
-            .Append("INNER JOIN ")
-            .AppendRelation(new SqlRelationRef.PhysicalTable(_descriptorTable))
-            .Append($" {_descriptorAlias} ON {_descriptorAlias}.")
-            .AppendQuoted(DocumentIdColumnName)
-            .Append($" = {_rootAlias}.")
-            .AppendQuoted(DocumentIdColumnName)
-            .AppendLine();
-    }
-
-    /// <summary>
     /// Emits a deterministic multi-line <c>WHERE</c> clause.
     /// </summary>
     private void AppendWhereClause(
@@ -615,12 +781,34 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         DbTableName rootTable,
         IReadOnlyList<RewrittenPredicate> predicates,
         PageDocumentIdAuthorizationSpec? authorization,
-        AuthorizationClaimEducationOrganizationIdParameterization? authorizationClaimParameterization
+        AuthorizationClaimEducationOrganizationIdParameterization? authorizationClaimParameterization,
+        PageCandidateMode.Cursor? cursor
     )
     {
-        var hasNamespaceGroup = (authorization?.NamespaceChecks?.Count ?? 0) > 0;
+        var orderedAndFilters = BuildOrderedAuthorizationAndFilters(authorization);
+        var ownershipTokenParameterization = authorization?.OwnershipTokenParameterization;
+        var ownershipFilterCount = ownershipTokenParameterization is null ? 0 : 1;
         var hasRelationshipGroup = (authorization?.Strategies.Count ?? 0) > 0;
-        var predicateCount = predicates.Count + (hasNamespaceGroup ? 1 : 0) + (hasRelationshipGroup ? 1 : 0);
+        var relationshipGroupCount = hasRelationshipGroup ? 1 : 0;
+
+        // Emission order is the AND-strategy execution order from auth.md: value predicates, then the
+        // namespace and custom-view filters in CMS-configured order, then the ownership filter, which
+        // executes last among the AND strategies whatever position CMS gave it, then the relationship OR
+        // group.
+        //
+        // Cursor bounds are emitted last, alongside rather than instead of every authorization
+        // predicate. Appending them keeps the filter and authorization fragments byte-identical to the
+        // other candidate modes, which is what makes the shared-candidate guarantee checkable. The one
+        // deliberate exception is a person subject anchored on the ordering column, whose auth-view
+        // subquery repeats the bounds so the auth-view scan is range-bounded as well (see
+        // AppendPersonAuthViewMembershipSubquerySql); the candidate set is unchanged.
+        var cursorBoundCount = cursor is null ? 0 : CursorBoundCount;
+        var predicateCount =
+            predicates.Count
+            + orderedAndFilters.Count
+            + ownershipFilterCount
+            + relationshipGroupCount
+            + cursorBoundCount;
 
         writer.AppendWhereClause(
             predicateCount,
@@ -632,66 +820,327 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
                     return;
                 }
 
-                var groupIndex = index - predicates.Count;
+                var authorizationFilterIndex = index - predicates.Count;
 
-                if (hasNamespaceGroup && groupIndex == 0)
+                if (authorizationFilterIndex < orderedAndFilters.Count)
                 {
-                    AppendNamespaceChecksSql(
+                    AppendOrderedAuthorizationAndFilterSql(
                         predicateWriter,
                         rootTable,
-                        authorization!.NamespaceChecks!,
-                        authorization.NamespacePrefixParameterization
-                            ?? throw new InvalidOperationException(
-                                "Namespace authorization SQL emission requires a namespace prefix parameterization when namespace checks are present."
-                            )
+                        authorization!,
+                        orderedAndFilters[authorizationFilterIndex]
                     );
                     return;
                 }
 
-                AppendAuthorizationSql(
+                var afterAuthorizationFilterIndex = authorizationFilterIndex - orderedAndFilters.Count;
+
+                if (ownershipTokenParameterization is not null && afterAuthorizationFilterIndex == 0)
+                {
+                    AppendOwnershipFilterSql(predicateWriter, ownershipTokenParameterization);
+                    return;
+                }
+
+                var afterOwnershipFilterIndex = afterAuthorizationFilterIndex - ownershipFilterCount;
+
+                if (hasRelationshipGroup && afterOwnershipFilterIndex == 0)
+                {
+                    AppendAuthorizationSql(
+                        predicateWriter,
+                        rootTable,
+                        authorization!,
+                        authorizationClaimParameterization
+                            ?? throw new InvalidOperationException(
+                                "Authorization SQL emission requires a claim EdOrg parameterization when authorization strategies are present."
+                            ),
+                        cursor
+                    );
+                    return;
+                }
+
+                AppendCursorBoundSql(
                     predicateWriter,
-                    rootTable,
-                    authorization!,
-                    authorizationClaimParameterization
+                    cursor
                         ?? throw new InvalidOperationException(
-                            "Authorization SQL emission requires a claim EdOrg parameterization when authorization strategies are present."
-                        )
+                            "Cursor bound SQL emission requires a cursor candidate mode."
+                        ),
+                    afterOwnershipFilterIndex - relationshipGroupCount
                 );
             }
         );
     }
 
-    private static void AppendNamespaceChecksSql(
+    /// <summary>
+    /// Emits the <c>OwnershipBased</c> page filter against the joined <c>dms.Document</c> row: a null guard,
+    /// then the dialect-specific membership predicate over the caller's ownership tokens. A stored null and a
+    /// non-matching stored token are both excluded from the page rather than denied. The null guard is
+    /// redundant with the membership test, which a null can never satisfy, and is kept so the predicate reads
+    /// like the namespace filter and states the exclusion explicitly.
+    /// </summary>
+    /// <remarks>
+    /// No outer parentheses are added here; <c>AppendWhereClause</c> brackets every predicate it emits.
+    /// The shared helper renders an empty token list as a constant false with no parameter, so a spec that
+    /// reaches this emitter with no tokens still fails closed.
+    /// </remarks>
+    private static void AppendOwnershipFilterSql(
         SqlWriter writer,
-        DbTableName rootTable,
-        IReadOnlyList<NamespaceAuthorizationCheckSpec> namespaceChecks,
-        NamespacePrefixParameterization namespacePrefixParameterization
+        OwnershipTokenParameterization ownershipTokenParameterization
     )
     {
-        for (var checkIndex = 0; checkIndex < namespaceChecks.Count; checkIndex++)
-        {
-            if (checkIndex > 0)
-            {
-                writer.Append(" AND ");
-            }
-
-            var check = namespaceChecks[checkIndex];
-            var tableAlias = ResolveNamespaceCheckAlias(check.RootTable, rootTable);
-
-            NamespacePrefixSqlHelper.AppendRootTableNamespacePredicate(
-                writer,
-                tableAlias,
-                check.NamespaceColumn,
-                namespacePrefixParameterization
-            );
-        }
+        OwnershipTokenSqlHelper.AppendIsNotNull(writer, _documentAlias, _ownershipTokenColumn);
+        writer.Append(" AND ");
+        OwnershipTokenSqlHelper.AppendMembershipPredicate(
+            writer,
+            _documentAlias,
+            _ownershipTokenColumn,
+            ownershipTokenParameterization
+        );
     }
 
     /// <summary>
-    /// Resolves the SQL alias to qualify a namespace check column. Resource queries always check
-    /// against the query root table. Descriptor queries root the page subquery on
-    /// <c>dms.Document</c> but the namespace column lives on the joined <c>dms.Descriptor</c> row;
-    /// in that case the check binds to the shared descriptor alias rather than the document root.
+    /// Emits one inclusive cursor bound predicate against the mode's anchor column.
+    /// </summary>
+    /// <remarks>
+    /// The operators stay inclusive under either anchor. <c>ContentVersion &gt; @anchor</c> and
+    /// <c>ContentVersion &gt;= @anchor + 1</c> are the same predicate over an integer sequence, so
+    /// reusing the inclusive form keeps one bound shape, one token shape, and one partition-range
+    /// assembler rather than a second set that would have to be kept in step with the first.
+    /// </remarks>
+    private void AppendCursorBoundSql(SqlWriter writer, PageCandidateMode.Cursor cursor, int boundIndex)
+    {
+        var (operatorToken, parameterName) = boundIndex switch
+        {
+            0 => (">=", cursor.InclusiveMinimumParameterName),
+            1 => ("<=", cursor.InclusiveMaximumParameterName),
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(boundIndex),
+                boundIndex,
+                "Unsupported cursor bound index."
+            ),
+        };
+
+        _planSqlDialect.AppendComparisonSql(
+            writer,
+            _rootAlias,
+            new DbColumnName(ResolveOrderingColumnName(cursor)),
+            operatorToken,
+            parameterName,
+            ScalarKind.Int64
+        );
+    }
+
+    private static IReadOnlyList<OrderedPageAuthorizationAndFilter> BuildOrderedAuthorizationAndFilters(
+        PageDocumentIdAuthorizationSpec? authorization
+    )
+    {
+        if (authorization is null)
+        {
+            return [];
+        }
+
+        var filters = new List<OrderedPageAuthorizationAndFilter>();
+        var stableTieBreaker = 0;
+
+        foreach (var namespaceCheck in authorization.NamespaceChecks ?? [])
+        {
+            filters.Add(new OrderedPageAuthorizationAndFilter.Namespace(namespaceCheck, stableTieBreaker++));
+        }
+
+        foreach (var customViewCheck in authorization.CustomViewChecks ?? [])
+        {
+            filters.Add(
+                new OrderedPageAuthorizationAndFilter.CustomView(customViewCheck, stableTieBreaker++)
+            );
+        }
+
+        return filters
+            .OrderBy(static filter => filter.RawConfiguredIndex)
+            .ThenBy(static filter => filter.StableTieBreaker)
+            .ToArray();
+    }
+
+    private static void AppendOrderedAuthorizationAndFilterSql(
+        SqlWriter writer,
+        DbTableName rootTable,
+        PageDocumentIdAuthorizationSpec authorization,
+        OrderedPageAuthorizationAndFilter filter
+    )
+    {
+        switch (filter)
+        {
+            case OrderedPageAuthorizationAndFilter.Namespace namespaceFilter:
+                AppendNamespaceCheckSql(
+                    writer,
+                    rootTable,
+                    namespaceFilter.Check,
+                    authorization.NamespacePrefixParameterization
+                        ?? throw new InvalidOperationException(
+                            "Namespace authorization SQL emission requires a namespace prefix parameterization when namespace checks are present."
+                        )
+                );
+                return;
+            case OrderedPageAuthorizationAndFilter.CustomView customViewFilter:
+                AppendCustomViewCheckSql(writer, rootTable, customViewFilter.Check);
+                return;
+            default:
+                throw new ArgumentOutOfRangeException(
+                    nameof(filter),
+                    filter.GetType().Name,
+                    "Unsupported page authorization AND filter."
+                );
+        }
+    }
+
+    private static void AppendNamespaceCheckSql(
+        SqlWriter writer,
+        DbTableName rootTable,
+        NamespaceAuthorizationCheckSpec check,
+        NamespacePrefixParameterization namespacePrefixParameterization
+    )
+    {
+        var tableAlias = ResolveNamespaceCheckAlias(check.RootTable, rootTable);
+
+        NamespacePrefixSqlHelper.AppendRootTableNamespacePredicate(
+            writer,
+            tableAlias,
+            check.NamespaceColumn,
+            namespacePrefixParameterization
+        );
+    }
+
+    private static void AppendCustomViewCheckSql(
+        SqlWriter writer,
+        DbTableName rootTable,
+        PageDocumentIdAuthorizationCustomViewCheck check
+    )
+    {
+        if (!check.RootTable.Equals(rootTable))
+        {
+            throw new InvalidOperationException(
+                $"Custom view authorization check root table '{check.RootTable}' does not match query root table '{rootTable}'."
+            );
+        }
+
+        if (check.PathToBasisResource.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "Custom view authorization check must include a path to the basis resource."
+            );
+        }
+
+        var pathSteps = check.PathToBasisResource;
+        var terminalStep = pathSteps[^1];
+
+        // A one-step path always sources from the root table: SecurableElementColumnPathResolver only emits a
+        // single step when the basis is the subject itself or is referenced by a root-owned FK, and a
+        // child-table edge is prefixed with a root-to-child step (making the path two steps). The FK already
+        // holds the basis resource's DocumentId, so the column can be filtered against the auth view
+        // directly. This covers descriptor bases too — their terminal step carries dms.Descriptor/DocumentId
+        // as a target, but the extra root re-scan those targets would drive is redundant.
+        if (pathSteps.Count == 1)
+        {
+            if (!terminalStep.SourceTable.Equals(rootTable))
+            {
+                throw new InvalidOperationException(
+                    $"Custom view authorization direct path table '{terminalStep.SourceTable}' does not match query root table '{rootTable}'."
+                );
+            }
+
+            AppendColumnInCustomViewSql(writer, _rootAlias, terminalStep.SourceColumnName, check);
+            return;
+        }
+
+        // Multi-step paths emit an uncorrelated subquery that re-scans the root table
+        // (r.DocumentId IN (SELECT t0.DocumentId FROM <root> t0 JOIN ...)) rather than correlating the
+        // joins to the outer row. Deferred, not overlooked: a correlated EXISTS rewrite would change the
+        // hot-path page SQL for every transitive custom view, so it needs a realistic-row-count
+        // measurement first — at small row counts the planner often flattens this to the same plan.
+        var aliasAllocator = PlanNamingConventions.CreateTableAliasAllocator();
+        var rootSubqueryAlias = aliasAllocator.AllocateNext();
+        var pathJoinAliases = Enumerable
+            .Range(0, pathSteps.Count - 1)
+            .Select(_ => aliasAllocator.AllocateNext())
+            .ToArray();
+
+        writer.Append($"{_rootAlias}.");
+        writer.AppendQuoted(check.RootDocumentIdColumn.Value);
+        writer.Append(" IN (SELECT ");
+        writer.Append($"{rootSubqueryAlias}.");
+        writer.AppendQuoted(check.RootDocumentIdColumn.Value);
+        writer.Append(" FROM ");
+        writer.AppendRelation(new SqlRelationRef.PhysicalTable(rootTable));
+        writer.Append($" {rootSubqueryAlias}");
+
+        var currentSourceAlias = rootSubqueryAlias;
+
+        for (var stepIndex = 0; stepIndex < pathSteps.Count - 1; stepIndex++)
+        {
+            var step = pathSteps[stepIndex];
+            var targetTable =
+                step.TargetTable
+                ?? throw new InvalidOperationException(
+                    "Custom view authorization transitive path steps must include a target table for intermediate joins."
+                );
+            var targetColumn =
+                step.TargetColumnName
+                ?? throw new InvalidOperationException(
+                    "Custom view authorization transitive path steps must include a target column for intermediate joins."
+                );
+            var joinAlias = pathJoinAliases[stepIndex];
+
+            writer.Append(" JOIN ");
+            writer.AppendRelation(new SqlRelationRef.PhysicalTable(targetTable));
+            writer.Append($" {joinAlias} ON {joinAlias}.");
+            writer.AppendQuoted(targetColumn.Value);
+            writer.Append($" = {currentSourceAlias}.");
+            writer.AppendQuoted(step.SourceColumnName.Value);
+
+            currentSourceAlias = joinAlias;
+        }
+
+        writer.Append($" WHERE {currentSourceAlias}.");
+        writer.AppendQuoted(terminalStep.SourceColumnName.Value);
+        AppendCustomViewMembershipSubquerySql(writer, check, aliasAllocator.AllocateNext());
+        writer.Append(")");
+    }
+
+    private static void AppendColumnInCustomViewSql(
+        SqlWriter writer,
+        string tableAlias,
+        DbColumnName sourceColumn,
+        PageDocumentIdAuthorizationCustomViewCheck check
+    )
+    {
+        writer.Append($"{tableAlias}.");
+        writer.AppendQuoted(sourceColumn.Value);
+        AppendCustomViewMembershipSubquerySql(
+            writer,
+            check,
+            PlanNamingConventions.CreateTableAliasAllocator().AllocateNext()
+        );
+    }
+
+    private static void AppendCustomViewMembershipSubquerySql(
+        SqlWriter writer,
+        PageDocumentIdAuthorizationCustomViewCheck check,
+        string authAlias
+    )
+    {
+        writer.Append(" IN (SELECT ");
+        writer.Append($"{authAlias}.");
+        writer.AppendQuoted(check.AuthViewDocumentIdColumn.Value);
+        writer.Append(" FROM ");
+        writer.AppendRelation(new SqlRelationRef.PhysicalTable(check.AuthView));
+        writer.Append($" {authAlias})");
+    }
+
+    /// <summary>
+    /// Resolves the SQL alias qualifying a namespace check column. Every supported query — resource and
+    /// descriptor alike — roots its namespace check on the query root table: descriptor page subqueries
+    /// root on <c>dms.Descriptor</c>, which is where <c>Namespace</c> lives, so no second alias applies.
+    /// A mismatch therefore means the planner emitted a check against a table this query does not root on,
+    /// which is a planning defect. Throwing keeps that loud instead of silently qualifying the column with
+    /// the root alias and emitting a filter against the wrong table.
     /// </summary>
     private static string ResolveNamespaceCheckAlias(DbTableName checkRootTable, DbTableName queryRootTable)
     {
@@ -700,14 +1149,9 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
             return _rootAlias;
         }
 
-        if (queryRootTable.Equals(_documentTable) && checkRootTable.Equals(_descriptorTable))
-        {
-            return _descriptorAlias;
-        }
-
         throw new InvalidOperationException(
             $"Namespace authorization check spec table '{checkRootTable}' does not match query root table '{queryRootTable}'. "
-                + "Namespace authorization SQL emission supports only concrete root-table columns (or the shared dms.Descriptor join for descriptor queries)."
+                + "Namespace authorization SQL emission supports only concrete root-table columns."
         );
     }
 
@@ -715,7 +1159,8 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         SqlWriter writer,
         DbTableName rootTable,
         PageDocumentIdAuthorizationSpec authorization,
-        AuthorizationClaimEducationOrganizationIdParameterization authorizationClaimParameterization
+        AuthorizationClaimEducationOrganizationIdParameterization authorizationClaimParameterization,
+        PageCandidateMode.Cursor? cursor
     )
     {
         var aliasAllocator = PlanNamingConventions.CreateTableAliasAllocator();
@@ -733,7 +1178,8 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
                 rootTable,
                 authorization.Strategies[strategyIndex],
                 authorizationClaimParameterization,
-                aliasAllocator
+                aliasAllocator,
+                cursor
             );
             writer.Append(")");
         }
@@ -744,7 +1190,8 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         DbTableName rootTable,
         PageDocumentIdAuthorizationStrategy strategy,
         AuthorizationClaimEducationOrganizationIdParameterization authorizationClaimParameterization,
-        PlanSqlTableAliasAllocator aliasAllocator
+        PlanSqlTableAliasAllocator aliasAllocator,
+        PageCandidateMode.Cursor? cursor
     )
     {
         for (var subjectIndex = 0; subjectIndex < strategy.Subjects.Count; subjectIndex++)
@@ -759,7 +1206,8 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
                 rootTable,
                 strategy.Subjects[subjectIndex],
                 authorizationClaimParameterization,
-                aliasAllocator
+                aliasAllocator,
+                cursor
             );
         }
     }
@@ -769,7 +1217,8 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         DbTableName rootTable,
         PageDocumentIdAuthorizationSubject subject,
         AuthorizationClaimEducationOrganizationIdParameterization authorizationClaimParameterization,
-        PlanSqlTableAliasAllocator aliasAllocator
+        PlanSqlTableAliasAllocator aliasAllocator,
+        PageCandidateMode.Cursor? cursor
     )
     {
         switch (subject)
@@ -789,7 +1238,8 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
                     rootTable,
                     personSubject,
                     authorizationClaimParameterization,
-                    aliasAllocator
+                    aliasAllocator,
+                    cursor
                 );
                 return;
             default:
@@ -806,11 +1256,15 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         DbTableName rootTable,
         PageDocumentIdAuthorizationPersonSubject subject,
         AuthorizationClaimEducationOrganizationIdParameterization authorizationClaimParameterization,
-        PlanSqlTableAliasAllocator aliasAllocator
+        PlanSqlTableAliasAllocator aliasAllocator,
+        PageCandidateMode.Cursor? cursor
     )
     {
         var personMetadata = subject.PersonMetadata;
 
+        // Load-bearing for anchor correctness, not merely a diagnostic: the emitters below qualify the
+        // anchor column with the root alias, so a stored anchor describing a different table would emit a
+        // predicate against a column that does not exist on the root row.
         RelationshipAuthorizationPeoplePathValidation.ValidateStoredAnchorRootTable(
             rootTable,
             personMetadata,
@@ -820,22 +1274,28 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         switch (personMetadata.Path.Kind)
         {
             case RelationshipAuthorizationPersonSubjectPathKind.SelfRootDocumentId:
+                // Load-bearing for the same reason as the Direct and Transitive checks below: the Self arm
+                // anchors on the stored anchor's column, so a subject bound to any other column would emit a
+                // predicate that authorizes on something other than the person the planner selected.
+                RelationshipAuthorizationPeoplePathValidation.ValidateSelfRootDocumentIdPath(
+                    subject.Table,
+                    subject.Column,
+                    personMetadata
+                );
                 AppendRootDocumentIdInPersonAuthViewSql(
                     writer,
-                    rootTable,
-                    personMetadata.StoredAnchor.RootDocumentIdColumn,
                     personMetadata.StoredAnchor.RootDocumentIdColumn,
                     subject.AuthObject,
                     authorizationClaimParameterization,
                     aliasAllocator.AllocateNext(),
-                    aliasAllocator.AllocateNext()
+                    cursor
                 );
                 return;
             case RelationshipAuthorizationPersonSubjectPathKind.DirectRootColumn:
                 AppendRootDocumentIdInPersonAuthViewSql(
                     writer,
-                    rootTable,
-                    personMetadata.StoredAnchor.RootDocumentIdColumn,
+                    // Its step.SourceTable check is likewise load-bearing here: it is what guarantees the
+                    // returned column lives on the root row and can be anchored on the root alias.
                     RelationshipAuthorizationPeoplePathValidation.GetDirectRootPersonDocumentIdColumn(
                         rootTable,
                         subject.Table,
@@ -846,7 +1306,7 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
                     subject.AuthObject,
                     authorizationClaimParameterization,
                     aliasAllocator.AllocateNext(),
-                    aliasAllocator.AllocateNext()
+                    cursor
                 );
                 return;
             case RelationshipAuthorizationPersonSubjectPathKind.TransitiveJoinPath:
@@ -877,6 +1337,10 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
     {
         var personMetadata = subject.PersonMetadata;
         var pathSteps = personMetadata.Path.Steps;
+
+        // Load-bearing for anchor correctness, not merely a diagnostic: this is what guarantees
+        // pathSteps[0].SourceTable is the query root, so the first step's source column is a column the root
+        // row itself carries and can be qualified with the root alias.
         RelationshipAuthorizationPeoplePathValidation.ValidateTransitivePersonPath(
             rootTable,
             subject.Table,
@@ -884,25 +1348,43 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
             pathSteps
         );
 
-        var rootSubqueryAlias = aliasAllocator.AllocateNext();
+        // The anchored shape needs a first hop to open the subquery on plus a separate terminal step carrying
+        // the person column. RelationshipAuthorizationPersonSubjectPath enforces that at construction, so a
+        // one-step transitive path cannot reach here.
+        var firstStep = pathSteps[0];
+        var firstHopTable =
+            firstStep.TargetTable
+            ?? throw new InvalidOperationException(
+                "Transitive People authorization path steps must include a target table for first-hop joins."
+            );
+        var firstHopColumn =
+            firstStep.TargetColumnName
+            ?? throw new InvalidOperationException(
+                "Transitive People authorization path steps must include a target column for first-hop joins."
+            );
+
+        var firstHopAlias = aliasAllocator.AllocateNext();
         var pathJoinAliases = Enumerable
-            .Range(0, pathSteps.Count - 1)
+            .Range(0, pathSteps.Count - 2)
             .Select(_ => aliasAllocator.AllocateNext())
             .ToArray();
         var authAlias = aliasAllocator.AllocateNext();
 
+        // Anchor on the root row's own reference FK and open the subquery at the first hop's target table.
+        // Anchoring on a primary-key self-join of the root table would be semantically identical but makes
+        // PostgreSQL scan the root table twice and hash every authorized DocumentId on every page.
         writer.Append($"{_rootAlias}.");
-        writer.AppendQuoted(personMetadata.StoredAnchor.RootDocumentIdColumn.Value);
+        writer.AppendQuoted(firstStep.SourceColumnName.Value);
         writer.Append(" IN (SELECT ");
-        writer.Append($"{rootSubqueryAlias}.");
-        writer.AppendQuoted(personMetadata.StoredAnchor.RootDocumentIdColumn.Value);
+        writer.Append($"{firstHopAlias}.");
+        writer.AppendQuoted(firstHopColumn.Value);
         writer.Append(" FROM ");
-        writer.AppendRelation(new SqlRelationRef.PhysicalTable(rootTable));
-        writer.Append($" {rootSubqueryAlias}");
+        writer.AppendRelation(new SqlRelationRef.PhysicalTable(firstHopTable));
+        writer.Append($" {firstHopAlias}");
 
-        var currentSourceAlias = rootSubqueryAlias;
+        var currentSourceAlias = firstHopAlias;
 
-        for (var stepIndex = 0; stepIndex < pathSteps.Count - 1; stepIndex++)
+        for (var stepIndex = 1; stepIndex < pathSteps.Count - 1; stepIndex++)
         {
             var step = pathSteps[stepIndex];
             var targetTable =
@@ -915,7 +1397,7 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
                 ?? throw new InvalidOperationException(
                     "Transitive People authorization path steps must include a target column for intermediate joins."
                 );
-            var joinAlias = pathJoinAliases[stepIndex];
+            var joinAlias = pathJoinAliases[stepIndex - 1];
 
             writer.Append(" JOIN ");
             writer.AppendRelation(new SqlRelationRef.PhysicalTable(targetTable));
@@ -940,40 +1422,58 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         writer.Append(")");
     }
 
+    /// <summary>
+    /// Emits the Self and Direct person predicates anchored on the root row's own column — the person twin
+    /// of <see cref="AppendRootSubjectHierarchyMatchSql"/>. Anchoring on a primary-key self-join of the root
+    /// table instead would be semantically identical but makes PostgreSQL scan the root table twice and hash
+    /// every authorized DocumentId on every page, so the anchor column is always one the root row carries.
+    /// </summary>
     private static void AppendRootDocumentIdInPersonAuthViewSql(
         SqlWriter writer,
-        DbTableName rootTable,
-        DbColumnName rootDocumentIdColumn,
-        DbColumnName rootPersonDocumentIdColumn,
+        DbColumnName anchorColumn,
         RelationshipAuthorizationAuthObject authObject,
         AuthorizationClaimEducationOrganizationIdParameterization authorizationClaimParameterization,
-        string rootSubqueryAlias,
-        string authAlias
+        string authAlias,
+        PageCandidateMode.Cursor? cursor
     )
     {
+        // The auth view's subject column holds the same key as the anchor column, so the cursor bounds
+        // transfer to it only when the anchor is the column the cursor ranges over. A reference anchor
+        // (a *_DocumentId foreign key) or a ContentVersion cursor ranges over a different key space and
+        // keeps the unbounded subquery.
+        var anchorBound =
+            cursor is not null
+            && string.Equals(anchorColumn.Value, ResolveOrderingColumnName(cursor), StringComparison.Ordinal)
+                ? cursor
+                : null;
+
         writer.Append($"{_rootAlias}.");
-        writer.AppendQuoted(rootDocumentIdColumn.Value);
-        writer.Append(" IN (SELECT ");
-        writer.Append($"{rootSubqueryAlias}.");
-        writer.AppendQuoted(rootDocumentIdColumn.Value);
-        writer.Append(" FROM ");
-        writer.AppendRelation(new SqlRelationRef.PhysicalTable(rootTable));
-        writer.Append($" {rootSubqueryAlias} WHERE {rootSubqueryAlias}.");
-        writer.AppendQuoted(rootPersonDocumentIdColumn.Value);
+        writer.AppendQuoted(anchorColumn.Value);
         AppendPersonAuthViewMembershipSubquerySql(
             writer,
             authObject,
             authorizationClaimParameterization,
-            authAlias
+            authAlias,
+            anchorBound
         );
-        writer.Append(")");
     }
 
+    /// <summary>
+    /// Emits <c> IN (SELECT subject FROM auth.View alias WHERE claim filter [AND subject range])</c>.
+    /// </summary>
+    /// <remarks>
+    /// When <paramref name="anchorBound" /> is supplied the subquery repeats the cursor's inclusive bounds
+    /// on the subject column. The root row is already bounded, so the candidate set does not change; the
+    /// inner bounds exist so the auth-view scan can be range-bounded too. Without them PostgreSQL
+    /// merge-joins an unbounded auth-view scan and reads every authorized row below the anchor before
+    /// producing its first match, making page cost proportional to cursor depth.
+    /// </remarks>
     private static void AppendPersonAuthViewMembershipSubquerySql(
         SqlWriter writer,
         RelationshipAuthorizationAuthObject authObject,
         AuthorizationClaimEducationOrganizationIdParameterization authorizationClaimParameterization,
-        string authAlias
+        string authAlias,
+        PageCandidateMode.Cursor? anchorBound = null
     )
     {
         writer.Append(" IN (SELECT ");
@@ -987,6 +1487,19 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
             writer,
             authorizationClaimParameterization
         );
+
+        if (anchorBound is not null)
+        {
+            writer.Append($" AND {authAlias}.");
+            writer.AppendQuoted(authObject.SubjectValueColumn.Value);
+            writer.Append(" >= ");
+            writer.AppendParameter(anchorBound.InclusiveMinimumParameterName);
+            writer.Append($" AND {authAlias}.");
+            writer.AppendQuoted(authObject.SubjectValueColumn.Value);
+            writer.Append(" <= ");
+            writer.AppendParameter(anchorBound.InclusiveMaximumParameterName);
+        }
+
         writer.Append(")");
     }
 
@@ -1279,37 +1792,35 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
     }
 
     /// <summary>
-    /// Creates a deterministic exception describing a filter/paging parameter-name collision.
+    /// Creates a deterministic exception describing a filter/mode parameter-name collision.
     /// </summary>
-    private static ArgumentException CreateFilterPagingCollisionException(
+    private static ArgumentException CreateFilterModeParameterCollisionException(
         string filterParameterName,
-        string pagingParameterName,
-        string pagingParameterPropertyName,
+        PageCandidateModeParameter modeParameter,
         string paramName
     )
     {
         return new ArgumentException(
-            $"Filter parameter name '{filterParameterName}' collides with paging parameter name '{pagingParameterName}' (case-insensitive). "
-                + $"Rename the filter parameter or change {pagingParameterPropertyName}.",
+            $"Filter parameter name '{filterParameterName}' collides with candidate mode parameter name "
+                + $"'{modeParameter.Name}' (case-insensitive). "
+                + $"Rename the filter parameter or change {modeParameter.PropertyName}.",
             paramName
         );
     }
 
     /// <summary>
-    /// Creates a deterministic exception describing an offset/limit paging parameter-name collision.
+    /// Creates a deterministic exception describing a collision between two mode-owned parameter names.
     /// </summary>
-    private static ArgumentException CreatePagingParameterCollisionException(
-        string offsetParameterName,
-        string limitParameterName,
-        string paramName
+    private static ArgumentException CreateModeParameterCollisionException(
+        PageCandidateModeParameter first,
+        PageCandidateModeParameter second
     )
     {
-        return new ArgumentException(
-            $"Paging parameter names must be distinct (case-insensitive). "
-                + $"{nameof(PageDocumentIdQuerySpec.OffsetParameterName)}='{offsetParameterName}', "
-                + $"{nameof(PageDocumentIdQuerySpec.LimitParameterName)}='{limitParameterName}'. "
-                + $"Rename either {nameof(PageDocumentIdQuerySpec.OffsetParameterName)} or {nameof(PageDocumentIdQuerySpec.LimitParameterName)}.",
-            paramName
+        return BuildArgumentException(
+            "Candidate mode parameter names must be distinct (case-insensitive). "
+                + $"{first.PropertyName}='{first.Name}', {second.PropertyName}='{second.Name}'. "
+                + $"Rename either {first.PropertyName} or {second.PropertyName}.",
+            nameof(PageDocumentIdQuerySpec.Mode)
         );
     }
 
@@ -1342,7 +1853,6 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         {
             QueryPredicateTarget.RootColumn => nameof(QueryPredicateTarget.RootColumn),
             QueryPredicateTarget.DocumentUuid => nameof(QueryPredicateTarget.DocumentUuid),
-            QueryPredicateTarget.DescriptorColumn => nameof(QueryPredicateTarget.DescriptorColumn),
             _ => throw new ArgumentOutOfRangeException(
                 nameof(target),
                 target,
@@ -1360,7 +1870,6 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         {
             QueryPredicateTarget.RootColumn => _rootAlias,
             QueryPredicateTarget.DocumentUuid => _documentAlias,
-            QueryPredicateTarget.DescriptorColumn => _descriptorAlias,
             _ => throw new ArgumentOutOfRangeException(
                 nameof(target),
                 target,

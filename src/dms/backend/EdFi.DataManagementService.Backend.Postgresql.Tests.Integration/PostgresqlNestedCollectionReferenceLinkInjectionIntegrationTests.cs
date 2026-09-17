@@ -195,7 +195,7 @@ public class Given_A_Postgresql_BellSchedule_With_Nested_Collection_ClassPeriod_
         services.Configure<DatabaseOptions>(options => options.IsolationLevel = IsolationLevel.ReadCommitted);
         services.AddTestReadableProfileProjector();
         services.AddScoped<RelationalDocumentStoreRepository>();
-        services.AddPostgresqlReferenceResolver();
+        services.AddPostgresqlBackendIntegrationTestServices();
 
         // Two slugs needed: School (BellSchedule.schoolReference at root) + ClassPeriod
         // (the nested-collection references — what 29c actually exercises).
@@ -415,13 +415,16 @@ public class Given_A_Postgresql_BellSchedule_With_Nested_Collection_ClassPeriod_
             MappingSet: _mappingSet,
             QueryElements: [],
             AuthorizationStrategyEvaluators: [],
-            PaginationParameters: new PaginationParameters(
-                Limit: 25,
-                Offset: 0,
-                TotalCount: false,
-                MaximumPageSize: MaximumPageSize
+            Paging: new CollectionPaging.Traditional(
+                new PaginationParameters(
+                    Limit: 25,
+                    Offset: 0,
+                    TotalCount: false,
+                    MaximumPageSize: MaximumPageSize
+                )
             ),
-            TraceId: new TraceId("pg-29c-query-bellschedule")
+            TraceId: new TraceId("pg-29c-query-bellschedule"),
+            PageOrderingMode: PageOrderingMode.DocumentId
         );
 
         return await scope
@@ -548,6 +551,7 @@ public class Given_A_Postgresql_BellSchedule_With_Nested_Collection_ClassPeriod_
             """
             INSERT INTO "dms"."Descriptor" (
                 "DocumentId",
+                "ResourceKeyId",
                 "Namespace",
                 "CodeValue",
                 "ShortDescription",
@@ -557,6 +561,7 @@ public class Given_A_Postgresql_BellSchedule_With_Nested_Collection_ClassPeriod_
             )
             VALUES (
                 @documentId,
+                @resourceKeyId,
                 @namespace,
                 @codeValue,
                 @shortDescription,
@@ -566,6 +571,7 @@ public class Given_A_Postgresql_BellSchedule_With_Nested_Collection_ClassPeriod_
             );
             """,
             new NpgsqlParameter("documentId", documentId),
+            new NpgsqlParameter("resourceKeyId", resourceKeyId),
             new NpgsqlParameter("namespace", @namespace),
             new NpgsqlParameter("codeValue", codeValue),
             new NpgsqlParameter("shortDescription", shortDescription),

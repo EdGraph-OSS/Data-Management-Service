@@ -1,0 +1,1403 @@
+// SPDX-License-Identifier: Apache-2.0
+// Licensed to the Ed-Fi Alliance under one or more agreements.
+// The Ed-Fi Alliance licenses this file to you under the Apache License, Version 2.0.
+// See the LICENSE and NOTICES files in the project root for more information.
+
+using System.Data;
+using System.Data.Common;
+using System.Text.Json.Nodes;
+using EdFi.DataManagementService.Backend.Composite;
+using EdFi.DataManagementService.Backend.External;
+using EdFi.DataManagementService.Backend.External.Plans;
+using EdFi.DataManagementService.Backend.Plans;
+using EdFi.DataManagementService.Backend.Tests.Unit.Composite;
+using EdFi.DataManagementService.Backend.Tests.Unit.TestSupport;
+using EdFi.DataManagementService.Core.External.Backend;
+using EdFi.DataManagementService.Core.External.Model;
+using FluentAssertions;
+using NUnit.Framework;
+
+namespace EdFi.DataManagementService.Backend.Tests.Unit;
+
+[TestFixture]
+[Parallelizable]
+public class Given_The_Composite_Relational_Write_First_Phase
+{
+    private static readonly DocumentUuid CandidateDocumentUuid = new(
+        Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb")
+    );
+
+    private static readonly DocumentUuid ExistingDocumentUuid = new(
+        Guid.Parse("cccccccc-1111-2222-3333-dddddddddddd")
+    );
+
+    [Test]
+    public async Task It_resolves_post_create_from_one_vacuous_composite_command()
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Post);
+        var session = new ScriptedWriteSession(CreateCompositeReader(target: null));
+
+        var resolution = await CreateSut().ResolveAsync(input, session);
+
+        resolution.ImmediateResult.Should().BeNull();
+        resolution
+            .Outcome!.ExecutionRequest.TargetContext.Should()
+            .BeOfType<RelationalWriteTargetContext.CreateNew>();
+        resolution.Outcome.LockedTarget.Should().BeNull();
+        resolution.Outcome.CurrentState.Should().BeNull();
+        session.Commands.Should().ContainSingle();
+    }
+
+    [TestCase(RelationalWriteOperationKind.Post)]
+    [TestCase(RelationalWriteOperationKind.Put)]
+    public async Task It_resolves_an_existing_target_and_hydrates_the_captured_content_version(
+        RelationalWriteOperationKind operationKind
+    )
+    {
+        var input = CreateInput(operationKind);
+        var session = new ScriptedWriteSession(
+            CreateCompositeReader(new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value))
+        );
+
+        var resolution = await CreateSut().ResolveAsync(input, session);
+
+        resolution.ImmediateResult.Should().BeNull();
+        resolution
+            .Outcome!.ExecutionRequest.TargetContext.Should()
+            .BeOfType<RelationalWriteTargetContext.ExistingDocument>();
+        resolution.Outcome.CurrentState!.DocumentMetadata.ContentVersion.Should().Be(44L);
+        resolution.Outcome.LockedTarget!.DocumentId.Should().Be(345L);
+        resolution.Outcome.LockedTarget.ObservedContentVersion.Should().Be(44L);
+        resolution.Outcome.LockedTarget.IsHeldBy(session).Should().BeTrue();
+        resolution.Outcome.LockedTarget.IsHeldBy(new ScriptedWriteSession()).Should().BeFalse();
+        session.Commands.Should().ContainSingle();
+    }
+
+    [Test]
+    public async Task It_returns_missing_put_without_decoding_absent_hydration_as_current_state()
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Put);
+        var session = new ScriptedWriteSession(CreateCompositeReader(target: null));
+
+        var resolution = await CreateSut().ResolveAsync(input, session);
+
+        resolution
+            .ImmediateResult.Should()
+            .Be(new RelationalWriteExecutorResult.Update(new UpdateResult.UpdateFailureNotExists()));
+        resolution.Outcome.Should().BeNull();
+        session.Commands.Should().ContainSingle();
+    }
+
+    [Test]
+    public async Task It_selects_the_post_create_immediate_result_before_reference_or_hydration_execution()
+    {
+        var expected = RelationalWriteExecutorResults.BuildUnknownFailureResult(
+            RelationalWriteOperationKind.Post,
+            "create plan denied"
+        );
+        var input = CreateInput(RelationalWriteOperationKind.Post) with
+        {
+            PostRelationshipAuthorizationPlans = CreatePostPlans(expected),
+        };
+        var adapterFactory = new TestReferenceResolverAdapterFactory
+        {
+            ExceptionToThrow = new FakeDbException("reference lookup must not execute"),
+        };
+        var session = new ScriptedWriteSession(CreateCaptureReader(target: null));
+
+        var resolution = await CreateSut(adapterFactory).ResolveAsync(input, session);
+
+        resolution.ImmediateResult.Should().BeSameAs(expected);
+        resolution.Outcome.Should().BeNull();
+        session.Commands.Should().ContainSingle();
+        session.Commands[0].CommandText.Should().NotContain("current-state-hydration");
+    }
+
+    [Test]
+    public async Task It_selects_the_existing_post_authorization_plan_after_capture()
+    {
+        var createImmediate = RelationalWriteExecutorResults.BuildUnknownFailureResult(
+            RelationalWriteOperationKind.Post,
+            "create branch only"
+        );
+        var input = CreateInput(RelationalWriteOperationKind.Post) with
+        {
+            PostRelationshipAuthorizationPlans = CreatePostPlans(createImmediate),
+        };
+        var target = new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value);
+        var session = new ScriptedWriteSession(
+            CreateCaptureReader(target),
+            CreateReader(CreateDocumentMetadataTable(target, 44L), CreateRootTable(target))
+        );
+
+        var resolution = await CreateSut().ResolveAsync(input, session);
+
+        resolution.ImmediateResult.Should().BeNull();
+        resolution
+            .Outcome!.ExecutionRequest.TargetContext.Should()
+            .BeOfType<RelationalWriteTargetContext.ExistingDocument>();
+        resolution.Outcome.ExecutionRequest.PostRelationshipAuthorizationPlans.Should().BeNull();
+        resolution
+            .Outcome.ExecutionRequest.StoredRelationshipAuthorization.Should()
+            .BeOfType<RelationshipAuthorizationResult.NoAuthorizationRequired>();
+        session.Commands.Should().HaveCount(2);
+    }
+
+    [Test]
+    public async Task It_keeps_stored_authorization_and_hydration_vacuous_after_an_absent_capture()
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Post, includeReadPlan: false) with
+        {
+            StoredNamespaceAuthorization = CreateStoredNamespaceAuthorization(),
+        };
+        var session = new ScriptedWriteSession(
+            CreateReader(CreateCaptureTable(target: null), CreateAuthorizationTable())
+        );
+
+        var resolution = await CreateSut().ResolveAsync(input, session);
+
+        resolution.ImmediateResult.Should().BeNull();
+        resolution
+            .Outcome!.ExecutionRequest.TargetContext.Should()
+            .BeOfType<RelationalWriteTargetContext.CreateNew>();
+        resolution.Outcome.CurrentState.Should().BeNull();
+        session.Commands.Should().ContainSingle();
+    }
+
+    [Test]
+    public async Task It_rejects_missing_hydration_metadata_for_a_captured_target()
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Put);
+        var session = new ScriptedWriteSession(
+            CreateCompositeReader(
+                new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value),
+                includeMetadata: false
+            )
+        );
+
+        Func<Task> act = async () => await CreateSut().ResolveAsync(input, session);
+
+        await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*no metadata*345*");
+    }
+
+    [Test]
+    public async Task It_rejects_hydration_content_version_misalignment()
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Put);
+        var session = new ScriptedWriteSession(
+            CreateCompositeReader(
+                new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value),
+                hydratedContentVersion: 45L
+            )
+        );
+
+        Func<Task> act = async () => await CreateSut().ResolveAsync(input, session);
+
+        await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*45*44*misaligned*");
+    }
+
+    [Test]
+    public async Task It_preserves_provider_failures()
+    {
+        var expected = new FakeDbException("provider failed");
+        var input = CreateInput(RelationalWriteOperationKind.Post);
+        var session = new ScriptedWriteSession(expected);
+
+        Func<Task> act = async () => await CreateSut().ResolveAsync(input, session);
+
+        (await act.Should().ThrowAsync<FakeDbException>()).Which.Should().BeSameAs(expected);
+    }
+
+    [Test]
+    public async Task It_propagates_cancellation()
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Post);
+        var session = new ScriptedWriteSession(CreateCompositeReader(target: null));
+        using var cancellationSource = new CancellationTokenSource();
+        await cancellationSource.CancelAsync();
+
+        Func<Task> act = async () => await CreateSut().ResolveAsync(input, session, cancellationSource.Token);
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
+    }
+
+    [Test]
+    public async Task It_maps_namespace_auth1_denial_before_deferred_relationship_denial()
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Put, includeReadPlan: false) with
+        {
+            StoredNamespaceAuthorization = CreateStoredNamespaceAuthorization(),
+            StoredRelationshipAuthorization = new RelationshipAuthorizationResult.NoClaims([], []),
+        };
+        var payload = NamespaceAuthorizationAuth1FailurePayloadCodec.Encode(
+            new NamespaceAuthorizationAuth1FailurePayload(
+                0,
+                NamespaceAuthorizationAuth1FailureKind.NamespaceMismatch
+            )
+        );
+        var extractor = new TestProviderFailureExtractor(
+            NamespaceAuthorizationAuth1FailurePayloadCodec.ProviderFailureCode,
+            payload
+        );
+        var session = new ScriptedWriteSession(
+            CreateCaptureReader(new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value)),
+            new FakeDbException("namespace denial")
+        );
+
+        var resolution = await CreateSut(providerFailureExtractor: extractor).ResolveAsync(input, session);
+
+        resolution
+            .ImmediateResult.Should()
+            .BeOfType<RelationalWriteExecutorResult.Update>()
+            .Which.Result.Should()
+            .BeOfType<UpdateResult.UpdateFailureNamespaceNotAuthorized>();
+        session.Commands.Should().HaveCount(2);
+        session.Commands[1].CommandText.Should().Contain("AUTH1");
+    }
+
+    [Test]
+    public async Task It_maps_an_invalid_namespace_auth1_payload_to_security_configuration_failure()
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Put, includeReadPlan: false) with
+        {
+            StoredNamespaceAuthorization = CreateStoredNamespaceAuthorization(),
+        };
+        var extractor = new TestProviderFailureExtractor(
+            NamespaceAuthorizationAuth1FailurePayloadCodec.ProviderFailureCode,
+            "ns1|9|m"
+        );
+        var session = new ScriptedWriteSession(new FakeDbException("invalid AUTH1 payload"));
+
+        var resolution = await CreateSut(providerFailureExtractor: extractor).ResolveAsync(input, session);
+
+        resolution
+            .ImmediateResult.Should()
+            .BeOfType<RelationalWriteExecutorResult.Update>()
+            .Which.Result.Should()
+            .BeOfType<UpdateResult.UpdateFailureSecurityConfiguration>();
+        resolution.Outcome.Should().BeNull();
+    }
+
+    [Test]
+    public async Task It_binds_the_decoded_target_to_a_structured_relationship_fallback()
+    {
+        var input = CreateInput(
+            RelationalWriteOperationKind.Put,
+            includeReadPlan: true,
+            dialect: SqlDialect.Mssql
+        );
+        input = input with
+        {
+            StoredRelationshipAuthorization =
+                Given_Default_Relational_Write_Executor.CreateStoredSchoolIdRelationshipAuthorization(
+                    input,
+                    Enumerable.Range(1, 2000).Select(static value => (long)value).ToArray()
+                ),
+        };
+        var target = new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value);
+        var session = new ScriptedWriteSession(
+            CreateCaptureReader(target),
+            CreateReader(CreateStoredRelationshipAuthorizationTable(target)),
+            CreateReader(CreateDocumentMetadataTable(target, 44L), CreateRootTable(target))
+        );
+
+        var resolution = await CreateSut().ResolveAsync(input, session);
+
+        resolution.ImmediateResult.Should().BeNull();
+        resolution.Outcome!.LockedTarget!.IsHeldBy(session).Should().BeTrue();
+        session.Commands.Should().HaveCount(3);
+        session
+            .Commands[1]
+            .Parameters.Single(parameter =>
+                parameter.Name.Equals("@DocumentId", StringComparison.OrdinalIgnoreCase)
+            )
+            .Value.Should()
+            .Be(target.DocumentId);
+        session.Commands[1].CommandText.Should().NotContain("@dms_composite_target_documentid");
+    }
+
+    [Test]
+    public void It_accepts_an_exact_guarded_no_op_lock_proof_from_the_current_session()
+    {
+        var session = new ScriptedWriteSession();
+        var proof = CreateLockProof(session, documentId: 345L, contentVersion: 44L);
+        var target = new RelationalWriteTargetContext.ExistingDocument(345L, ExistingDocumentUuid, 44L);
+
+        Action act = () =>
+            DefaultRelationalWriteExecutor.ValidateGuardedNoOpLockProof(proof, target, session);
+
+        act.Should().NotThrow();
+    }
+
+    [Test]
+    public void It_rejects_a_guarded_no_op_lock_proof_from_another_session()
+    {
+        var originatingSession = new ScriptedWriteSession();
+        var currentSession = new ScriptedWriteSession();
+        var proof = CreateLockProof(originatingSession, documentId: 345L, contentVersion: 44L);
+        var target = new RelationalWriteTargetContext.ExistingDocument(345L, ExistingDocumentUuid, 44L);
+
+        Action act = () =>
+            DefaultRelationalWriteExecutor.ValidateGuardedNoOpLockProof(proof, target, currentSession);
+
+        act.Should().Throw<InvalidOperationException>().WithMessage("*current write session*");
+    }
+
+    [Test]
+    public void It_rejects_a_missing_guarded_no_op_lock_proof()
+    {
+        var session = new ScriptedWriteSession();
+        var target = new RelationalWriteTargetContext.ExistingDocument(345L, ExistingDocumentUuid, 44L);
+
+        Action act = () => DefaultRelationalWriteExecutor.ValidateGuardedNoOpLockProof(null, target, session);
+
+        act.Should().Throw<InvalidOperationException>().WithMessage("*matching capture lock proof*");
+    }
+
+    [TestCase(346L, 44L)]
+    [TestCase(345L, 45L)]
+    public void It_rejects_a_guarded_no_op_lock_proof_that_disagrees_with_the_target(
+        long documentId,
+        long contentVersion
+    )
+    {
+        var session = new ScriptedWriteSession();
+        var proof = CreateLockProof(session, documentId, contentVersion);
+        var target = new RelationalWriteTargetContext.ExistingDocument(345L, ExistingDocumentUuid, 44L);
+
+        Action act = () =>
+            DefaultRelationalWriteExecutor.ValidateGuardedNoOpLockProof(proof, target, session);
+
+        act.Should().Throw<InvalidOperationException>().WithMessage("*matching capture lock proof*");
+    }
+
+    [TestCase(3, 1)]
+    [TestCase(2, 3)]
+    public async Task It_preflights_exact_fit_and_one_over_budget_before_selecting_a_segment(
+        int parameterBudget,
+        int expectedCommandCount
+    )
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Post) with
+        {
+            StoredNamespaceAuthorization = CreateStoredNamespaceAuthorization(),
+        };
+        var target = new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value);
+        var scripts =
+            parameterBudget == 3
+                ? new object[]
+                {
+                    CreateReader(
+                        CreateCaptureTable(target),
+                        CreateAuthorizationTable(),
+                        CreateDocumentMetadataTable(target, 44L),
+                        CreateRootTable(target)
+                    ),
+                }
+                :
+                [
+                    CreateCaptureReader(target),
+                    CreateReader(CreateAuthorizationTable()),
+                    CreateReader(CreateDocumentMetadataTable(target, 44L), CreateRootTable(target)),
+                ];
+        var session = new ScriptedWriteSession(scripts);
+        var sut = CreateSut(
+            commandBudget: new RelationalCommandBudget(parameterBudget, MaxRowsPerStatement: 1000)
+        );
+
+        var resolution = await sut.ResolveAsync(input, session);
+
+        resolution.ImmediateResult.Should().BeNull();
+        session.Commands.Should().HaveCount(expectedCommandCount);
+        session
+            .Commands[0]
+            .CommandText.Contains("Namespace", StringComparison.OrdinalIgnoreCase)
+            .Should()
+            .Be(parameterBudget == 3);
+
+        if (parameterBudget == 2)
+        {
+            session
+                .Commands[1]
+                .Parameters.Single(parameter =>
+                    parameter.Name.Equals("@documentId", StringComparison.OrdinalIgnoreCase)
+                )
+                .Value.Should()
+                .Be(target.DocumentId);
+        }
+    }
+
+    [TestCase(5, true)]
+    [TestCase(4, false)]
+    public async Task It_preflights_the_combined_capture_authorization_and_reference_budget(
+        int parameterBudget,
+        bool expectCompositeReferenceLookup
+    )
+    {
+        var referentialId = new ReferentialId(Guid.Parse("87654321-1111-2222-3333-444444444444"));
+        var input = CreateInput(
+            RelationalWriteOperationKind.Post,
+            includeReadPlan: true,
+            documentReferences: [CreateDocumentReference(referentialId)]
+        ) with
+        {
+            StoredNamespaceAuthorization = CreateStoredNamespaceAuthorization(),
+        };
+        var lookupCommand = new RelationalCommand(
+            "SELECT @lookup0 AS \"LookupMarker0\", @lookup1 AS \"LookupMarker1\" WHERE FALSE",
+            [new RelationalParameter("@lookup0", 1), new RelationalParameter("@lookup1", 2)]
+        );
+        var factory = new TestReferenceResolverAdapterFactory { EmbeddableCommand = lookupCommand };
+        var target = new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value);
+        object[] scripts = expectCompositeReferenceLookup
+            ?
+            [
+                CreateReader(
+                    CreateCaptureTable(target),
+                    CreateAuthorizationTable(),
+                    CreateReferenceLookupTable(),
+                    CreateDocumentMetadataTable(target, 44L),
+                    CreateRootTable(target)
+                ),
+            ]
+            :
+            [
+                CreateCaptureReader(target),
+                CreateReader(CreateAuthorizationTable()),
+                CreateReader(CreateDocumentMetadataTable(target, 44L), CreateRootTable(target)),
+            ];
+        var session = new ScriptedWriteSession(scripts);
+        var sut = CreateSut(
+            factory,
+            commandBudget: new RelationalCommandBudget(parameterBudget, MaxRowsPerStatement: 1000)
+        );
+
+        var resolution = await sut.ResolveAsync(input, session);
+
+        resolution.ImmediateResult.Should().BeNull();
+        session.Commands.Should().HaveCount(expectCompositeReferenceLookup ? 1 : 3);
+        session
+            .Commands[0]
+            .CommandText.Contains("LookupMarker", StringComparison.Ordinal)
+            .Should()
+            .Be(expectCompositeReferenceLookup);
+
+        if (!expectCompositeReferenceLookup)
+        {
+            session
+                .Commands[1]
+                .Parameters.Single(parameter =>
+                    parameter.Name.Equals("@documentId", StringComparison.OrdinalIgnoreCase)
+                )
+                .Value.Should()
+                .Be(target.DocumentId);
+        }
+    }
+
+    private static CompositeRelationalWriteFirstPhase CreateSut(
+        TestReferenceResolverAdapterFactory? adapterFactory = null,
+        IRelationshipAuthorizationProviderFailureExtractor? providerFailureExtractor = null,
+        RelationalCommandBudget? commandBudget = null,
+        IRelationalCommandExecutor? customViewValidationCommandExecutor = null,
+        IRelationalWriteExceptionClassifier? writeExceptionClassifier = null
+    ) =>
+        new(
+            adapterFactory ?? new TestReferenceResolverAdapterFactory(),
+            relationshipAuthorizationProviderFailureExtractor: providerFailureExtractor,
+            commandBudget: commandBudget,
+            customViewValidationCommandExecutor: customViewValidationCommandExecutor,
+            writeExceptionClassifier: writeExceptionClassifier
+        );
+
+    private static RelationalWriteLockedTarget CreateLockProof(
+        IRelationalWriteSession session,
+        long documentId,
+        long contentVersion
+    ) =>
+        RelationalWriteLockedTarget.FromCaptureOutcome(
+            new RelationalCompositeStatementOutcome(
+                0,
+                "capture-target",
+                new RelationalCompositeCapturedTarget(documentId, contentVersion, ExistingDocumentUuid.Value)
+            ),
+            session
+        );
+
+    private static RelationalWriteExecutorInput CreateInput(
+        RelationalWriteOperationKind operationKind,
+        bool includeReadPlan = true,
+        SqlDialect dialect = SqlDialect.Pgsql,
+        IReadOnlyList<DocumentReference>? documentReferences = null
+    )
+    {
+        var rootPlan = Given_Default_Relational_Write_Executor.CreateRootPlan();
+        var resourceModel = Given_Default_Relational_Write_Executor.CreateRelationalResourceModel(
+            rootPlan.TableModel
+        );
+        var writePlan = new ResourceWritePlan(resourceModel, [rootPlan]);
+        var mappingSet = Given_Default_Relational_Write_Executor.CreateMappingSet(
+            resourceModel,
+            [rootPlan],
+            dialect
+        );
+
+        return new RelationalWriteExecutorInput(
+            mappingSet,
+            operationKind,
+            operationKind is RelationalWriteOperationKind.Put
+                ? new RelationalWriteTargetRequest.Put(ExistingDocumentUuid)
+                : new RelationalWriteTargetRequest.Post(
+                    new ReferentialId(Guid.Parse("12345678-1111-2222-3333-444444444444")),
+                    CandidateDocumentUuid
+                ),
+            writePlan,
+            includeReadPlan
+                ? Given_Default_Relational_Write_Executor.CreateReadPlan(resourceModel, dialect)
+                : null,
+            JsonNode.Parse("""{"schoolId":255901,"name":"Lincoln High"}""")!,
+            allowIdentityUpdates: false,
+            new TraceId("composite-first-phase-test"),
+            new ReferenceResolverRequest(mappingSet, resourceModel.Resource, documentReferences ?? [], [])
+        );
+    }
+
+    private static PostRelationshipAuthorizationPlans CreatePostPlans(
+        RelationalWriteExecutorResult createNewImmediateResult
+    )
+    {
+        var noAuthorizationRequired = new RelationshipAuthorizationResult.NoAuthorizationRequired([]);
+
+        return new PostRelationshipAuthorizationPlans(
+            new RelationshipAuthorizationUpdatePlan(noAuthorizationRequired, noAuthorizationRequired, [], []),
+            CreateNewProposedRelationshipAuthorization: null,
+            createNewImmediateResult
+        );
+    }
+
+    [Test]
+    public async Task It_emits_the_stored_custom_view_checks_in_the_opening_command()
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Put, includeReadPlan: false) with
+        {
+            CustomViewAuthorization = CreateStoredCustomViewAuthorization(("SchoolWithATag", 0)),
+        };
+        var session = new ScriptedWriteSession(
+            CreateReader(
+                CreateCaptureTable(new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value)),
+                CreateAuthorizationTable()
+            )
+        );
+
+        await CreateSut().ResolveAsync(input, session);
+
+        session.Commands.Should().ContainSingle();
+        session.Commands[0].CommandText.Should().Contain("SchoolWithATag");
+    }
+
+    [Test]
+    public async Task It_maps_a_stored_custom_view_auth1_denial_to_the_custom_view_failure()
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Put, includeReadPlan: false) with
+        {
+            CustomViewAuthorization = CreateStoredCustomViewAuthorization(("SchoolWithATag", 0)),
+        };
+        // One composite command carries capture and checks, so the abort is that command's failure.
+        var session = new ScriptedWriteSession(new FakeDbException("custom view denial"));
+
+        var resolution = await CreateSut(providerFailureExtractor: CustomViewFailureExtractor(0))
+            .ResolveAsync(input, session);
+
+        var failure = resolution
+            .ImmediateResult.Should()
+            .BeOfType<RelationalWriteExecutorResult.Update>()
+            .Which.Result.Should()
+            .BeOfType<UpdateResult.UpdateFailureCustomViewNotAuthorized>()
+            .Subject;
+        failure.CustomViewFailure.StrategyName.Should().Be("SchoolWithATag");
+        failure.CustomViewFailure.Hint.Should().Be("You may need a SchoolWithATag hint.");
+    }
+
+    [Test]
+    public async Task It_maps_a_stored_custom_view_denial_on_a_post_to_the_upsert_failure()
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Post, includeReadPlan: false) with
+        {
+            CustomViewAuthorization = CreateStoredCustomViewAuthorization(("SchoolWithATag", 0)),
+        };
+        // One composite command carries capture and checks, so the abort is that command's failure.
+        var session = new ScriptedWriteSession(new FakeDbException("custom view denial"));
+
+        var resolution = await CreateSut(providerFailureExtractor: CustomViewFailureExtractor(0))
+            .ResolveAsync(input, session);
+
+        resolution
+            .ImmediateResult.Should()
+            .BeOfType<RelationalWriteExecutorResult.Upsert>()
+            .Which.Result.Should()
+            .BeOfType<UpsertResult.UpsertFailureCustomViewNotAuthorized>();
+    }
+
+    [Test]
+    public async Task It_maps_an_unmappable_custom_view_payload_to_security_configuration_failure()
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Put, includeReadPlan: false) with
+        {
+            CustomViewAuthorization = CreateStoredCustomViewAuthorization(("SchoolWithATag", 0)),
+        };
+        // One composite command carries capture and checks, so the abort is that command's failure.
+        var session = new ScriptedWriteSession(new FakeDbException("custom view denial"));
+
+        // Index 4 addresses no planned check, so the payload is a configuration defect, not a denial.
+        var resolution = await CreateSut(providerFailureExtractor: CustomViewFailureExtractor(4))
+            .ResolveAsync(input, session);
+
+        resolution
+            .ImmediateResult.Should()
+            .BeOfType<RelationalWriteExecutorResult.Update>()
+            .Which.Result.Should()
+            .BeOfType<UpdateResult.UpdateFailureSecurityConfiguration>();
+    }
+
+    [Test]
+    public async Task It_attributes_a_non_auth1_failure_in_a_custom_view_command_to_the_configured_view()
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Put, includeReadPlan: false) with
+        {
+            CustomViewAuthorization = CreateStoredCustomViewAuthorization(("SchoolWithATag", 0)),
+        };
+        var session = new ScriptedWriteSession(new FakeDbException("relation does not exist"));
+
+        var act = async () =>
+            await CreateSut(providerFailureExtractor: new TestProviderFailureExtractor("42P01", "missing"))
+                .ResolveAsync(input, session);
+
+        await act.Should().ThrowAsync<CustomViewAuthorizationValidationException>();
+    }
+
+    [Test]
+    public async Task It_maps_a_transient_failure_in_a_custom_view_command_to_a_write_conflict()
+    {
+        // A deadlock at reader-open carries no AUTH1 payload either, but it proves nothing about the
+        // configured view: it must keep the retryable 409 write-conflict classification instead of being
+        // relabelled as a custom-view validation 500.
+        var input = CreateInput(RelationalWriteOperationKind.Put, includeReadPlan: false) with
+        {
+            CustomViewAuthorization = CreateStoredCustomViewAuthorization(("SchoolWithATag", 0)),
+        };
+        var session = new ScriptedWriteSession(new FakeDbException("deadlock detected"));
+        var classifier = new ConfigurableRelationalWriteExceptionClassifier
+        {
+            IsTransientFailureToReturn = true,
+        };
+
+        var resolution = await CreateSut(
+                providerFailureExtractor: new TestProviderFailureExtractor("40P01", "deadlock detected"),
+                writeExceptionClassifier: classifier
+            )
+            .ResolveAsync(input, session);
+
+        resolution
+            .ImmediateResult.Should()
+            .BeOfType<RelationalWriteExecutorResult.Update>()
+            .Which.Result.Should()
+            .BeOfType<UpdateResult.UpdateFailureWriteConflict>();
+    }
+
+    [Test]
+    public async Task It_validates_a_co_batched_custom_view_before_running_the_opening_command()
+    {
+        // The view's statement rides the opening command, so a table masquerading as auth.{StrategyName} would
+        // answer it silently. Its contract is settled before that command is sent, which is also what keeps the
+        // 500 ahead of anything the command decides.
+        var input = CreateInput(RelationalWriteOperationKind.Put, includeReadPlan: false) with
+        {
+            CustomViewAuthorization = CreateStoredCustomViewAuthorization(("SchoolWithATag", 0)),
+        };
+        var session = new ScriptedWriteSession(
+            CreateReader(
+                CreateCaptureTable(new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value)),
+                CreateAuthorizationTable()
+            )
+        );
+        var validationExecutor = new StubValidationCommandExecutor(
+            new FakeDbException("invalid custom authorization view DocumentId contract")
+        );
+
+        var act = async () =>
+            await CreateSut(customViewValidationCommandExecutor: validationExecutor)
+                .ResolveAsync(input, session);
+
+        await act.Should().ThrowAsync<CustomViewAuthorizationValidationException>();
+        validationExecutor
+            .ExecutedCommands.Should()
+            .ContainSingle()
+            .Subject.CommandText.Should()
+            .Contain("SchoolWithATag");
+        session.Commands.Should().BeEmpty();
+    }
+
+    [Test]
+    public async Task It_declines_the_single_composite_plan_for_a_custom_view_run_after_the_namespace_check()
+    {
+        // Nothing else here forces ordered segments: the run configured after NamespaceBased does, because its
+        // view may be validated only once that check has passed, which one command cannot express. Co-batched
+        // behind the namespace statement, a table masquerading as the view would answer the membership SQL and
+        // the request would proceed on it.
+        var input = CreateInput(RelationalWriteOperationKind.Put, includeReadPlan: false) with
+        {
+            StoredNamespaceAuthorization = CreateStoredNamespaceAuthorization(),
+            CustomViewAuthorization = CreateStoredCustomViewAuthorization(
+                ("SchoolWithAnEarlyTag", 0),
+                ("SchoolWithALateTag", 2)
+            ),
+        };
+        var session = new ScriptedWriteSession(
+            CreateCaptureReader(new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value)),
+            CreateReader(CreateAuthorizationTable()),
+            CreateReader(CreateAuthorizationTable()),
+            CreateReader(CreateAuthorizationTable())
+        );
+
+        await CreateSut().ResolveAsync(input, session);
+
+        session.Commands.Should().HaveCount(4);
+        session.Commands[0].CommandText.Should().NotContain("SchoolWith");
+        session.Commands[1].CommandText.Should().Contain("SchoolWithAnEarlyTag");
+        session.Commands[2].CommandText.Should().Contain("namespacePrefixes");
+        session.Commands[3].CommandText.Should().Contain("SchoolWithALateTag");
+    }
+
+    [Test]
+    public async Task It_runs_the_custom_view_runs_around_the_namespace_segment_in_the_ordered_path()
+    {
+        // A deferred no-claims relationship denial sends the request to ordered segments, so every stored
+        // check runs as its own command. Configured order still has to hold: the view configured before
+        // NamespaceBased, then the namespace check, then the view configured after it.
+        var input = CreateInput(RelationalWriteOperationKind.Put, includeReadPlan: false) with
+        {
+            StoredNamespaceAuthorization = CreateStoredNamespaceAuthorization(),
+            CustomViewAuthorization = CreateStoredCustomViewAuthorization(
+                ("SchoolWithAnEarlyTag", 0),
+                ("SchoolWithALateTag", 2)
+            ),
+            StoredRelationshipAuthorization = new RelationshipAuthorizationResult.NoClaims([], []),
+        };
+        var session = new ScriptedWriteSession(
+            CreateCaptureReader(new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value)),
+            CreateReader(CreateAuthorizationTable()),
+            CreateReader(CreateAuthorizationTable()),
+            CreateReader(CreateAuthorizationTable())
+        );
+
+        await CreateSut().ResolveAsync(input, session);
+
+        session.Commands.Should().HaveCount(4);
+        session.Commands[0].CommandText.Should().NotContain("SchoolWith");
+        session.Commands[1].CommandText.Should().Contain("SchoolWithAnEarlyTag");
+        session.Commands[2].CommandText.Should().Contain("namespacePrefixes");
+        session.Commands[3].CommandText.Should().Contain("SchoolWithALateTag");
+    }
+
+    [Test]
+    public async Task It_denies_from_a_segmented_after_namespace_custom_view_run_with_a_request_wide_index()
+    {
+        // The after-namespace run is its own segment carrying a non-zero request-wide index. The namespace
+        // segment has already passed, so the reported denial must be the later view's, resolved against the
+        // full planned list, and nothing downstream may run.
+        var input = CreateInput(RelationalWriteOperationKind.Put, includeReadPlan: false) with
+        {
+            StoredNamespaceAuthorization = CreateStoredNamespaceAuthorization(),
+            CustomViewAuthorization = CreateStoredCustomViewAuthorization(
+                ("SchoolWithAnEarlyTag", 0),
+                ("SchoolWithALateTag", 2)
+            ),
+            StoredRelationshipAuthorization = new RelationshipAuthorizationResult.NoClaims([], []),
+        };
+        var session = new ScriptedWriteSession(
+            CreateCaptureReader(new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value)),
+            CreateReader(CreateAuthorizationTable()),
+            CreateReader(CreateAuthorizationTable()),
+            new FakeDbException("late custom view denial")
+        );
+
+        var resolution = await CreateSut(providerFailureExtractor: CustomViewFailureExtractor(1))
+            .ResolveAsync(input, session);
+
+        resolution
+            .ImmediateResult.Should()
+            .BeOfType<RelationalWriteExecutorResult.Update>()
+            .Which.Result.Should()
+            .BeOfType<UpdateResult.UpdateFailureCustomViewNotAuthorized>()
+            .Subject.CustomViewFailure.StrategyName.Should()
+            .Be("SchoolWithALateTag");
+        // Capture, the early view, the namespace segment, then the denying late view — and nothing after it,
+        // so the deferred relationship denial, reference lookup, and hydration never ran.
+        session.Commands.Should().HaveCount(4);
+        session.Commands[3].CommandText.Should().Contain("SchoolWithALateTag");
+    }
+
+    [Test]
+    public async Task It_denies_from_a_segmented_custom_view_run_before_the_namespace_segment_runs()
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Put, includeReadPlan: false) with
+        {
+            StoredNamespaceAuthorization = CreateStoredNamespaceAuthorization(),
+            CustomViewAuthorization = CreateStoredCustomViewAuthorization(("SchoolWithAnEarlyTag", 0)),
+            StoredRelationshipAuthorization = new RelationshipAuthorizationResult.NoClaims([], []),
+        };
+        var session = new ScriptedWriteSession(
+            CreateCaptureReader(new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value)),
+            new FakeDbException("custom view denial")
+        );
+
+        var resolution = await CreateSut(providerFailureExtractor: CustomViewFailureExtractor(0))
+            .ResolveAsync(input, session);
+
+        resolution
+            .ImmediateResult.Should()
+            .BeOfType<RelationalWriteExecutorResult.Update>()
+            .Which.Result.Should()
+            .BeOfType<UpdateResult.UpdateFailureCustomViewNotAuthorized>()
+            .Subject.CustomViewFailure.StrategyName.Should()
+            .Be("SchoolWithAnEarlyTag");
+        // The namespace segment never ran: the earlier view's denial is the one reported.
+        session.Commands.Should().HaveCount(2);
+        session
+            .Commands.Should()
+            .AllSatisfy(command => command.CommandText.Should().NotContain("namespacePrefixes"));
+    }
+
+    /// <summary>
+    /// One stored custom-view check per configured strategy, indexed across the request the way the planner
+    /// assigns them. A self-basis path keeps the fixture independent of any reference model.
+    /// </summary>
+    private static RelationalCustomViewAuthorization CreateStoredCustomViewAuthorization(
+        params (string StrategyName, int RawConfiguredIndex)[] strategies
+    ) =>
+        new([
+            .. strategies.Select(
+                (strategy, index) =>
+                    new SingleRecordCustomViewAuthorizationCheckSpec(
+                        new ConfiguredAuthorizationStrategy(
+                            strategy.StrategyName,
+                            strategy.RawConfiguredIndex
+                        ),
+                        index,
+                        CustomViewAuthorizationCheckValueSource.Stored,
+                        new DbTableName(new DbSchemaName("auth"), strategy.StrategyName),
+                        new DbColumnName("DocumentId"),
+                        [
+                            new ColumnPathStep(
+                                new DbTableName(new DbSchemaName("edfi"), "School"),
+                                new DbColumnName("DocumentId"),
+                                null,
+                                null
+                            ),
+                        ],
+                        new CustomViewAuthorizationCheckTarget.Stored(
+                            new DbTableName(new DbSchemaName("edfi"), "School"),
+                            new DbColumnName("DocumentId")
+                        ),
+                        new QualifiedResourceName("Ed-Fi", "School"),
+                        [$"{strategy.StrategyName}Element"],
+                        $"You may need a {strategy.StrategyName} hint."
+                    )
+            ),
+        ]);
+
+    private static TestProviderFailureExtractor CustomViewFailureExtractor(
+        int index,
+        CustomViewAuthorizationAuth1FailureKind failureKind =
+            CustomViewAuthorizationAuth1FailureKind.NoMatchingCustomViewRow
+    ) =>
+        new(
+            CustomViewAuthorizationAuth1FailurePayloadCodec.ProviderFailureCode,
+            CustomViewAuthorizationAuth1FailurePayloadCodec.Encode(
+                new CustomViewAuthorizationAuth1FailurePayload(index, failureKind)
+            )
+        );
+
+    private static RelationalWriteNamespaceAuthorization CreateStoredNamespaceAuthorization() =>
+        new(
+            [
+                new NamespaceAuthorizationCheckSpec(
+                    0,
+                    NamespaceAuthorizationCheckValueSource.Stored,
+                    new DbTableName(new DbSchemaName("edfi"), "School"),
+                    new DbColumnName("Name")
+                ),
+            ],
+            NamespacePrefixParameterizationFactory.Create(
+                SqlDialect.Pgsql,
+                ["uri://ed-fi.org/"],
+                "namespacePrefixes"
+            )
+        );
+
+    private static DocumentReference CreateDocumentReference(ReferentialId referentialId) =>
+        new(
+            new BaseResourceInfo(new ProjectName("Ed-Fi"), new ResourceName("School"), IsDescriptor: false),
+            new DocumentIdentity([new DocumentIdentityElement(new JsonPath("$.schoolId"), "255901")]),
+            referentialId,
+            new JsonPath("$.schoolReference")
+        );
+
+    // ----- Ownership --------------------------------------------------------
+
+    /// <summary>
+    /// The ownership statement lands after the namespace one, matching auth.md: ownership is the last AND
+    /// filter. Statement order is precedence order because the command aborts at its first AUTH1; the
+    /// relative order against the relationship statement is asserted by the composite append fixture.
+    /// </summary>
+    [TestCase(RelationalWriteOperationKind.Post)]
+    [TestCase(RelationalWriteOperationKind.Put)]
+    public async Task It_emits_the_ownership_statement_after_namespace_and_before_hydration(
+        RelationalWriteOperationKind operationKind
+    )
+    {
+        var target = new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value);
+        var input = CreateInput(operationKind) with
+        {
+            StoredNamespaceAuthorization = CreateStoredNamespaceAuthorization(),
+            StoredOwnershipAuthorization = CreateStoredOwnershipAuthorization(),
+        };
+        var session = new ScriptedWriteSession(
+            CreateReader(
+                CreateCaptureTable(target),
+                // One row set for the namespace check, one for the ownership check.
+                CreateAuthorizationTable(),
+                CreateAuthorizationTable(),
+                CreateDocumentMetadataTable(target, 44L),
+                CreateRootTable(target)
+            )
+        );
+
+        await CreateSut().ResolveAsync(input, session);
+
+        var commandText = session.Commands.Should().ContainSingle().Subject.CommandText;
+        // The prefix parameter is emitted only by the namespace check; both checks are SELECT CASE, so a
+        // shared marker would make this comparison hold either way.
+        var namespaceIndex = commandText.IndexOf("namespacePrefixes", StringComparison.Ordinal);
+        var ownershipIndex = commandText.IndexOf("CreatedByOwnershipTokenId", StringComparison.Ordinal);
+        namespaceIndex.Should().BePositive();
+        ownershipIndex.Should().BePositive();
+        namespaceIndex.Should().BeLessThan(ownershipIndex);
+        // Hydration follows both checks, which is what puts the ownership decision ahead of reading the row
+        // it authorizes.
+        ownershipIndex
+            .Should()
+            .BeLessThan(commandText.LastIndexOf("ContentVersion", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// This is the assertion that pins D1: a POST that resolves to a create is never denied by ownership.
+    /// The statement carries the carrier's row guard, so with no captured target it produces no rows and
+    /// none of its branches — the AUTH1 abort device included — evaluates. Asserted with the caller holding
+    /// zero ownership tokens, which is the configuration most likely to deny if the guard were missing.
+    /// </summary>
+    [Test]
+    public async Task It_keeps_the_ownership_statement_vacuous_for_a_create_with_no_tokens()
+    {
+        var input = CreateInput(RelationalWriteOperationKind.Post, includeReadPlan: false) with
+        {
+            StoredOwnershipAuthorization = CreateStoredOwnershipAuthorization(ownershipTokenIds: []),
+        };
+        var session = new ScriptedWriteSession(
+            CreateReader(CreateCaptureTable(target: null), CreateAuthorizationTable())
+        );
+
+        var resolution = await CreateSut().ResolveAsync(input, session);
+
+        resolution.ImmediateResult.Should().BeNull();
+        resolution
+            .Outcome!.ExecutionRequest.TargetContext.Should()
+            .BeOfType<RelationalWriteTargetContext.CreateNew>();
+        var commandText = session.Commands.Should().ContainSingle().Subject.CommandText;
+        // The check is present and guarded: an empty token list renders a constant-false membership
+        // predicate, and the row guard is what stops the statement producing a row to abort on.
+        commandText.Should().Contain("CreatedByOwnershipTokenId");
+        commandText.Should().Contain("1 = 0");
+        commandText
+            .Should()
+            .Contain(
+                IRelationalCompositeCommandDialect
+                    .Create(SqlDialect.Pgsql)
+                    .Carrier.CapturedTargetPresentPredicate
+            );
+    }
+
+    /// <summary>
+    /// The failure a POST deferred from preflight is owed only to an upsert-as-update, and in the ownership
+    /// slot: after the namespace segment, before the relationship check and the hydration, so no DML follows.
+    /// The request takes the ordered-segments path, which is what keeps the relationship statement and the
+    /// hydration from riding ahead of the failure inside one composite command.
+    /// </summary>
+    [Test]
+    public async Task It_returns_the_deferred_ownership_failure_for_an_existing_post_target_after_the_namespace_segment()
+    {
+        var deferred = RelationalWriteExecutorResults.BuildSecurityConfigurationFailureResult(
+            RelationalWriteOperationKind.Post,
+            ["ownership token cap"]
+        );
+        var target = new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value);
+        var input = CreateInput(RelationalWriteOperationKind.Post) with
+        {
+            StoredNamespaceAuthorization = CreateStoredNamespaceAuthorization(),
+            DeferredStoredOwnershipFailureResult = deferred,
+        };
+        var session = new ScriptedWriteSession(
+            CreateCaptureReader(target),
+            CreateReader(CreateAuthorizationTable())
+        );
+
+        var resolution = await CreateSut().ResolveAsync(input, session);
+
+        resolution.ImmediateResult.Should().BeSameAs(deferred);
+        resolution.Outcome.Should().BeNull();
+        // Capture, then the namespace segment, then the deferred failure in the ownership slot: no
+        // relationship, reference or hydration command follows it.
+        session.Commands.Should().HaveCount(2);
+        session.Commands[1].CommandText.Should().Contain("namespacePrefixes");
+        session
+            .Commands.Should()
+            .NotContain(command => command.CommandText.Contains("CreatedByOwnershipTokenId"));
+    }
+
+    /// <summary>
+    /// A create never sees the deferred failure: ownership never denies a create, and the over-limit list was
+    /// never parameterized for one, so the write proceeds with no ownership statement or parameter at all.
+    /// </summary>
+    [Test]
+    public async Task It_ignores_the_deferred_ownership_failure_for_a_post_create()
+    {
+        var deferred = RelationalWriteExecutorResults.BuildSecurityConfigurationFailureResult(
+            RelationalWriteOperationKind.Post,
+            ["ownership token cap"]
+        );
+        var input = CreateInput(RelationalWriteOperationKind.Post, includeReadPlan: false) with
+        {
+            DeferredStoredOwnershipFailureResult = deferred,
+        };
+        var session = new ScriptedWriteSession(CreateCaptureReader(target: null));
+
+        var resolution = await CreateSut().ResolveAsync(input, session);
+
+        resolution.ImmediateResult.Should().BeNull();
+        resolution
+            .Outcome!.ExecutionRequest.TargetContext.Should()
+            .BeOfType<RelationalWriteTargetContext.CreateNew>();
+        var commandText = session.Commands.Should().ContainSingle().Subject.CommandText;
+        commandText.Should().NotContain("CreatedByOwnershipTokenId");
+        commandText.Should().NotContain("ownershipTokenIds");
+    }
+
+    /// <summary>
+    /// An ownership denial on the co-batched command maps to the operation's own ownership failure rather
+    /// than a generic write failure, for both verbs.
+    /// </summary>
+    [TestCase(RelationalWriteOperationKind.Post)]
+    [TestCase(RelationalWriteOperationKind.Put)]
+    public async Task It_maps_a_co_batched_ownership_denial_to_the_operations_ownership_failure(
+        RelationalWriteOperationKind operationKind
+    )
+    {
+        var input = CreateInput(operationKind) with
+        {
+            StoredOwnershipAuthorization = CreateStoredOwnershipAuthorization(rawConfiguredIndex: 1),
+        };
+        var extractor = new TestProviderFailureExtractor(
+            OwnershipAuthorizationAuth1FailurePayloadCodec.ProviderFailureCode,
+            OwnershipAuthorizationAuth1FailurePayloadCodec.Encode(
+                new OwnershipAuthorizationAuth1FailurePayload(
+                    1,
+                    OwnershipAuthorizationAuth1FailureKind.OwnershipTokenMismatch
+                )
+            )
+        );
+        var session = new ScriptedWriteSession(new FakeDbException("ownership denial"));
+
+        var resolution = await CreateSut(providerFailureExtractor: extractor).ResolveAsync(input, session);
+
+        var immediate = resolution.ImmediateResult.Should().NotBeNull().And.Subject;
+
+        if (operationKind is RelationalWriteOperationKind.Post)
+        {
+            immediate
+                .Should()
+                .BeOfType<RelationalWriteExecutorResult.Upsert>()
+                .Which.Result.Should()
+                .BeOfType<UpsertResult.UpsertFailureOwnershipNotAuthorized>()
+                .Which.OwnershipFailure.ConfiguredStrategyIndex.Should()
+                .Be(1);
+        }
+        else
+        {
+            immediate
+                .Should()
+                .BeOfType<RelationalWriteExecutorResult.Update>()
+                .Which.Result.Should()
+                .BeOfType<UpdateResult.UpdateFailureOwnershipNotAuthorized>()
+                .Which.OwnershipFailure.ConfiguredStrategyIndex.Should()
+                .Be(1);
+        }
+    }
+
+    /// <summary>
+    /// A token list that does not fit the command's budget sends the whole request to the ordered-segments
+    /// path, as a namespace non-fit already does. That path executes and validates every check in configured
+    /// order, so ownership still runs after the namespace check and before the relationship one.
+    /// </summary>
+    /// <remarks>
+    /// SQL Server-shaped deliberately, and asserted at both token counts against one budget. PostgreSQL
+    /// binds any token count as a single array parameter, so a PostgreSQL fallback could only ever be caused
+    /// by something other than the token list — the capture's own parameters, say — which would make this
+    /// test pass while proving nothing. Here the token count is the only thing that differs between the two
+    /// cases.
+    /// </remarks>
+    [TestCase(2, true)]
+    [TestCase(6, false)]
+    public async Task It_co_batches_ownership_only_while_its_scalar_tokens_fit_the_budget(
+        int ownershipTokenCount,
+        bool expectsCoBatch
+    )
+    {
+        var target = new CapturedTarget(345L, 44L, ExistingDocumentUuid.Value);
+        var input = CreateInput(RelationalWriteOperationKind.Put, dialect: SqlDialect.Mssql) with
+        {
+            StoredOwnershipAuthorization = CreateStoredOwnershipAuthorization(
+                dialect: SqlDialect.Mssql,
+                ownershipTokenIds:
+                [
+                    .. Enumerable.Range(1, ownershipTokenCount).Select(static tokenId => (short)tokenId),
+                ]
+            ),
+        };
+        var session = expectsCoBatch
+            ? new ScriptedWriteSession(
+                CreateReader(
+                    CreateCaptureTable(target),
+                    CreateAuthorizationTable(),
+                    CreateDocumentMetadataTable(target, 44L),
+                    CreateRootTable(target)
+                )
+            )
+            : new ScriptedWriteSession(
+                CreateCaptureReader(target),
+                // The ownership segment authorizes, then hydration runs.
+                CreateReader(CreateAuthorizationTable()),
+                CreateReader(CreateDocumentMetadataTable(target, 44L), CreateRootTable(target))
+            );
+
+        var resolution = await CreateSut(
+                commandBudget: new RelationalCommandBudget(
+                    MaxParametersPerCommand: 4,
+                    MaxRowsPerStatement: 1000
+                )
+            )
+            .ResolveAsync(input, session);
+
+        resolution.ImmediateResult.Should().BeNull();
+
+        if (expectsCoBatch)
+        {
+            session.Commands.Should().ContainSingle();
+            session.Commands[0].CommandText.Should().Contain("CreatedByOwnershipTokenId");
+            return;
+        }
+
+        session.Commands.Count.Should().BeGreaterThan(1);
+        session.Commands[0].CommandText.Should().NotContain("CreatedByOwnershipTokenId");
+        session
+            .Commands.Skip(1)
+            .Should()
+            .Contain(command => command.CommandText.Contains("CreatedByOwnershipTokenId"));
+    }
+
+    private static RelationalOwnershipAuthorization CreateStoredOwnershipAuthorization(
+        int rawConfiguredIndex = 1,
+        IReadOnlyList<short>? ownershipTokenIds = null,
+        SqlDialect dialect = SqlDialect.Pgsql
+    ) =>
+        new(
+            new OwnershipAuthorizationCheckSpec(rawConfiguredIndex),
+            OwnershipTokenParameterizationFactory.Create(
+                dialect,
+                ownershipTokenIds ?? [11],
+                "ownershipTokenIds"
+            )
+        );
+
+    private static DbDataReader CreateCompositeReader(
+        CapturedTarget? target,
+        bool includeMetadata = true,
+        long hydratedContentVersion = 44L
+    ) =>
+        CreateReader(
+            CreateCaptureTable(target),
+            CreateDocumentMetadataTable(
+                target is not null && includeMetadata ? target : null,
+                hydratedContentVersion
+            ),
+            CreateRootTable(target is null || !includeMetadata ? null : target)
+        );
+
+    private static DbDataReader CreateCaptureReader(CapturedTarget? target) =>
+        CreateReader(CreateCaptureTable(target));
+
+    private static DbDataReader CreateReader(params DataTable[] tables) => new DataTableReader(tables);
+
+    private static DataTable CreateCaptureTable(CapturedTarget? target)
+    {
+        var table = new DataTable();
+        table.Columns.Add("DocumentId", typeof(long));
+        table.Columns.Add("ContentVersion", typeof(long));
+        table.Columns.Add("DocumentUuid", typeof(Guid));
+
+        if (target is not null)
+        {
+            table.Rows.Add(target.DocumentId, target.ContentVersion, target.DocumentUuid);
+        }
+        else
+        {
+            table.Rows.Add(DBNull.Value, DBNull.Value, DBNull.Value);
+        }
+
+        return table;
+    }
+
+    private static DataTable CreateAuthorizationTable()
+    {
+        var table = new DataTable();
+        table.Columns.Add("Authorized", typeof(int));
+        return table;
+    }
+
+    private static DataTable CreateStoredRelationshipAuthorizationTable(CapturedTarget target)
+    {
+        var table = new DataTable();
+        table.Columns.Add("AuthorizationResult", typeof(int));
+        table.Columns.Add("ContentVersion", typeof(long));
+        table.Rows.Add(1, target.ContentVersion);
+        return table;
+    }
+
+    private static DataTable CreateReferenceLookupTable()
+    {
+        var table = new DataTable();
+        table.Columns.Add("ReferentialId", typeof(Guid));
+        table.Columns.Add("DocumentId", typeof(long));
+        table.Columns.Add("ResourceKeyId", typeof(short));
+        table.Columns.Add("ReferentialIdentityResourceKeyId", typeof(short));
+        table.Columns.Add("IsDescriptor", typeof(bool));
+        table.Columns.Add("VerificationIdentityKey", typeof(string));
+        return table;
+    }
+
+    private static DataTable CreateDocumentMetadataTable(CapturedTarget? target, long hydratedContentVersion)
+    {
+        var table = new DataTable();
+        table.Columns.Add("DocumentId", typeof(long));
+        table.Columns.Add("DocumentUuid", typeof(Guid));
+        table.Columns.Add("ContentVersion", typeof(long));
+        table.Columns.Add("ContentLastModifiedAt", typeof(DateTimeOffset));
+        table.Columns.Add("ResourceKeyId", typeof(short));
+
+        if (target is not null)
+        {
+            table.Rows.Add(
+                target.DocumentId,
+                target.DocumentUuid,
+                hydratedContentVersion,
+                DateTimeOffset.UnixEpoch,
+                (short)1
+            );
+        }
+
+        return table;
+    }
+
+    private static DataTable CreateRootTable(CapturedTarget? target)
+    {
+        var table = new DataTable();
+        table.Columns.Add("DocumentId", typeof(long));
+        table.Columns.Add("SchoolId", typeof(int));
+        table.Columns.Add("Name", typeof(string));
+
+        if (target is not null)
+        {
+            table.Rows.Add(target.DocumentId, 255901, "Lincoln High");
+        }
+
+        return table;
+    }
+
+    private sealed record CapturedTarget(long DocumentId, long ContentVersion, Guid DocumentUuid);
+
+    private sealed class TestReferenceResolverAdapterFactory : IReferenceResolverAdapterFactory
+    {
+        public RelationalCommand? EmbeddableCommand { get; init; }
+
+        public DbException? ExceptionToThrow { get; init; }
+
+        public IReferenceResolverAdapter CreateAdapter() => new TestReferenceResolverAdapter(this);
+
+        public IReferenceResolverAdapter CreateSessionAdapter(IRelationalCommandExecutor commandExecutor) =>
+            new TestReferenceResolverAdapter(this);
+
+        public RelationalCommand? TryBuildSessionLookupCommand(ReferenceLookupRequest request) =>
+            EmbeddableCommand;
+
+        private sealed class TestReferenceResolverAdapter(TestReferenceResolverAdapterFactory factory)
+            : IReferenceResolverAdapter
+        {
+            public Task<IReadOnlyList<ReferenceLookupResult>> ResolveAsync(
+                ReferenceLookupRequest request,
+                CancellationToken cancellationToken = default
+            )
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (factory.ExceptionToThrow is not null)
+                {
+                    throw factory.ExceptionToThrow;
+                }
+
+                return Task.FromResult<IReadOnlyList<ReferenceLookupResult>>([]);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Stands in for the fresh-connection executor the custom-view validation probe uses, recording what it was
+    /// asked to run and optionally failing the way an object that is not a conforming view would.
+    /// </summary>
+    private sealed class StubValidationCommandExecutor(DbException? failure = null)
+        : IRelationalCommandExecutor
+    {
+        public SqlDialect Dialect => SqlDialect.Pgsql;
+
+        public List<RelationalCommand> ExecutedCommands { get; } = [];
+
+        public Task<TResult> ExecuteReaderAsync<TResult>(
+            RelationalCommand command,
+            Func<IRelationalCommandReader, CancellationToken, Task<TResult>> readAsync,
+            CancellationToken cancellationToken = default
+        )
+        {
+            ExecutedCommands.Add(command);
+
+            return failure is null
+                ? Task.FromResult(default(TResult)!)
+                : Task.FromException<TResult>(failure);
+        }
+    }
+
+    private sealed class TestProviderFailureExtractor(string? providerErrorCode, string providerMessage)
+        : IRelationshipAuthorizationProviderFailureExtractor
+    {
+        public RelationshipAuthorizationProviderFailure Extract(DbException exception) =>
+            new(providerErrorCode, providerMessage);
+    }
+
+    private sealed class FakeDbException(string message) : DbException(message);
+}

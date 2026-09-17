@@ -3,15 +3,18 @@
 // The Ed-Fi Alliance licenses this file to you under the Apache License, Version 2.0.
 // See the LICENSE and NOTICES files in the project root for more information.
 
+using System.Security.Cryptography;
 using EdFi.DmsConfigurationService.Backend.Postgresql.Repositories;
 using EdFi.DmsConfigurationService.Backend.Repositories;
 using EdFi.DmsConfigurationService.Backend.Services;
 using EdFi.DmsConfigurationService.DataModel.Model;
 using EdFi.DmsConfigurationService.DataModel.Model.Application;
 using EdFi.DmsConfigurationService.DataModel.Model.DataStore;
+using EdFi.DmsConfigurationService.DataModel.Model.DataStoreDerivative;
 using EdFi.DmsConfigurationService.DataModel.Model.Vendor;
 using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 
 namespace EdFi.DmsConfigurationService.Backend.Postgresql.Tests.Integration;
 
@@ -58,7 +61,7 @@ public class DataStoreTests : DatabaseTest
     [TestFixture]
     public class Given_insert_data_store : DataStoreTests
     {
-        private long _id;
+        private int _id;
 
         [SetUp]
         public async Task Setup()
@@ -67,6 +70,7 @@ public class DataStoreTests : DatabaseTest
             {
                 DataStoreType = "Production",
                 Name = "Test Instance",
+                Provider = "postgresql",
                 ConnectionString = "Server=localhost;Database=TestDb;User Id=user;Password=pass;",
             };
 
@@ -85,6 +89,7 @@ public class DataStoreTests : DatabaseTest
             var instanceFromDb = ((DataStoreQueryResult.Success)getResult).DataStoreResponses.First();
             instanceFromDb.DataStoreType.Should().Be("Production");
             instanceFromDb.Name.Should().Be("Test Instance");
+            instanceFromDb.Provider.Should().Be("postgresql");
             AssertIsValidEncryptedBase64(
                 instanceFromDb.ConnectionString,
                 "Server=localhost;Database=TestDb;User Id=user;Password=pass;"
@@ -100,6 +105,7 @@ public class DataStoreTests : DatabaseTest
             var instanceFromDb = ((DataStoreGetResult.Success)getByIdResult).DataStoreResponse;
             instanceFromDb.DataStoreType.Should().Be("Production");
             instanceFromDb.Name.Should().Be("Test Instance");
+            instanceFromDb.Provider.Should().Be("postgresql");
             AssertIsValidEncryptedBase64(
                 instanceFromDb.ConnectionString,
                 "Server=localhost;Database=TestDb;User Id=user;Password=pass;"
@@ -110,7 +116,7 @@ public class DataStoreTests : DatabaseTest
     [TestFixture]
     public class Given_insert_data_store_without_connection_string : DataStoreTests
     {
-        private long _id;
+        private int _id;
 
         [SetUp]
         public async Task Setup()
@@ -137,6 +143,7 @@ public class DataStoreTests : DatabaseTest
             var instanceFromDb = ((DataStoreGetResult.Success)getByIdResult).DataStoreResponse;
             instanceFromDb.DataStoreType.Should().Be("Development");
             instanceFromDb.Name.Should().Be("Test Instance Without Connection");
+            instanceFromDb.Provider.Should().BeNull();
             instanceFromDb.ConnectionString.Should().BeNull();
         }
     }
@@ -154,6 +161,7 @@ public class DataStoreTests : DatabaseTest
             {
                 DataStoreType = "Staging",
                 Name = "Original Instance",
+                Provider = "postgresql",
                 ConnectionString = "Server=original;Database=OriginalDb;",
             };
 
@@ -161,6 +169,7 @@ public class DataStoreTests : DatabaseTest
             {
                 DataStoreType = "Production",
                 Name = "Updated Instance",
+                Provider = "sqlserver",
                 ConnectionString = "Server=updated;Database=UpdatedDb;",
             };
 
@@ -182,6 +191,7 @@ public class DataStoreTests : DatabaseTest
             var instanceFromDb = ((DataStoreQueryResult.Success)getResult).DataStoreResponses.First();
             instanceFromDb.DataStoreType.Should().Be("Production");
             instanceFromDb.Name.Should().Be("Updated Instance");
+            instanceFromDb.Provider.Should().Be("sqlserver");
             AssertIsValidEncryptedBase64(
                 instanceFromDb.ConnectionString,
                 "Server=updated;Database=UpdatedDb;"
@@ -197,6 +207,7 @@ public class DataStoreTests : DatabaseTest
             var instanceFromDb = ((DataStoreGetResult.Success)getByIdResult).DataStoreResponse;
             instanceFromDb.DataStoreType.Should().Be("Production");
             instanceFromDb.Name.Should().Be("Updated Instance");
+            instanceFromDb.Provider.Should().Be("sqlserver");
             AssertIsValidEncryptedBase64(
                 instanceFromDb.ConnectionString,
                 "Server=updated;Database=UpdatedDb;"
@@ -205,10 +216,186 @@ public class DataStoreTests : DatabaseTest
     }
 
     [TestFixture]
+    public class Given_update_data_store_without_provider : DataStoreTests
+    {
+        private int _id;
+
+        [SetUp]
+        public async Task Setup()
+        {
+            DataStoreInsertCommand instance = new()
+            {
+                DataStoreType = "Staging",
+                Name = "Original Instance",
+                Provider = "postgresql",
+            };
+
+            var insertResult = await _repository.InsertDataStore(instance);
+            insertResult.Should().BeOfType<DataStoreInsertResult.Success>();
+            _id = ((DataStoreInsertResult.Success)insertResult).Id;
+
+            DataStoreUpdateCommand update = new()
+            {
+                Id = _id,
+                DataStoreType = "Production",
+                Name = "Updated Instance",
+            };
+
+            var updateResult = await _repository.UpdateDataStore(update);
+            updateResult.Should().BeOfType<DataStoreUpdateResult.Success>();
+        }
+
+        [Test]
+        public async Task It_should_preserve_the_existing_provider()
+        {
+            var getResult = await _repository.GetDataStore(_id);
+            getResult.Should().BeOfType<DataStoreGetResult.Success>();
+
+            var instanceFromDb = ((DataStoreGetResult.Success)getResult).DataStoreResponse;
+            instanceFromDb.Provider.Should().Be("postgresql");
+        }
+    }
+
+    /// <summary>
+    /// A deployment moving off a rejected encryption key recovers by re-submitting each connection
+    /// string once the new key is configured. That procedure is only sound if update re-encrypts with
+    /// the currently configured key instead of leaving the stored cipher text keyed to the previous
+    /// one, which is what this fixture pins. The resubmitted value is deliberately identical to the
+    /// original — the procedure changes only the key — so an unchanged-value no-op guard added to
+    /// update would fail here instead of breaking the recovery invisibly.
+    /// </summary>
+    [TestFixture]
+    public class Given_a_data_store_updated_after_the_encryption_key_changed : DataStoreTests
+    {
+        private const string OriginalConnectionString = "Server=original;Database=OriginalDb;";
+
+        /// <summary>
+        /// Named for the step it models; the value must stay equal to
+        /// <see cref="OriginalConnectionString" /> because the recovery procedure re-submits the
+        /// connection string unchanged.
+        /// </summary>
+        private const string ResubmittedConnectionString = OriginalConnectionString;
+
+        /// <summary>
+        /// 32 characters, and deliberately different from the configured test key: the key an operator
+        /// rotates to.
+        /// </summary>
+        private const string RotatedEncryptionKey = "Rk3pQ8sT2vW9xZ4bC6dE1gH5jL7mN0rY";
+
+        private IConnectionStringEncryptionService _rotatedKeyEncryptionService = null!;
+        private string _storedCipherTextBeforeRotation = null!;
+        private string _storedCipherTextAfterRotation = null!;
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var insertResult = await _repository.InsertDataStore(
+                new DataStoreInsertCommand
+                {
+                    DataStoreType = "Production",
+                    Name = "Re-keyed Instance",
+                    ConnectionString = OriginalConnectionString,
+                }
+            );
+            insertResult.Should().BeOfType<DataStoreInsertResult.Success>();
+            var id = ((DataStoreInsertResult.Success)insertResult).Id;
+
+            _storedCipherTextBeforeRotation = await StoredCipherText(id);
+
+            _rotatedKeyEncryptionService = new ConnectionStringEncryptionService(
+                Options.Create(
+                    new DatabaseOptions
+                    {
+                        DatabaseConnection = Configuration.DatabaseOptions.Value.DatabaseConnection,
+                        EncryptionKey = RotatedEncryptionKey,
+                    }
+                )
+            );
+
+            // Stands in for the Configuration Service running on the new key when the operator
+            // re-submits the connection string.
+            IDataStoreRepository repositoryOnRotatedKey = new DataStoreRepository(
+                Configuration.DatabaseOptions,
+                NullLogger<DataStoreRepository>.Instance,
+                _rotatedKeyEncryptionService,
+                _routeContextRepository,
+                _derivativeRepository,
+                new TestAuditContext(),
+                new TenantContextProvider()
+            );
+
+            var updateResult = await repositoryOnRotatedKey.UpdateDataStore(
+                new DataStoreUpdateCommand
+                {
+                    Id = id,
+                    DataStoreType = "Production",
+                    Name = "Re-keyed Instance",
+                    ConnectionString = ResubmittedConnectionString,
+                }
+            );
+            updateResult.Should().BeOfType<DataStoreUpdateResult.Success>();
+
+            _storedCipherTextAfterRotation = await StoredCipherText(id);
+        }
+
+        /// <summary>
+        /// A get returns the stored bytes as Base64 without decrypting them, so this is the cipher text
+        /// as persisted.
+        /// </summary>
+        private async Task<string> StoredCipherText(int id)
+        {
+            var getResult = await _repository.GetDataStore(id);
+            getResult.Should().BeOfType<DataStoreGetResult.Success>();
+
+            var storedConnectionString = ((DataStoreGetResult.Success)getResult)
+                .DataStoreResponse
+                .ConnectionString;
+            storedConnectionString.Should().NotBeNullOrEmpty();
+            return storedConnectionString!;
+        }
+
+        /// <summary>
+        /// Same plaintext, but a different key and a fresh random IV: the stored bytes must change.
+        /// </summary>
+        [Test]
+        public void It_replaces_the_stored_cipher_text() =>
+            _storedCipherTextAfterRotation.Should().NotBe(_storedCipherTextBeforeRotation);
+
+        [Test]
+        public void It_decrypts_cleanly_under_the_new_key() =>
+            _rotatedKeyEncryptionService
+                .Decrypt(Convert.FromBase64String(_storedCipherTextAfterRotation))
+                .Should()
+                .Be(ResubmittedConnectionString);
+
+        [Test]
+        public void It_no_longer_yields_the_connection_string_under_the_previous_key()
+        {
+            // AES-CBC with PKCS7 padding is unauthenticated, so the previous key either throws on
+            // invalid padding or returns unrelated bytes, and both outcomes prove the row was
+            // re-keyed. Requiring the throw would make this intermittent, because a wrong key lands
+            // on structurally valid padding often enough to matter.
+            string? decryptedWithPreviousKey = null;
+            try
+            {
+                decryptedWithPreviousKey = new ConnectionStringEncryptionService(
+                    Configuration.DatabaseOptions
+                ).Decrypt(Convert.FromBase64String(_storedCipherTextAfterRotation));
+            }
+            catch (CryptographicException)
+            {
+                // Left null: the assertion below holds either way.
+            }
+
+            decryptedWithPreviousKey.Should().NotBe(ResubmittedConnectionString);
+        }
+    }
+
+    [TestFixture]
     public class Given_delete_data_store : DataStoreTests
     {
-        private long _instance1Id;
-        private long _instance2Id;
+        private int _instance1Id;
+        private int _instance2Id;
 
         [SetUp]
         public async Task Setup()
@@ -308,7 +495,7 @@ public class DataStoreTests : DatabaseTest
     [TestFixture]
     public class Given_data_store_with_route_contexts : DataStoreTests
     {
-        private long _dataStoreId;
+        private int _dataStoreId;
 
         [SetUp]
         public async Task Setup()
@@ -389,9 +576,9 @@ public class DataStoreTests : DatabaseTest
     [TestFixture]
     public class Given_validate_multiple_data_store_ids : DataStoreTests
     {
-        private long _instance1Id;
-        private long _instance2Id;
-        private long _instance3Id;
+        private int _instance1Id;
+        private int _instance2Id;
+        private int _instance3Id;
 
         [SetUp]
         public async Task Setup()
@@ -430,7 +617,7 @@ public class DataStoreTests : DatabaseTest
         [Test]
         public async Task It_should_return_all_existing_ids()
         {
-            long[] idsToCheck = [_instance1Id, _instance2Id, _instance3Id];
+            int[] idsToCheck = [_instance1Id, _instance2Id, _instance3Id];
             var result = await _repository.GetExistingDataStoreIds(idsToCheck);
 
             result.Should().BeOfType<DataStoreIdsExistResult.Success>();
@@ -444,7 +631,7 @@ public class DataStoreTests : DatabaseTest
         [Test]
         public async Task It_should_return_only_existing_ids_when_some_dont_exist()
         {
-            long[] idsToCheck = [_instance1Id, 99999, _instance2Id, 88888, _instance3Id];
+            int[] idsToCheck = [_instance1Id, 99999, _instance2Id, 88888, _instance3Id];
             var result = await _repository.GetExistingDataStoreIds(idsToCheck);
 
             result.Should().BeOfType<DataStoreIdsExistResult.Success>();
@@ -460,7 +647,7 @@ public class DataStoreTests : DatabaseTest
         [Test]
         public async Task It_should_return_empty_set_when_no_ids_exist()
         {
-            long[] idsToCheck = [99999, 88888, 77777];
+            int[] idsToCheck = [99999, 88888, 77777];
             var result = await _repository.GetExistingDataStoreIds(idsToCheck);
 
             result.Should().BeOfType<DataStoreIdsExistResult.Success>();
@@ -471,7 +658,7 @@ public class DataStoreTests : DatabaseTest
         [Test]
         public async Task It_should_return_empty_set_when_input_is_empty()
         {
-            long[] idsToCheck = [];
+            int[] idsToCheck = [];
             var result = await _repository.GetExistingDataStoreIds(idsToCheck);
 
             result.Should().BeOfType<DataStoreIdsExistResult.Success>();
@@ -483,10 +670,10 @@ public class DataStoreTests : DatabaseTest
     [TestFixture]
     public class Given_data_store_is_assigned_to_applications : DataStoreTests
     {
-        private long _dataStoreId1;
-        private long _dataStoreId2;
-        private long _unassignedDataStoreId;
-        private long _vendorId;
+        private int _dataStoreId1;
+        private int _dataStoreId2;
+        private int _unassignedDataStoreId;
+        private int _vendorId;
 
         [SetUp]
         public async Task Setup()
@@ -800,6 +987,173 @@ public class DataStoreTests : DatabaseTest
                 .ToList();
             names.Should().HaveCount(3);
             names.Should().ContainInOrder("Charlie-Instance", "November-Instance", "Zulu-Instance");
+        }
+    }
+
+    /// <summary>
+    /// DataStoreRepository composes derivatives through a separate repository, and the two read paths
+    /// use different lookups: GetDataStore resolves a single parent while QueryDataStore resolves a
+    /// batch and groups the result. Both swallow a failed derivative lookup into an empty collection,
+    /// so only an assertion on the composed response can prove the derivatives actually arrive.
+    /// </summary>
+    [TestFixture]
+    public class Given_a_data_store_with_both_derivative_types : DataStoreTests
+    {
+        private int _dataStoreId;
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var insertResult = await _repository.InsertDataStore(
+                new DataStoreInsertCommand
+                {
+                    DataStoreType = "Production",
+                    Name = "Derivative Composition Instance",
+                    ConnectionString = "Server=localhost;Database=CompositionDb;",
+                }
+            );
+            _dataStoreId = insertResult.Should().BeOfType<DataStoreInsertResult.Success>().Subject.Id;
+
+            await InsertDerivative("Snapshot", "Server=localhost;Database=SnapshotDb;");
+            await InsertDerivative("ReadReplica", "Server=localhost;Database=ReadReplicaDb;");
+        }
+
+        private async Task InsertDerivative(string derivativeType, string connectionString)
+        {
+            var result = await _derivativeRepository.InsertDataStoreDerivative(
+                new DataStoreDerivativeInsertCommand
+                {
+                    DataStoreId = _dataStoreId,
+                    DerivativeType = derivativeType,
+                    ConnectionString = connectionString,
+                }
+            );
+            result.Should().BeOfType<DataStoreDerivativeInsertResult.Success>();
+        }
+
+        [Test]
+        public async Task It_should_include_both_derivatives_in_the_single_data_store_response()
+        {
+            var getResult = await _repository.GetDataStore(_dataStoreId);
+
+            DataStoreResponse dataStore = getResult
+                .Should()
+                .BeOfType<DataStoreGetResult.Success>()
+                .Subject.DataStoreResponse;
+
+            AssertCarriesBothDerivatives(dataStore);
+        }
+
+        [Test]
+        public async Task It_should_include_both_derivatives_in_the_queried_data_store_response()
+        {
+            var queryResult = await _repository.QueryDataStore(new DataStoreQuery { Limit = 25, Offset = 0 });
+
+            DataStoreResponse dataStore = queryResult
+                .Should()
+                .BeOfType<DataStoreQueryResult.Success>()
+                .Subject.DataStoreResponses.Should()
+                .ContainSingle(response => response.Id == _dataStoreId)
+                .Subject;
+
+            AssertCarriesBothDerivatives(dataStore);
+        }
+
+        private void AssertCarriesBothDerivatives(DataStoreResponse dataStore)
+        {
+            var derivatives = dataStore.DataStoreDerivatives.ToList();
+
+            derivatives
+                .Select(derivative => new { derivative.DataStoreId, derivative.DerivativeType })
+                .Should()
+                .BeEquivalentTo(
+                    new[]
+                    {
+                        new { DataStoreId = _dataStoreId, DerivativeType = "ReadReplica" },
+                        new { DataStoreId = _dataStoreId, DerivativeType = "Snapshot" },
+                    }
+                );
+
+            derivatives
+                .Should()
+                .OnlyContain(
+                    derivative => derivative.Id > 0,
+                    "the composed response carries each derivative's persisted identity"
+                );
+        }
+    }
+
+    /// <summary>
+    /// A get returns the stored cipher text and the write path refuses cipher text, so leaving the
+    /// field out of an update is how a client keeps the connection string it cannot resend. The
+    /// stored bytes have to come through that update untouched.
+    /// </summary>
+    [TestFixture]
+    public class Given_update_data_store_without_a_connection_string : DataStoreTests
+    {
+        private const string OriginalConnectionString = "Server=original;Database=OriginalDb;";
+
+        private int _id;
+        private string _storedValueBeforeUpdate = null!;
+        private string _storedValueAfterUpdate = null!;
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var insertResult = await _repository.InsertDataStore(
+                new DataStoreInsertCommand
+                {
+                    DataStoreType = "Staging",
+                    Name = "Original Instance",
+                    ConnectionString = OriginalConnectionString,
+                }
+            );
+            insertResult.Should().BeOfType<DataStoreInsertResult.Success>();
+            _id = ((DataStoreInsertResult.Success)insertResult).Id;
+
+            _storedValueBeforeUpdate = await StoredConnectionString(_id);
+
+            var updateResult = await _repository.UpdateDataStore(
+                new DataStoreUpdateCommand
+                {
+                    Id = _id,
+                    DataStoreType = "Production",
+                    Name = "Renamed Instance",
+                    ConnectionString = null,
+                }
+            );
+            updateResult.Should().BeOfType<DataStoreUpdateResult.Success>();
+
+            _storedValueAfterUpdate = await StoredConnectionString(_id);
+        }
+
+        private async Task<string> StoredConnectionString(int id)
+        {
+            var getResult = await _repository.GetDataStore(id);
+            getResult.Should().BeOfType<DataStoreGetResult.Success>();
+
+            string? storedValue = ((DataStoreGetResult.Success)getResult).DataStoreResponse.ConnectionString;
+            storedValue.Should().NotBeNullOrEmpty();
+            return storedValue!;
+        }
+
+        [Test]
+        public void It_leaves_the_stored_cipher_text_unchanged() =>
+            _storedValueAfterUpdate.Should().Be(_storedValueBeforeUpdate);
+
+        [Test]
+        public void It_still_decrypts_to_the_original_connection_string() =>
+            AssertIsValidEncryptedBase64(_storedValueAfterUpdate, OriginalConnectionString);
+
+        [Test]
+        public async Task It_applies_the_other_changes()
+        {
+            var getResult = await _repository.GetDataStore(_id);
+            getResult.Should().BeOfType<DataStoreGetResult.Success>();
+
+            var dataStoreFromDb = ((DataStoreGetResult.Success)getResult).DataStoreResponse;
+            dataStoreFromDb.Name.Should().Be("Renamed Instance");
+            dataStoreFromDb.DataStoreType.Should().Be("Production");
         }
     }
 }

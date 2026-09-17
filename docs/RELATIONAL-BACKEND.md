@@ -32,6 +32,8 @@ For the design rationale, start with these:
 
 - [`overview.md`](../reference/design/backend-redesign/design-docs/overview.md) — the redesign at a glance
 - [`data-model.md`](../reference/design/backend-redesign/design-docs/data-model.md) — the relational schema (`dms.*` core tables, per-resource tables, descriptor projections)
+- [`ddl-generation.md`](../reference/design/backend-redesign/design-docs/ddl-generation.md) — deterministic DDL and create-only provisioning semantics
+- [`cdc-streaming.md`](../reference/design/backend-redesign/design-docs/cdc/cdc-streaming.md) — DocumentCache configuration, projection, readiness, CDC admission, and operations
 - [`new-startup-flow.md`](../reference/design/backend-redesign/design-docs/new-startup-flow.md) — how the service starts up against a provisioned database
 
 ## 2. Provisioning a database for an effective schema
@@ -64,13 +66,15 @@ api-schema-tools ddl emit --schema core/ApiSchema.json --output ./ddl-output --d
 
 | Output file | When | Contents |
 |---|---|---|
-| `pgsql.sql` / `mssql.sql` | per selected dialect | the full DDL script for that engine |
+| `pgsql.sql` / `mssql.sql` | per selected dialect | the full DDL script for that engine, without a built-in transaction wrapper |
 | `effective-schema.manifest.json` | always | the schema fingerprint, components, and resource-key seed summary |
-| `relational-model.{dialect}.manifest.json` | per selected dialect | the derived relational model inventory (tables, columns, constraints, indexes, views, triggers) |
+| `relational-model.{dialect}.manifest.json` | per selected dialect | the effective-schema-derived relational model inventory; fixed `dms` inventory is emitted in SQL and affects the optional DDL manifest hashes/counts instead |
 | `ddl.manifest.json` | only with `--ddl-manifest` | dialect-independent summary (normalized-SQL hash + statement count per dialect) for diagnostics |
 
 `--dialect` accepts `pgsql`, `mssql`, or `both` (default `both`). All output uses Unix
-line endings so the same inputs produce byte-for-byte identical files.
+line endings so the same inputs produce byte-for-byte identical files. Scripts produced
+by `ddl emit` are intentionally standalone DDL, not `BEGIN`/`COMMIT` wrapped artifacts;
+the caller owns any all-or-nothing wrapper when applying emitted SQL manually.
 
 ### Apply the DDL to a database (`ddl provision`)
 
@@ -95,6 +99,92 @@ api-schema-tools ddl provision \
 `--create-database` creates the target if missing; `--timeout` (default `300` seconds)
 bounds DDL execution. For SQL Server, provisioning configures Read Committed Snapshot
 Isolation (and `ALLOW_SNAPSHOT_ISOLATION`) on newly created databases.
+
+### Always-provisioned DocumentCache inventory
+
+Full relational provisioning always creates the fixed `dms` inventory needed by the
+DocumentCache and CDC design:
+
+- [`dms.DataStoreIdentity`](../reference/design/backend-redesign/design-docs/data-model.md#3-dmsdatastoreidentity)
+- [`dms.DocumentCache`](../reference/design/backend-redesign/design-docs/data-model.md#5-dmsdocumentcache-always-provisioned-optional-projection)
+- [`dms.DocumentProjectionWork`](../reference/design/backend-redesign/design-docs/data-model.md#5a-dmsdocumentprojectionwork-always-provisioned-durable-projection-work)
+- [`dms.DocumentCacheState`](../reference/design/backend-redesign/design-docs/data-model.md#6-dmsdocumentcachestate-singleton-projection-state)
+
+These objects are physical schema and durable state. Runtime projection, projection
+administration, projection health/readiness, cache-backed reads, and complete target
+eligibility validation are configured and operated explicitly; the authoritative behavior
+lives in the DocumentCache/CDC design. This guide links to the design owners instead of
+restating their contracts: the
+[`data-model.md`](../reference/design/backend-redesign/design-docs/data-model.md) table
+sections define the physical shape; the
+[`Cached Document Contract`](../reference/design/backend-redesign/design-docs/cdc/0001-relational-cdc-projector-and-sources.md#cached-document-contract)
+and
+[`Transactional Enqueue`](../reference/design/backend-redesign/design-docs/cdc/0001-relational-cdc-projector-and-sources.md#transactional-enqueue)
+sections define cache and work semantics; DDL behavior is in
+[`ddl-generation.md`](../reference/design/backend-redesign/design-docs/ddl-generation.md#provision-semantics-create-only-no-migrations);
+schema/query integration is in
+[`cdc-streaming.md`](../reference/design/backend-redesign/design-docs/cdc/cdc-streaming.md#schema-and-query-integration);
+cache-backed read behavior is in
+[`05-cache-backed-read-path.md`](../reference/design/backend-redesign/epics/18-document-cache/05-cache-backed-read-path.md);
+runtime configuration is summarized in
+[`docs/CONFIGURATION.md`](./CONFIGURATION.md#datamanagementdocumentcache);
+operator workflows are in
+[`reference/document-cache-documentation/operations-runbook.md`](../reference/document-cache-documentation/operations-runbook.md);
+and the `CDC-INV-02` / `CDC-INV-03` traceability rows live under
+[`Contract-to-Evidence Traceability`](../reference/design/backend-redesign/design-docs/cdc/cdc-streaming.md#contract-to-evidence-traceability).
+
+### Cache-backed read acceleration
+
+Cache-backed reads are optional. DMS considers `dms.DocumentCache` only for external
+resource and descriptor GET-by-id and GET-many response-body assembly when
+`DataManagement:DocumentCache:ReadAcceleration:Enabled` is `true` and the selected
+tenant/data-store pair matches an explicit `DocumentCache:Targets` entry. Other endpoints,
+internal stored-document reads, mutations, change-query endpoints, discovery, OpenAPI, and
+administrative commands continue on their existing paths.
+
+The relational read path remains the correctness path. Fresh cache rows may supply only the
+body for candidates that the relational flow already selected and authorized; misses,
+stale rows, lifecycle fences, target ineligibility, expected cache-read availability
+failures, invalid cached JSON, and direct-fill failures fall back to relational reads
+without exposing whether cache was used. Optional direct fill after fallback is
+best-effort, bounded by `ReadAcceleration:DirectFillTimeout`, and uses the shared
+DocumentCache materializer/writer rather than the shaped API response. Snapshot and
+read-replica requests skip direct fill when derivative routing is available because those
+requests remain read-only.
+
+### Create-only guardrails and reruns
+
+Provisioning is still create-only: it does not migrate an older DocumentCache shape,
+reconcile arbitrary drift, or classify every partial database state. Phase-zero checks are
+bounded to the effective-schema hash, required singleton safety for
+`dms.DataStoreIdentity` and `dms.DocumentCacheState`, known legacy DocumentCache artifacts
+(`DocumentCache.Etag`, `UX_DocumentCache_DocumentUuid`, and
+`IX_DocumentCache_ProjectName_ResourceName_LastModifiedAt`), and PostgreSQL enqueue-owner
+prerequisites. Other incompatible objects are allowed to fail through ordinary provider
+DDL execution.
+
+On a completed same-hash database, provisioning preserves `SourceIdentity`, projection
+lifecycle, `CacheAheadRecoveryRequired`, cache rows, pending work, and existing enqueue
+timestamps. Compatible reruns use the normal existence-check and replaceable
+function/trigger patterns to finish or refresh generated definitions. If a known legacy
+cache artifact is present, drop and recreate the database rather than expecting in-place
+repair.
+
+`ddl provision` executes generated statements in one transaction after any optional
+database-creation pre-step; a failure rolls that transaction back. `ddl emit` writes
+transaction-free SQL for review/manual use.
+
+### Provider trigger security
+
+PostgreSQL provisioning creates or safely reuses a locked-down `NOLOGIN`
+`edfi_dms_enqueue_owner` role and gives the authenticated provisioning principal only the
+direct membership needed to own and refresh the enqueue functions. That owner is not a
+runtime DMS credential; production still uses the deployment-supplied data-store
+credential, while later CDC work owns separate CDC principals and grants.
+
+SQL Server uses the existing same-owner ownership chain for the enqueue trigger and
+referenced `dms` tables. The generated trigger has no `EXECUTE AS`, enqueue user, or
+enqueue role.
 
 ### Scripted local provisioning
 
@@ -137,12 +227,13 @@ The generated DDL ([`SeedDmlEmitter.cs`](../src/dms/backend/EdFi.DataManagementS
 assembled by [`FullDdlEmitter.cs`](../src/dms/backend/EdFi.DataManagementService.Backend.Ddl/FullDdlEmitter.cs))
 protects the database in two places:
 
-- **Preflight** (search the script for the full `-- Phase 0: Preflight (fail fast on schema hash mismatch)` header). Before any DDL runs,
+- **Preflight** (search the script for the full `-- Phase 0: Bounded Provisioning Guards` header). Before any DDL runs,
   if `dms.EffectiveSchema` already exists with a *different* hash, the script raises an error and
   aborts. You cannot accidentally re-provision an existing database for a different effective schema.
-- **Seed insert-if-missing + validate** (search for the full `-- Phase 7: Seed Data (insert-if-missing
-  + validation)` header — the bare "Phase 7" number is reused by other emitters for unrelated
-  sections, so match on the label text). The fingerprint row is inserted only if absent
+  The same phase performs only the bounded DocumentCache safety checks described above; it
+  is not a full schema-drift validator.
+- **Seed insert-if-missing + validate** (search for the full `-- Phase 10: Seed Data (insert-if-missing
+  + validation)` header). The fingerprint row is inserted only if absent
   (`ON CONFLICT DO NOTHING` / `IF NOT EXISTS`), then the stored `ApiSchemaFormatVersion`,
   `ResourceKeyCount`, and `ResourceKeySeedHash` are validated against the expected values and
   the script fails on any mismatch.
@@ -213,11 +304,12 @@ document `Id`, and the `ChangeVersion` for a given write. Only the separator aft
 
 #### Read metadata (`_etag`, `_lastModifiedDate`)
 
-On read, `_lastModifiedDate` is served from the stored `ContentLastModifiedAt` and `_etag` is derived
-as a hash over the materialized content. When a served `_etag` or `_lastModifiedDate` looks wrong,
+On read, `_lastModifiedDate` is served from the stored `ContentLastModifiedAt` and `_etag` is
+composed from `ContentVersion` plus the active representation `variantKey`; the materialized
+content is not hashed to build `_etag`. When a served `_etag` or `_lastModifiedDate` looks wrong,
 start here:
 
-- [`RelationalReadMaterializer.cs`](../src/dms/backend/EdFi.DataManagementService.Backend/RelationalReadMaterializer.cs) — derives `_etag` and serves `_lastModifiedDate` for resources
+- [`RelationalReadMaterializer.cs`](../src/dms/backend/EdFi.DataManagementService.Backend/RelationalReadMaterializer.cs) — composes `_etag` and serves `_lastModifiedDate` for resources
 - [`DescriptorDocumentMaterializer.cs`](../src/dms/backend/EdFi.DataManagementService.Backend/DescriptorDocumentMaterializer.cs) — the same for descriptors
 
 #### Change-version filtering (`minChangeVersion` / `maxChangeVersion`)
@@ -242,6 +334,22 @@ endpoints, which are still a placeholder shim (see the note below).
 > ([`TrackedChangesEndpointModule.cs`](../src/dms/frontend/EdFi.DataManagementService.Frontend.AspNetCore/Modules/TrackedChangesEndpointModule.cs))
 > that returns `[]` (with a `Total-Count: 0` header only when `totalCount=true` is requested). Do not
 > expect `/deletes` or `/keyChanges` to read the tracked-change tables yet.
+
+`newestChangeVersion` is the current value reported by the provider's change-version sequence, not
+`MAX(ContentVersion)` over `dms.Document`. After identity stamp columns were removed from
+`dms.Document`, document inserts and identity-changing root updates allocate one sequence value
+instead of two: they formerly wrote both a content stamp and an identity stamp. Child scopes and
+content-only root updates already allocated only one value. The reported watermark therefore no
+longer appears one value ahead of the stored `ContentVersion` for document inserts and
+identity-changing root updates. Database sequences can still have ordinary gaps, for example from
+rolled-back transactions; SQL Server sequence-cache recovery after a restart can also leave
+`current_value` ahead of every stored `ContentVersion`.
+
+Compatibility note: change-version filters use inclusive bounds. A client that stores the previous
+`newestChangeVersion` and later resumes by passing it as `minChangeVersion` can receive the boundary
+item again. Incremental extraction clients should treat change-query windows as idempotent and
+deduplicate by the appropriate resource identity and change version, or advance their lower bound
+according to their own resume policy.
 
 ## 5. Mapping packs (optional)
 

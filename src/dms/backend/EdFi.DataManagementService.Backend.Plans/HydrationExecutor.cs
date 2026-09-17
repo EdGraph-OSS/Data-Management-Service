@@ -15,11 +15,11 @@ namespace EdFi.DataManagementService.Backend.Plans;
 /// </summary>
 /// <remarks>
 /// <para>
-/// The executor builds a single SQL batch that returns multiple result sets (document metadata,
-/// root rows, child rows, descriptor URI rows, and optional document-reference lookup rows)
-/// consumed sequentially via <see cref="DbDataReader.NextResultAsync"/>. Query and default
-/// single-document batches materialize a keyset relation first; the PostgreSQL single-document
-/// fast path starts directly with document metadata.
+/// The executor builds a single SQL batch that returns multiple result sets (a query keyset's
+/// selected ids, document metadata, root rows, child rows, descriptor URI rows, and optional
+/// document-reference lookup rows) consumed sequentially via
+/// <see cref="DbDataReader.NextResultAsync"/>. Query and default single-document batches materialize
+/// a keyset relation first; the single-document fast path starts directly with document metadata.
 /// </para>
 /// <para>
 /// Takes an already-opened <see cref="DbConnection"/> so callers can manage connection
@@ -116,7 +116,7 @@ public static class HydrationExecutor
     /// <param name="executionOptions">Controls optional projection work in the hydration batch.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The hydrated page containing document metadata and per-table row data.</returns>
-    public static async Task<HydratedPage> ExecuteAsync(
+    public static Task<HydratedPage> ExecuteAsync(
         DbConnection connection,
         ResourceReadPlan plan,
         PageKeysetSpec keyset,
@@ -127,24 +127,155 @@ public static class HydrationExecutor
     )
     {
         ArgumentNullException.ThrowIfNull(connection);
+
+        return ExecuteAsync(
+            batchSql =>
+            {
+                var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = batchSql;
+                return command;
+            },
+            plan,
+            keyset,
+            dialect,
+            executionOptions,
+            ct
+        );
+    }
+
+    /// <summary>
+    /// Executes the hydration batch through a caller-supplied command factory.
+    /// </summary>
+    /// <remarks>
+    /// The factory receives the assembled batch SQL and returns a command already bound to the
+    /// caller's connection and transaction. This lets a write session create the hydration command
+    /// through its own command-creation seam, so a session decorator observes the hydration batch
+    /// alongside every other in-session command. Keyset parameters are added to the returned
+    /// command here, so factories must not assume the command they return is already complete.
+    /// </remarks>
+    /// <param name="createCommand">Builds a command bound to the caller's connection/transaction.</param>
+    /// <param name="plan">The compiled resource read plan.</param>
+    /// <param name="keyset">The page keyset specification.</param>
+    /// <param name="dialect">The SQL dialect.</param>
+    /// <param name="executionOptions">Controls optional projection work in the hydration batch.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The hydrated page containing document metadata and per-table row data.</returns>
+    public static async Task<HydratedPage> ExecuteAsync(
+        Func<string, DbCommand> createCommand,
+        ResourceReadPlan plan,
+        PageKeysetSpec keyset,
+        SqlDialect dialect,
+        HydrationExecutionOptions executionOptions,
+        CancellationToken ct
+    )
+    {
+        ArgumentNullException.ThrowIfNull(createCommand);
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(keyset);
 
         var batchSql = HydrationBatchBuilder.Build(plan, keyset, dialect, executionOptions);
 
-        await using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = batchSql;
+        await using var command = createCommand(batchSql);
         HydrationBatchBuilder.AddParameters(command, keyset);
 
         await using var reader = await command.ExecuteReaderAsync(ct);
 
-        // Keyset batches begin with temp-table reset/creation + INSERT materialization. Both
-        // Npgsql and SqlClient skip DDL/DML statements when advancing result sets, so the reader
-        // is positioned at the first SELECT result set automatically. The PostgreSQL fast path
-        // starts with that same first SELECT result set.
+        // Keyset batches begin with temp-table reset/creation + INSERT materialization. Both Npgsql
+        // and SqlClient skip statements that produce no result set (DDL, and DML without an
+        // OUTPUT/RETURNING clause), so the reader is positioned at the batch's first row-returning
+        // statement automatically. An OUTPUT/RETURNING clause still produces a result set when the
+        // statement affects zero rows, so a query keyset's materialization insert always holds that
+        // first position, returning the ids it selected — an empty result set for a zero-size page.
+        // Without such a clause the first position is the first SELECT, where the single-document
+        // fast path also starts.
+        return await ReadPageAsync(reader, plan, keyset, executionOptions, ct);
+    }
 
-        // 1. Optional total count
+    /// <summary>
+    /// How many result sets the hydration batch for <paramref name="keyset"/> emits, which is also the
+    /// number of result-set positions the batch occupies when co-batched into a larger command. A query
+    /// keyset's materialization insert returns its selected ids and therefore occupies a position; the
+    /// batch's remaining DDL/DML statements produce no result set and occupy none.
+    /// </summary>
+    public static int GetResultSetCount(
+        ResourceReadPlan plan,
+        PageKeysetSpec keyset,
+        HydrationExecutionOptions executionOptions
+    )
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        ArgumentNullException.ThrowIfNull(keyset);
+
+        var count = 1 + plan.TablePlansInDependencyOrder.Length;
+
+        if (keyset is PageKeysetSpec.Query)
+        {
+            count++;
+        }
+
+        if (keyset is PageKeysetSpec.Query { Plan.TotalCountSql: not null })
+        {
+            count++;
+        }
+
+        if (executionOptions.IncludeDescriptorProjection)
+        {
+            count += plan.DescriptorProjectionPlansInOrder.Length;
+        }
+
+        if (executionOptions.IncludeDocumentReferenceLookup && plan.DocumentReferenceLookup is not null)
+        {
+            count++;
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// Reads the hydration batch's result sets from a reader positioned at the batch's first result
+    /// set. Consumes exactly <see cref="GetResultSetCount"/> result sets — the last of them remains
+    /// current when this returns — so the batch can be decoded from inside a larger multi-statement
+    /// command as well as from its own.
+    /// </summary>
+    public static async Task<HydratedPage> ReadPageAsync(
+        DbDataReader reader,
+        ResourceReadPlan plan,
+        PageKeysetSpec keyset,
+        HydrationExecutionOptions executionOptions,
+        CancellationToken ct
+    )
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+        ArgumentNullException.ThrowIfNull(plan);
+        ArgumentNullException.ThrowIfNull(keyset);
+
+        // 1. Selected page keyset ids, for a query keyset only. Read before anything else because the
+        //    materialization insert that returns them is the batch's first row-returning statement.
+        //    The boundary describes the keys selection chose, so it is independent of what the
+        //    metadata and table result sets below still find: every selected row may have been deleted
+        //    between materialization and hydration, leaving a non-null boundary and an empty page.
+        long? highestSelectedAnchor = null;
+
+        if (keyset is PageKeysetSpec.Query)
+        {
+            // The same predicate the batch builder emitted this result set from, so the ordinal read
+            // here cannot disagree with the column list that produced it.
+            highestSelectedAnchor = await HydrationReader.ReadSelectedAnchorMaximumAsync(
+                reader,
+                HydrationBatchBuilder.CarriesSelectedAnchor(keyset),
+                ct
+            );
+
+            if (!await reader.NextResultAsync(ct))
+            {
+                throw new InvalidOperationException(
+                    "Expected a result set after the selected page keyset ids but no more result sets available."
+                );
+            }
+        }
+
+        // 2. Optional total count
         long? totalCount = null;
         bool hasTotalCount = keyset is PageKeysetSpec.Query { Plan.TotalCountSql: not null };
 
@@ -159,10 +290,10 @@ public static class HydrationExecutor
             }
         }
 
-        // 2. Document metadata
+        // 3. Document metadata
         var documentMetadata = await HydrationReader.ReadDocumentMetadataAsync(reader, ct);
 
-        // 3. Table rows in dependency order
+        // 4. Table rows in dependency order
         var tableRows = new HydratedTableRows[plan.TablePlansInDependencyOrder.Length];
 
         for (var i = 0; i < plan.TablePlansInDependencyOrder.Length; i++)
@@ -185,7 +316,7 @@ public static class HydrationExecutor
 
         if (executionOptions.IncludeDescriptorProjection)
         {
-            // 4. Descriptor URI rows in compiled-plan order
+            // 5. Descriptor URI rows in compiled-plan order
             for (var i = 0; i < plan.DescriptorProjectionPlansInOrder.Length; i++)
             {
                 if (!await reader.NextResultAsync(ct))
@@ -203,7 +334,7 @@ public static class HydrationExecutor
             }
         }
 
-        // 5. Document-reference auxiliary lookup (gated by plan property AND the caller-supplied
+        // 6. Document-reference auxiliary lookup (gated by plan property AND the caller-supplied
         //    execution option — write-path callers opt out because they discard the result).
         HydratedDocumentReferenceLookup? documentReferenceLookup = null;
 
@@ -229,6 +360,7 @@ public static class HydrationExecutor
         return new HydratedPage(totalCount, documentMetadata, tableRows, descriptorRows)
         {
             DocumentReferenceLookup = documentReferenceLookup,
+            HighestSelectedAnchor = highestSelectedAnchor,
         };
     }
 

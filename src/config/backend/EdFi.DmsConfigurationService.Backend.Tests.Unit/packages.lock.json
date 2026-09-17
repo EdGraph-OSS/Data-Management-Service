@@ -32,6 +32,12 @@
         "resolved": "4.12.0",
         "contentHash": "5S+LHLhm0am4MWQQMN0O3VyKA/St5JCqH1yv+1YGZl2klIJlLlmNA/KTLCVJSC1kZPIKR1MFF/3g9FqsyzIyCQ=="
       },
+      "Microsoft.Extensions.TimeProvider.Testing": {
+        "type": "Direct",
+        "requested": "[10.3.0, )",
+        "resolved": "10.3.0",
+        "contentHash": "CKjS1u0JlMIA44o/0NV8nXRCaudpol3ERVlB9eu21kvq++EMt7fBavbPxWXN+nOpsdDhz/pb0MY2RBpk2/PGbA=="
+      },
       "Microsoft.NET.Test.Sdk": {
         "type": "Direct",
         "requested": "[17.11.1, )",
@@ -281,10 +287,10 @@
       },
       "Microsoft.Extensions.FileProviders.Abstractions": {
         "type": "Transitive",
-        "resolved": "9.0.6",
-        "contentHash": "q9FPkSGVA9ipI255p3PBAvWNXas5Tzjyp/DwYSwT+46mIFw9fWZahsF6vHpoxLt5/vtANotH2sAm7HunuFIx9g==",
+        "resolved": "10.0.1",
+        "contentHash": "+b3DligYSZuoWltU5YdbMpIEUHNZPgPrzWfNiIuDkMdqOl93UxYB5KzS3lgpRfTXJhTNpo/CZ8w/sTkDTPDdxQ==",
         "dependencies": {
-          "Microsoft.Extensions.Primitives": "9.0.6"
+          "Microsoft.Extensions.Primitives": "10.0.1"
         }
       },
       "Microsoft.Extensions.Http.Diagnostics": {
@@ -607,7 +613,7 @@
           "Microsoft.IdentityModel.Protocols": "[8.12.0, )",
           "OpenIddict.Core": "[7.0.0, )",
           "Polly": "[8.5.2, )",
-          "Polly.Extensions": "[8.4.2, )",
+          "Polly.Extensions": "[8.5.2, )",
           "System.IdentityModel.Tokens.Jwt": "[8.12.0, )",
           "dbup-core": "[5.0.87, )",
           "dbup-sqlserver": "[5.0.40, )"
@@ -619,6 +625,7 @@
           "Dapper": "[2.1.35, )",
           "EdFi.DmsConfigurationService.Backend": "[1.0.0, )",
           "Microsoft.AspNetCore.Authentication.JwtBearer": "[10.0.1, )",
+          "Microsoft.Extensions.Hosting.Abstractions": "[10.0.1, )",
           "Microsoft.Extensions.Http": "[10.0.1, )",
           "Microsoft.IdentityModel.JsonWebTokens": "[8.12.0, )",
           "OpenIddict.Abstractions": "[7.0.0, )",
@@ -643,7 +650,7 @@
           "Npgsql.DependencyInjection": "[8.0.3, )",
           "OpenIddict.Core": "[7.0.0, )",
           "Polly": "[8.5.2, )",
-          "Polly.Extensions": "[8.4.2, )",
+          "Polly.Extensions": "[8.5.2, )",
           "System.IdentityModel.Tokens.Jwt": "[8.12.0, )",
           "System.Linq.Async": "[6.0.3, )",
           "dbup-core": "[5.0.87, )",
@@ -834,14 +841,14 @@
       "Microsoft.Extensions.Hosting.Abstractions": {
         "type": "CentralTransitive",
         "requested": "[10.0.1, )",
-        "resolved": "9.0.6",
-        "contentHash": "G9T95JbcG/wQpeVIzg0IMwxI+uTywDmbxWUWN2P0mdna35rmuTqgTrZ4SU5rcfUT3EJfbI9N4K8UyCAAc6QK8Q==",
+        "resolved": "10.0.1",
+        "contentHash": "qmoQkVZcbm4/gFpted3W3Y+1kTATZTcUhV3mRkbtpfBXlxWCHwh/2oMffVcCruaGOfJuEnyAsGyaSUouSdECOw==",
         "dependencies": {
-          "Microsoft.Extensions.Configuration.Abstractions": "9.0.6",
-          "Microsoft.Extensions.DependencyInjection.Abstractions": "9.0.6",
-          "Microsoft.Extensions.Diagnostics.Abstractions": "9.0.6",
-          "Microsoft.Extensions.FileProviders.Abstractions": "9.0.6",
-          "Microsoft.Extensions.Logging.Abstractions": "9.0.6"
+          "Microsoft.Extensions.Configuration.Abstractions": "10.0.1",
+          "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.1",
+          "Microsoft.Extensions.Diagnostics.Abstractions": "10.0.1",
+          "Microsoft.Extensions.FileProviders.Abstractions": "10.0.1",
+          "Microsoft.Extensions.Logging.Abstractions": "10.0.1"
         }
       },
       "Microsoft.Extensions.Http": {
@@ -1011,19 +1018,19 @@
       },
       "Polly.Core": {
         "type": "CentralTransitive",
-        "requested": "[8.4.2, )",
+        "requested": "[8.5.2, )",
         "resolved": "8.5.2",
         "contentHash": "1MJKdxv4zwDmiWvYvVN24DsrWUfgQ4F83voH8bhbtLMdPuGy8CfTUzsgQhvyrl1a7hrM6f/ydwLVdVUI0xooUw=="
       },
       "Polly.Extensions": {
         "type": "CentralTransitive",
-        "requested": "[8.4.2, )",
-        "resolved": "8.4.2",
-        "contentHash": "GZ9vRVmR0jV2JtZavt+pGUsQ1O1cuRKG7R7VOZI6ZDy9y6RNPvRvXK1tuS4ffUrv8L0FTea59oEuQzgS0R7zSA==",
+        "requested": "[8.5.2, )",
+        "resolved": "8.5.2",
+        "contentHash": "NcUEkeMB7LMsLBXzY9PuuKP7ylXngUEuhmaWxCrlXqYLbVQQzG1ulAnaEQ2LM1zlSoxRftAjCuhPIH40qeWAlg==",
         "dependencies": {
           "Microsoft.Extensions.Logging.Abstractions": "8.0.0",
           "Microsoft.Extensions.Options": "8.0.0",
-          "Polly.Core": "8.4.2"
+          "Polly.Core": "8.5.2"
         }
       },
       "System.IdentityModel.Tokens.Jwt": {

@@ -18,9 +18,43 @@ using FluentAssertions;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Npgsql;
 using NUnit.Framework;
 
 namespace EdFi.DataManagementService.Backend.Postgresql.Tests.Integration;
+
+internal sealed class DescriptorCommandRecorder
+{
+    private readonly List<string> _commandTexts = [];
+
+    public IReadOnlyList<string> CommandTexts => _commandTexts;
+
+    public void Reset() => _commandTexts.Clear();
+
+    public void Record(RelationalCommand command) => _commandTexts.Add(command.CommandText);
+}
+
+/// <summary>
+/// Records the descriptor page commands the real provider executor ran, so a test can prove a cursor
+/// page cost exactly one command and asked for no count rather than inferring it from a null TotalCount.
+/// </summary>
+internal sealed class RecordingDescriptorCommandExecutor(
+    PostgresqlRelationalCommandExecutor inner,
+    DescriptorCommandRecorder recorder
+) : IRelationalCommandExecutor
+{
+    public SqlDialect Dialect => inner.Dialect;
+
+    public Task<TResult> ExecuteReaderAsync<TResult>(
+        RelationalCommand command,
+        Func<IRelationalCommandReader, CancellationToken, Task<TResult>> readAsync,
+        CancellationToken cancellationToken = default
+    )
+    {
+        recorder.Record(command);
+        return inner.ExecuteReaderAsync(command, readAsync, cancellationToken);
+    }
+}
 
 [TestFixture]
 [NonParallelizable]
@@ -31,6 +65,12 @@ public class Given_A_Postgresql_DescriptorRead_Query_Request
     private const string FixtureRelativePath = "src/dms/backend/Fixtures/authoritative/ds-5.2";
     private const int MaximumPageSize = 500;
     private const string SharedPagingDescription = "Shared paging count";
+
+    // Custom view-based strategy names follow the {BasisResource}With... convention, so these resolve
+    // SchoolTypeDescriptor as the basis resource and bind auth."{StrategyName}".
+    private const string CustomViewStrategyName = "SchoolTypeDescriptorWithCustomViewProviderTest";
+    private const string MissingCustomViewStrategyName =
+        "SchoolTypeDescriptorWithMissingCustomViewProviderTest";
 
     private static readonly QualifiedResourceName SchoolTypeDescriptorResource = new(
         "Ed-Fi",
@@ -173,6 +213,55 @@ public class Given_A_Postgresql_DescriptorRead_Query_Request
     }
 
     [Test]
+    public async Task It_filters_descriptor_queries_by_a_custom_view_against_the_real_database()
+    {
+        // Descriptor GET-many has its own authorization preflight and page SQL (rooted on dms.Document
+        // with the descriptor row joined), so its custom-view path is not covered by the regular-resource
+        // custom-view fixtures. This proves the emitted descriptor SQL and the validation probe both
+        // execute against a real database rather than only matching a unit-generated string.
+        await SeedDescriptorsAsync();
+        await CreateDescriptorCustomAuthViewAsync(
+            CustomViewStrategyName,
+            authorizedDocumentUuid: AlternativeSeed.DocumentUuid
+        );
+
+        var result = await ExecuteQueryAsync(
+            [],
+            "pg-descriptor-query-custom-view",
+            totalCount: true,
+            authorizationStrategyEvaluators: [CreateCustomViewStrategyEvaluator(CustomViewStrategyName)]
+        );
+
+        AssertDescriptorPage(result, [AlternativeSeed], expectedTotalCount: 1);
+    }
+
+    [Test]
+    public async Task It_fails_the_descriptor_query_with_a_system_error_when_the_custom_view_is_missing()
+    {
+        // The companion negative case: descriptor GET-many must surface a missing auth view as a
+        // controlled custom-view validation failure instead of silently returning an empty page.
+        await SeedDescriptorsAsync();
+        await DropDescriptorCustomAuthViewAsync(MissingCustomViewStrategyName);
+
+        Func<Task> act = () =>
+            ExecuteQueryAsync(
+                [],
+                "pg-descriptor-query-missing-custom-view",
+                authorizationStrategyEvaluators:
+                [
+                    CreateCustomViewStrategyEvaluator(MissingCustomViewStrategyName),
+                ]
+            );
+
+        var assertion = await act.Should().ThrowAsync<CustomViewAuthorizationValidationException>();
+        assertion
+            .Which.InnerException.Should()
+            .BeOfType<PostgresException>()
+            .Which.SqlState.Should()
+            .Be(PostgresErrorCodes.UndefinedTable);
+    }
+
+    [Test]
     public async Task It_returns_an_empty_page_for_an_invalid_descriptor_query_id()
     {
         await SeedDescriptorsAsync();
@@ -263,7 +352,7 @@ public class Given_A_Postgresql_DescriptorRead_Query_Request
     }
 
     [Test]
-    public async Task It_does_not_fail_when_total_count_is_requested_and_a_corrupt_descriptor_document_is_outside_the_selected_page()
+    public async Task It_excludes_a_corrupt_descriptor_document_from_the_page_and_total_count()
     {
         await SeedDescriptorsAsync([PagingFirstSeed]);
 
@@ -271,6 +360,8 @@ public class Given_A_Postgresql_DescriptorRead_Query_Request
             _mappingSet,
             SchoolTypeDescriptorResource
         );
+        // A dms.Document row with no dms.Descriptor row (hand-corrupted state). The page keyset
+        // and total count root on dms.Descriptor, so the corrupt document is invisible to both.
         await PostgresqlDescriptorReadTestSupport.InsertDocumentAsync(
             _database,
             new DocumentUuid(Guid.Parse("30000000-0000-0000-0000-000000000207")),
@@ -285,11 +376,11 @@ public class Given_A_Postgresql_DescriptorRead_Query_Request
             offset: 0
         );
 
-        AssertDescriptorPage(result, [PagingFirstSeed], expectedTotalCount: 2);
+        AssertDescriptorPage(result, [PagingFirstSeed], expectedTotalCount: 1);
     }
 
     [Test]
-    public async Task It_returns_an_unknown_failure_when_the_selected_descriptor_query_document_has_no_descriptor_row()
+    public async Task It_excludes_a_corrupt_descriptor_document_from_selection_instead_of_failing_hydration()
     {
         await SeedDescriptorsAsync([PagingFirstSeed]);
 
@@ -297,21 +388,23 @@ public class Given_A_Postgresql_DescriptorRead_Query_Request
             _mappingSet,
             SchoolTypeDescriptorResource
         );
-        var corruptDocumentId = await PostgresqlDescriptorReadTestSupport.InsertDocumentAsync(
+        // Before the dms.Descriptor re-root this corrupt document was selectable at offset 1 and
+        // failed mid-hydration; now the keyset can only yield documents with a descriptor row.
+        await PostgresqlDescriptorReadTestSupport.InsertDocumentAsync(
             _database,
             new DocumentUuid(Guid.Parse("30000000-0000-0000-0000-000000000208")),
             resourceKeyId
         );
 
-        var result = await ExecuteQueryAsync([], "pg-descriptor-query-corrupt-selected", limit: 1, offset: 1);
+        var result = await ExecuteQueryAsync(
+            [],
+            "pg-descriptor-query-corrupt-selected",
+            totalCount: true,
+            limit: 1,
+            offset: 1
+        );
 
-        var failure = result.Should().BeOfType<QueryResult.UnknownFailure>().Subject;
-        failure.FailureMessage.Should().Contain($"DocumentId {corruptDocumentId}");
-        // The row reader treats Namespace as nullable so a stored null can flow into the
-        // namespace-authorization stored-namespace-uninitialized 403; CodeValue is the next
-        // required column, so the reader's invariant message names it when the LEFT JOIN
-        // finds no descriptor row.
-        failure.FailureMessage.Should().Contain("dms.Descriptor.CodeValue must not be null.");
+        AssertEmptyPage(result, expectedTotalCount: 1);
     }
 
     [Test]
@@ -325,10 +418,10 @@ public class Given_A_Postgresql_DescriptorRead_Query_Request
             [],
             "pg-descriptor-query-change-version-window",
             totalCount: true,
-            changeVersionRange: new ChangeVersionRange(middleContentVersion, middleContentVersion)
+            changeVersionRange: new ChangeVersionRange(middleContentVersion - 1, middleContentVersion)
         );
 
-        AssertDescriptorPage(result, [PagingSecondSeed], expectedTotalCount: 1);
+        AssertDescriptorPage(result, [PagingFirstSeed, PagingSecondSeed], expectedTotalCount: 2);
     }
 
     [Test]
@@ -372,7 +465,7 @@ public class Given_A_Postgresql_DescriptorRead_Query_Request
             "pg-descriptor-query-change-version-resource-key-scope",
             totalCount: true,
             changeVersionRange: new ChangeVersionRange(
-                contentVersions.Values.Min(),
+                contentVersions.Values.Min() - 1,
                 contentVersions.Values.Max()
             )
         );
@@ -468,7 +561,15 @@ public class Given_A_Postgresql_DescriptorRead_Query_Request
         services.Configure<DatabaseOptions>(options => options.IsolationLevel = IsolationLevel.ReadCommitted);
         services.AddTestReadableProfileProjector();
         services.AddScoped<RelationalDocumentStoreRepository>();
-        services.AddPostgresqlReferenceResolver();
+        services.AddSingleton<DescriptorCommandRecorder>();
+        services.AddScoped<PostgresqlRelationalCommandExecutor>();
+        services.AddScoped<IRelationalCommandExecutor>(
+            serviceProvider => new RecordingDescriptorCommandExecutor(
+                serviceProvider.GetRequiredService<PostgresqlRelationalCommandExecutor>(),
+                serviceProvider.GetRequiredService<DescriptorCommandRecorder>()
+            )
+        );
+        services.AddPostgresqlBackendIntegrationTestServices();
 
         return services.BuildServiceProvider(
             new ServiceProviderOptions { ValidateOnBuild = true, ValidateScopes = true }
@@ -488,13 +589,48 @@ public class Given_A_Postgresql_DescriptorRead_Query_Request
         }
     }
 
+    private static AuthorizationStrategyEvaluator CreateCustomViewStrategyEvaluator(string strategyName) =>
+        new(strategyName, [], FilterOperator.And);
+
+    /// <summary>
+    /// Creates <c>auth."{strategyName}"</c> exposing the bigint <c>DocumentId</c> of exactly one seeded
+    /// descriptor, so the descriptor page query has something real to intersect with.
+    /// </summary>
+    private async Task CreateDescriptorCustomAuthViewAsync(
+        string strategyName,
+        DocumentUuid authorizedDocumentUuid
+    )
+    {
+        await DropDescriptorCustomAuthViewAsync(strategyName);
+
+        // CREATE VIEW cannot carry parameters, so the uuid is inlined; it is a Guid, so its formatted
+        // form cannot introduce anything but hex digits and hyphens.
+        await _database.ExecuteNonQueryAsync(
+            $"""
+            CREATE VIEW "auth"."{strategyName}" AS
+            SELECT "DocumentId"
+            FROM "dms"."Document"
+            WHERE "DocumentUuid" = '{authorizedDocumentUuid.Value:D}'::uuid;
+            """
+        );
+    }
+
+    private async Task DropDescriptorCustomAuthViewAsync(string strategyName)
+    {
+        await _database.ExecuteNonQueryAsync("CREATE SCHEMA IF NOT EXISTS \"auth\";");
+        await _database.ExecuteNonQueryAsync($"DROP VIEW IF EXISTS \"auth\".\"{strategyName}\";");
+    }
+
     private async Task<QueryResult> ExecuteQueryAsync(
         QueryElement[] queryElements,
         string traceId,
         bool totalCount = false,
         int limit = 25,
         int offset = 0,
-        ChangeVersionRange? changeVersionRange = null
+        ChangeVersionRange? changeVersionRange = null,
+        AuthorizationStrategyEvaluator[]? authorizationStrategyEvaluators = null,
+        CollectionPaging? paging = null,
+        PageOrderingMode pageOrderingMode = PageOrderingMode.DocumentId
     )
     {
         await using var scope = _serviceProvider.CreateAsyncScope();
@@ -505,15 +641,19 @@ public class Given_A_Postgresql_DescriptorRead_Query_Request
             AuthorizationContext: new RelationalAuthorizationContext([]),
             MappingSet: _mappingSet,
             QueryElements: queryElements,
-            AuthorizationStrategyEvaluators: [],
-            PaginationParameters: new PaginationParameters(
-                Limit: limit,
-                Offset: offset,
-                TotalCount: totalCount,
-                MaximumPageSize: MaximumPageSize
-            ),
+            AuthorizationStrategyEvaluators: authorizationStrategyEvaluators ?? [],
+            Paging: paging
+                ?? new CollectionPaging.Traditional(
+                    new PaginationParameters(
+                        Limit: limit,
+                        Offset: offset,
+                        TotalCount: totalCount,
+                        MaximumPageSize: MaximumPageSize
+                    )
+                ),
             TraceId: new TraceId(traceId),
-            ChangeVersionRange: changeVersionRange
+            ChangeVersionRange: changeVersionRange,
+            PageOrderingMode: pageOrderingMode
         );
 
         return await scope
@@ -573,6 +713,231 @@ public class Given_A_Postgresql_DescriptorRead_Query_Request
     private static void AssertSingleDescriptorMatch(QueryResult result, DescriptorReadSeed expectedSeed)
     {
         AssertDescriptorPage(result, [expectedSeed]);
+    }
+
+    // A descriptor cursor walk against a real database. Descriptor selection and row retrieval are one
+    // statement, so the boundary each page reports is the maximum of the keys that statement selected,
+    // and following it must deliver every seeded descriptor exactly once before the walk ends empty.
+    [Test]
+    public async Task It_walks_descriptor_pages_by_cursor()
+    {
+        await SeedDescriptorsAsync(PagingDescriptorSeeds);
+
+        List<string> walkedDocumentUuids = [];
+        var range = CursorRange.From(1);
+        var pages = 0;
+
+        while (pages++ < PagingDescriptorSeeds.Length + 1)
+        {
+            var success = (QueryResult.QuerySuccess)
+                await ExecuteQueryAsync(
+                    [],
+                    "pg-descriptor-cursor-walk",
+                    paging: new CollectionPaging.Cursor(range, new PageSize(2))
+                );
+
+            // Cursor mode asks for no count on any page of the walk.
+            success.TotalCount.Should().BeNull();
+
+            walkedDocumentUuids.AddRange(
+                success.EdfiDocs.Select(document => document!["id"]!.GetValue<string>())
+            );
+
+            if (success.HighestSelectedAnchor is not { } highestSelectedDocumentId)
+            {
+                success.EdfiDocs.Should().BeEmpty("the page that ends a walk selects nothing");
+                break;
+            }
+
+            range = new CursorRange(highestSelectedDocumentId + 1, range.InclusiveMaximum);
+        }
+
+        string[] expectedDocumentUuids =
+        [
+            .. PagingDescriptorSeeds.Select(seed => seed.DocumentUuid.Value.ToString()),
+        ];
+
+        walkedDocumentUuids.Should().Equal(expectedDocumentUuids.AsEnumerable());
+    }
+
+    [Test]
+    public async Task It_selects_no_descriptor_page_at_a_zero_cursor_page_size()
+    {
+        await SeedDescriptorsAsync(PagingDescriptorSeeds);
+
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteQueryAsync(
+                [],
+                "pg-descriptor-cursor-size-0",
+                paging: new CollectionPaging.Cursor(CursorRange.From(1), new PageSize(0))
+            );
+
+        success.HighestSelectedAnchor.Should().BeNull();
+        success.EdfiDocs.Should().BeEmpty();
+    }
+
+    // The story requires real-provider descriptor evidence for the predicates a cursor page composes
+    // with, not only for the unfiltered walk. A filter reaching the descriptor candidate relation
+    // alongside the range is what keeps a filtered walk from returning documents the filter excludes.
+    [Test]
+    public async Task It_composes_a_descriptor_query_filter_with_the_cursor_range()
+    {
+        await SeedDescriptorsAsync(PagingDescriptorSeeds);
+
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteQueryAsync(
+                [CreateQueryElement("codeValue", "$.codeValue", PagingSecondSeed.CodeValue)],
+                "pg-descriptor-cursor-filter",
+                paging: new CollectionPaging.Cursor(CursorRange.From(1), new PageSize(25))
+            );
+
+        success.EdfiDocs.Should().ContainSingle();
+        AssertDescriptorDocument(success.EdfiDocs[0]!.AsObject(), PagingSecondSeed);
+        success.HighestSelectedAnchor.Should().NotBeNull();
+    }
+
+    // Against current data a min-only window keeps DocumentId ordering, so a cursor page inside it
+    // continues normally. A frozen snapshot orders every windowed shape by ContentVersion.
+    [Test]
+    public async Task It_composes_a_min_only_change_version_window_with_the_descriptor_cursor_range()
+    {
+        await SeedDescriptorsAsync(PagingDescriptorSeeds);
+        var contentVersions = await ReadDescriptorContentVersionsByDocumentUuidAsync();
+        var lowestContentVersion = contentVersions.Values.Min();
+
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteQueryAsync(
+                [],
+                "pg-descriptor-cursor-min-window",
+                changeVersionRange: new ChangeVersionRange(lowestContentVersion - 1, null),
+                paging: new CollectionPaging.Cursor(CursorRange.From(1), new PageSize(25))
+            );
+
+        success.EdfiDocs.Should().HaveCount(PagingDescriptorSeeds.Length);
+        success.HighestSelectedAnchor.Should().NotBeNull();
+    }
+
+    // A window that excludes every descriptor selects nothing, so the page carries no boundary: the
+    // change-version predicate really reaches the cursor candidate relation rather than being dropped.
+    [Test]
+    public async Task It_composes_an_excluding_change_version_window_with_the_descriptor_cursor_range()
+    {
+        await SeedDescriptorsAsync(PagingDescriptorSeeds);
+        var contentVersions = await ReadDescriptorContentVersionsByDocumentUuidAsync();
+        var highestContentVersion = contentVersions.Values.Max();
+
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteQueryAsync(
+                [],
+                "pg-descriptor-cursor-excluding-window",
+                changeVersionRange: new ChangeVersionRange(highestContentVersion + 1, null),
+                paging: new CollectionPaging.Cursor(CursorRange.From(1), new PageSize(25))
+            );
+
+        success.EdfiDocs.Should().BeEmpty();
+        success.HighestSelectedAnchor.Should().BeNull();
+    }
+
+    // The two page shapes are observed in different anchor units on one real descriptor query: the
+    // cursor call leaves PageOrderingMode at its DocumentId default and reports a DocumentId, while
+    // the traditional call passes ContentVersion explicitly and reports the window's highest one. The
+    // window no longer decides that on its own - a max-bearing window resolves ContentVersion for
+    // either page shape - so the contrast here comes from what each call requests, not from the
+    // window they share.
+    [Test]
+    public async Task It_composes_a_max_bearing_change_version_window_with_the_descriptor_cursor_range()
+    {
+        await SeedDescriptorsAsync(PagingDescriptorSeeds);
+        var contentVersions = await ReadDescriptorContentVersionsByDocumentUuidAsync();
+        var highestContentVersion = contentVersions.Values.Max();
+
+        var cursorSuccess = (QueryResult.QuerySuccess)
+            await ExecuteQueryAsync(
+                [],
+                "pg-descriptor-cursor-max-window",
+                changeVersionRange: new ChangeVersionRange(null, highestContentVersion),
+                paging: new CollectionPaging.Cursor(CursorRange.From(1), new PageSize(25))
+            );
+
+        cursorSuccess.EdfiDocs.Should().HaveCount(PagingDescriptorSeeds.Length);
+        cursorSuccess.HighestSelectedAnchor.Should().NotBeNull();
+
+        var traditionalSuccess = (QueryResult.QuerySuccess)
+            await ExecuteQueryAsync(
+                [],
+                "pg-descriptor-traditional-max-window",
+                changeVersionRange: new ChangeVersionRange(null, highestContentVersion),
+                pageOrderingMode: PageOrderingMode.ContentVersion
+            );
+
+        // The traditional page over the same window is ordered by ContentVersion, so its boundary is the
+        // highest ContentVersion this resource's descriptors carry rather than any DocumentId. Scoped to
+        // the documents the query can reach: the window above is bounded by the highest version in the
+        // whole Descriptor table, which spans descriptor types this request never selects from.
+        var inScopeHighestContentVersion = cursorSuccess
+            .EdfiDocs.Select(document => contentVersions[Guid.Parse(document!["id"]!.GetValue<string>())])
+            .Max();
+
+        traditionalSuccess.HighestSelectedAnchor.Should().Be(inScopeHighestContentVersion);
+    }
+
+    [Test]
+    public async Task It_selects_the_whole_descriptor_collection_at_the_configured_maximum_page_size()
+    {
+        await SeedDescriptorsAsync(PagingDescriptorSeeds);
+
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteQueryAsync(
+                [],
+                "pg-descriptor-cursor-size-max",
+                paging: new CollectionPaging.Cursor(CursorRange.From(1), new PageSize(MaximumPageSize))
+            );
+
+        success.EdfiDocs.Should().HaveCount(PagingDescriptorSeeds.Length);
+        success.HighestSelectedAnchor.Should().NotBeNull();
+    }
+
+    // Observed at the provider command seam rather than inferred from a null TotalCount: a descriptor
+    // cursor page runs exactly one command, and that command asks for no count. A second roundtrip or a
+    // count would break the single-command invariant without changing any response value.
+    [Test]
+    public async Task It_runs_one_descriptor_command_with_no_count_for_a_cursor_page()
+    {
+        await SeedDescriptorsAsync(PagingDescriptorSeeds);
+
+        var recorder = _serviceProvider.GetRequiredService<DescriptorCommandRecorder>();
+        recorder.Reset();
+
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteQueryAsync(
+                [],
+                "pg-descriptor-cursor-command-shape",
+                paging: new CollectionPaging.Cursor(CursorRange.From(1), new PageSize(2))
+            );
+
+        success.EdfiDocs.Should().HaveCount(2);
+        recorder.CommandTexts.Should().ContainSingle("a cursor page must not add a command or a roundtrip");
+        recorder.CommandTexts[0].Should().NotContain("COUNT");
+        recorder.CommandTexts[0].Should().Contain("@cursorMin");
+        recorder.CommandTexts[0].Should().Contain("@cursorMax");
+        recorder.CommandTexts[0].Should().Contain("@pageSize");
+        recorder.CommandTexts[0].Should().NotContain("@offset");
+    }
+
+    // The traditional counterpart does compile count SQL when asked, so the assertion above is a property
+    // of cursor mode rather than of this fixture never counting at all.
+    [Test]
+    public async Task It_still_counts_for_a_traditional_descriptor_page_when_requested()
+    {
+        await SeedDescriptorsAsync(PagingDescriptorSeeds);
+
+        var recorder = _serviceProvider.GetRequiredService<DescriptorCommandRecorder>();
+        recorder.Reset();
+
+        await ExecuteQueryAsync([], "pg-descriptor-traditional-command-shape", totalCount: true);
+
+        recorder.CommandTexts.Should().ContainSingle();
+        recorder.CommandTexts[0].Should().Contain("COUNT");
     }
 
     private static void AssertDescriptorPage(

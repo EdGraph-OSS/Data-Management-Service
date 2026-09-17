@@ -33,7 +33,8 @@ All authorization stories (design, DDL/provisioning, runtime integration, and te
 - `DMS-1057` — `08-namespace-auth-strategy.md` — Implement Namespace-based Authorization Strategy
 - `DMS-1058` — `09-design-ownership-token-maintenance.md` — Design Ownership-token maintenance in CMS
 - `DMS-1059` — `10-emit-ownership-column-and-index.md` — Emit the CreatedByOwnershipTokenId column and index
-- `DMS-1060` — `11-ownership-auth-strategy.md` — Implement Ownership-based Authorization Strategy
+- `DMS-1060` — `11-ownership-auth-strategy.md` — Implement Ownership-based Authorization for GET-by-id, POST, PUT, and DELETE
+- `DMS-1410` — `11b-ownership-auth-get-many.md` — Implement Ownership-based Authorization for GET-many
 - `DMS-1061` — `12-view-based-resolve-column-path.md` — Add support for View-based strategy in the ResolveSecurableElementColumnPath function
 - `DMS-1062` — `13-view-based-auth-get-many.md` — Implement View-based Authorization Strategy for GET-many
 - `DMS-1063` — `14-view-based-auth-crud.md` — Implement View-based Authorization Strategy for GET-by-id, POST, PUT, and DELETE
@@ -44,3 +45,7 @@ All authorization stories (design, DDL/provisioning, runtime integration, and te
 - `DMS-1096` — `19-auth-verification-harness.md` — Verification harness for emitted auth DB objects
 - `DMS-1099` — `20-configuration-problem-details` — Implement Security Configuration ProblemDetails
 - `DMS-1207` — `21-token-info-edorg-relational-auth-schema.md` — Convert token_info Education Organization Lookup to Relational Auth Schema
+- `DMS-1362` - `22-namespace-auth-index-prefix-like.md` - Make live Namespace authorization indexes serve prefix `LIKE` on PostgreSQL; prerequisite for tracked namespace index emission
+- `DMS-1372` — `23-store-api-client-ownership-tokens-in-cms.md` — Store and Maintain API-client Ownership Tokens in CMS
+- `DMS-1373` — `24-load-and-cache-api-client-ownership-tokens-from-cms.md` — Load and Cache API-client Ownership Tokens from CMS in DMS
+- `DMS-1374` — `25-ownership-token-operational-lifecycle-spike.md` — Define Ownership-token Operational Lifecycle and Administration

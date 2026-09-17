@@ -16,7 +16,7 @@ namespace EdFi.DataManagementService.Backend.Mssql.Tests.Integration;
 /// <em>extension</em> reference binding through the native <c>ON UPDATE CASCADE</c> foreign key,
 /// and that the extension stamp trigger then bumps the owning root document's
 /// <c>ContentVersion</c>. This is the extension-scope counterpart to
-/// <see cref="MssqlChildBindingIdentityPropagationTests"/> (which covers child-collection
+/// <see cref="Given_A_Provisioned_Mssql_Database_With_A_ClassPeriod_To_BellSchedule_Child_Binding"/> (which covers child-collection
 /// bindings): here the cascade lands in the sample-project root extension table
 /// <c>[sample].[StudentEducationOrganizationAssociationExtension]</c>, whose
 /// <c>FavoriteProgram_RefKey</c> foreign key retains <c>ON UPDATE CASCADE</c> toward the mutable
@@ -108,10 +108,6 @@ public class Given_A_Provisioned_Mssql_Database_With_A_FavoriteProgram_Extension
         var bindingRowsBefore = await QueryFavoriteProgramExtensionRowCountAsync(rootDocumentId);
         var bindingAnchorBefore = await QueryFavoriteProgramExtensionAnchorAsync(rootDocumentId);
         bindingRowsBefore.Should().Be(1);
-
-        // Small delay so a stamp comparison that also checks ContentLastModifiedAt sees a distinct
-        // timestamp.
-        await _database.ExecuteNonQueryAsync("WAITFOR DELAY '00:00:00.050';");
 
         // Act — rename the upstream Program identity column.
         await _database.ExecuteNonQueryAsync(

@@ -10,24 +10,56 @@ namespace EdFi.DataManagementService.Backend;
 
 internal static class OrderedDeleteCommandBuilder
 {
+    private const string DocumentIdParameterName = "@documentId";
+
     private static readonly DbColumnName DocumentIdColumn = new("DocumentId");
 
     public static RelationalCommand BuildResourceDeleteByDocumentIdCommand(
         SqlDialect dialect,
         DbTableName rootTable,
         long documentId
-    )
-    {
-        var rootDeleteSql = $"""
-            DELETE FROM {FormatTable(dialect, rootTable)}
-            WHERE {FormatColumn(dialect, DocumentIdColumn)} = @documentId;
-            """;
-
-        return new RelationalCommand(
-            $"{rootDeleteSql}{Environment.NewLine}{BuildDocumentDeleteByDocumentIdSql(dialect)}",
-            [new RelationalParameter("@documentId", documentId)]
+    ) =>
+        new(
+            BuildResourceRootDeleteByDocumentIdCommand(dialect, rootTable, documentId).CommandText
+                + Environment.NewLine
+                + BuildDocumentDeleteByDocumentIdSql(dialect),
+            [new RelationalParameter(DocumentIdParameterName, documentId)]
         );
-    }
+
+    /// <summary>
+    /// The resource root delete alone. Split out from the combined command so a co-batched delete can emit
+    /// it as its own logical statement: it modifies a table carrying an emitted <c>*_Stamp</c> trigger, so
+    /// it cannot use <c>OUTPUT</c> and needs the builder's sentinel to own a result set.
+    /// </summary>
+    public static RelationalCommand BuildResourceRootDeleteByDocumentIdCommand(
+        SqlDialect dialect,
+        DbTableName rootTable,
+        long documentId
+    ) =>
+        new(
+            $"""
+            DELETE FROM {FormatTable(dialect, rootTable)}
+            WHERE {FormatColumn(
+                dialect,
+                DocumentIdColumn
+            )} = {DocumentIdParameterName}{StatementOptionsSuffix(dialect)};
+            """,
+            [new RelationalParameter(DocumentIdParameterName, documentId)]
+        );
+
+    /// <summary>
+    /// The <c>dms.Document</c> delete alone, returning the deleted id. It carries no trigger, which is the
+    /// only reason this one statement can use <c>RETURNING</c> / <c>OUTPUT</c>; that is a property of the
+    /// current DDL and is not relied on for resource tables.
+    /// </summary>
+    public static RelationalCommand BuildDocumentDeleteByDocumentIdCommand(
+        SqlDialect dialect,
+        long documentId
+    ) =>
+        new(
+            BuildDocumentDeleteByDocumentIdSql(dialect),
+            [new RelationalParameter(DocumentIdParameterName, documentId)]
+        );
 
     public static RelationalCommand BuildDescriptorDeleteCommand(
         SqlDialect dialect,
@@ -64,12 +96,14 @@ internal static class OrderedDeleteCommandBuilder
                     FROM [dms].[Document]
                     WHERE [DocumentUuid] = @documentUuid
                       AND [ResourceKeyId] = @resourceKeyId
-                );
+                )
+                OPTION (KEEPFIXED PLAN);
 
                 DELETE FROM [dms].[Document]
                 OUTPUT DELETED.[DocumentId]
                 WHERE [DocumentUuid] = @documentUuid
-                  AND [ResourceKeyId] = @resourceKeyId;
+                  AND [ResourceKeyId] = @resourceKeyId
+                OPTION (KEEPFIXED PLAN);
                 """,
                 [
                     new RelationalParameter("@documentUuid", documentUuid.Value),
@@ -92,12 +126,22 @@ internal static class OrderedDeleteCommandBuilder
             SqlDialect.Mssql => """
                 DELETE FROM [dms].[Document]
                 OUTPUT DELETED.[DocumentId]
-                WHERE [DocumentId] = @documentId;
+                WHERE [DocumentId] = @documentId
+                OPTION (KEEPFIXED PLAN);
                 """,
             _ => throw new NotSupportedException(
                 $"Relational delete does not support SQL dialect '{dialect}'."
             ),
         };
+
+    /// <summary>
+    /// MSSQL delete plans embed a NO ACTION referential-check apparatus spanning every table that
+    /// references the deleted row's cascade targets, so any auto-stats event on any of those tables
+    /// invalidates the plan. These are fixed unique-key seeks whose optimal plan cannot change;
+    /// KEEPFIXED PLAN suppresses the statistics-driven recompiles. PostgreSQL has no analog.
+    /// </summary>
+    private static string StatementOptionsSuffix(SqlDialect dialect) =>
+        dialect == SqlDialect.Mssql ? $"{Environment.NewLine}OPTION (KEEPFIXED PLAN)" : "";
 
     private static string FormatTable(SqlDialect dialect, DbTableName table) =>
         $"{QuoteIdentifier(dialect, table.Schema.Value)}.{QuoteIdentifier(dialect, table.Name)}";

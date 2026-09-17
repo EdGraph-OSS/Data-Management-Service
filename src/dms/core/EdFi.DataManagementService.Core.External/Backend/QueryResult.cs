@@ -16,7 +16,36 @@ public record QueryResult
     /// </summary>
     /// <param name="EdfiDocs">The documents returned from the query</param>
     /// <param name="TotalCount">The total number of documents returned</param>
-    public record QuerySuccess(JsonArray EdfiDocs, int? TotalCount) : QueryResult();
+    /// <param name="HighestSelectedAnchor">
+    /// The maximum continuation-anchor value in the selected page keyset, or null when page selection
+    /// was skipped or selected no keys, including early-empty paths and zero-size pages. Its units
+    /// follow the anchor the request resolved: ContentVersion for a max-bearing change-version
+    /// window against any data source, and for any windowed shape served from a frozen snapshot;
+    /// DocumentId otherwise, and DocumentId throughout while the
+    /// UseLegacyDocumentIdOrderingForChangeQueries switch is set. Independent of
+    /// <paramref name="EdfiDocs"/>: it can be non-null while the body is empty, because every selected
+    /// row may be deleted before hydration completes.
+    /// </param>
+    /// <remarks>
+    /// There is no companion flag saying whether the maximum may anchor a continuation. Every page that
+    /// selects keys now reports the maximum of the key it was actually ordered by, so a non-null maximum
+    /// always describes where that page ended; the state a flag once distinguished — a page that
+    /// selected keys but was ordered by something the maximum could not express — no longer exists.
+    /// </remarks>
+    public record QuerySuccess(JsonArray EdfiDocs, int? TotalCount, long? HighestSelectedAnchor = null)
+        : QueryResult()
+    {
+        /// <summary>
+        /// No candidate selection command was issued; this empty success is a short-circuit.
+        /// </summary>
+        /// <remarks>
+        /// Defaults to false, so every site that actually selected is already correct — including the
+        /// executed pages that legitimately return nothing. Only the deliberate short-circuits set it
+        /// true. Without it, an empty success from a real selection is indistinguishable from one where
+        /// no command ran at all, and the two are different facts about the request.
+        /// </remarks>
+        public bool SelectionSkipped { get; init; }
+    }
 
     /// <summary>
     /// A known failure from the query handler, likely invalid query terms that

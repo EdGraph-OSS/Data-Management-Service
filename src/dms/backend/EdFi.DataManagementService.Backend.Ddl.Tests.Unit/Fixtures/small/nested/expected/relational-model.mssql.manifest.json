@@ -1,7 +1,7 @@
 {
   "dialect": "mssql",
-  "effective_schema_hash": "c67b3bd7bed6cc1ca82f58951f0636d0c7022eb570a786e7c2c9f1f45b6c0eb1",
-  "relational_mapping_version": "v2",
+  "effective_schema_hash": "ff71fc0b68ec2a97e3df876d47cfc93f8cef81ffe9806bc1c00da52ffd127c3d",
+  "relational_mapping_version": "v3",
   "projects": [
     {
       "project_endpoint_name": "ed-fi",
@@ -39,6 +39,20 @@
       "key_columns": [
         "Discriminator",
         "ContentVersion"
+      ]
+    },
+    {
+      "name": "IX_Descriptor_ResourceKeyId_ContentVersion_DocumentId",
+      "table": {
+        "schema": "dms",
+        "name": "Descriptor"
+      },
+      "kind": "Explicit",
+      "is_unique": false,
+      "key_columns": [
+        "ResourceKeyId",
+        "ContentVersion",
+        "DocumentId"
       ]
     },
     {
@@ -327,6 +341,15 @@
           "is_primary_key": true
         },
         {
+          "role": "DocumentId",
+          "column": "DocumentId",
+          "scalar_type": {
+            "kind": "Int64"
+          },
+          "is_nullable": false,
+          "is_primary_key": false
+        },
+        {
           "role": "CreatedAt",
           "column": "CreatedAt",
           "scalar_type": {
@@ -382,6 +405,15 @@
           },
           "is_nullable": false,
           "is_primary_key": true
+        },
+        {
+          "role": "DocumentId",
+          "column": "DocumentId",
+          "scalar_type": {
+            "kind": "Int64"
+          },
+          "is_nullable": false,
+          "is_primary_key": false
         },
         {
           "role": "CreatedAt",

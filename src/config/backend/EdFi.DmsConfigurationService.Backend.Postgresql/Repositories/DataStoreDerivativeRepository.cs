@@ -3,9 +3,11 @@
 // The Ed-Fi Alliance licenses this file to you under the Apache License, Version 2.0.
 // See the LICENSE and NOTICES files in the project root for more information.
 
+using System.Data;
 using Dapper;
 using EdFi.DmsConfigurationService.Backend.Repositories;
 using EdFi.DmsConfigurationService.Backend.Services;
+using EdFi.DmsConfigurationService.DataModel;
 using EdFi.DmsConfigurationService.DataModel.Infrastructure;
 using EdFi.DmsConfigurationService.DataModel.Model;
 using EdFi.DmsConfigurationService.DataModel.Model.DataStoreDerivative;
@@ -73,7 +75,7 @@ public class DataStoreDerivativeRepository(
                 TenantId,
             };
 
-            var id = await connection.ExecuteScalarAsync<long?>(sql, parameters);
+            var id = await connection.ExecuteScalarAsync<int?>(sql, parameters);
             if (id == null)
             {
                 return new DataStoreDerivativeInsertResult.FailureForeignKeyViolation();
@@ -88,6 +90,22 @@ public class DataStoreDerivativeRepository(
         {
             logger.LogWarning(ex, "Data store not found");
             return new DataStoreDerivativeInsertResult.FailureForeignKeyViolation();
+        }
+        catch (PostgresException ex)
+            when (ex.SqlState == PostgresErrorCodes.UniqueViolation
+                && ex.ConstraintName == "UX_DataStoreDerivative_DataStoreId_DerivativeType"
+            )
+        {
+            logger.LogWarning(
+                ex,
+                "Data store derivative already exists for DataStoreId '{DataStoreId}' and DerivativeType '{DerivativeType}'",
+                command.DataStoreId,
+                LoggingUtility.SanitizeForLog(command.DerivativeType)
+            );
+            return new DataStoreDerivativeInsertResult.FailureDuplicateDataStoreDerivative(
+                command.DataStoreId,
+                command.DerivativeType
+            );
         }
         catch (Exception ex)
         {
@@ -112,8 +130,8 @@ public class DataStoreDerivativeRepository(
                 """;
 
             var results = await connection.QueryAsync<(
-                long Id,
-                long DataStoreId,
+                int Id,
+                int DataStoreId,
                 string DerivativeType,
                 byte[]? ConnectionString
             )>(
@@ -145,7 +163,7 @@ public class DataStoreDerivativeRepository(
         }
     }
 
-    public async Task<DataStoreDerivativeGetResult> GetDataStoreDerivative(long id)
+    public async Task<DataStoreDerivativeGetResult> GetDataStoreDerivative(int id)
     {
         await using var connection = new NpgsqlConnection(databaseOptions.Value.DatabaseConnection);
         try
@@ -158,8 +176,8 @@ public class DataStoreDerivativeRepository(
                 """;
 
             var result = await connection.QuerySingleOrDefaultAsync<(
-                long Id,
-                long DataStoreId,
+                int Id,
+                int DataStoreId,
                 string DerivativeType,
                 byte[]? ConnectionString
             )?>(sql, new { Id = id, TenantId });
@@ -196,9 +214,19 @@ public class DataStoreDerivativeRepository(
         await connection.OpenAsync();
         try
         {
+            bool preserveConnectionString = ConnectionStringWrite.PreservesExistingValue(
+                command.ConnectionString
+            );
+
+            // Left out of the SET clause when the caller provided no connection string, so the row
+            // keeps the cipher text a reader can still decrypt.
+            string connectionStringAssignment = preserveConnectionString
+                ? string.Empty
+                : "\"ConnectionString\" = @ConnectionString, ";
+
             var sql = $"""
                 UPDATE "dmscs"."DataStoreDerivative" dd
-                SET "DataStoreId" = @DataStoreId, "DerivativeType" = @DerivativeType, "ConnectionString" = @ConnectionString,
+                SET "DataStoreId" = @DataStoreId, "DerivativeType" = @DerivativeType, {connectionStringAssignment}
                     "LastModifiedAt" = @LastModifiedAt, "ModifiedBy" = @ModifiedBy
                 FROM "dmscs"."DataStore" ds
                 WHERE dd."Id" = @Id
@@ -210,16 +238,27 @@ public class DataStoreDerivativeRepository(
                   );
                 """;
 
-            var parameters = new
+            var parameters = new DynamicParameters(
+                new
+                {
+                    command.Id,
+                    command.DataStoreId,
+                    command.DerivativeType,
+                    LastModifiedAt = auditContext.GetCurrentTimestamp(),
+                    ModifiedBy = auditContext.GetCurrentUser(),
+                    TenantId,
+                }
+            );
+
+            if (!preserveConnectionString)
             {
-                command.Id,
-                command.DataStoreId,
-                command.DerivativeType,
-                ConnectionString = encryptionService.Encrypt(command.ConnectionString),
-                LastModifiedAt = auditContext.GetCurrentTimestamp(),
-                ModifiedBy = auditContext.GetCurrentUser(),
-                TenantId,
-            };
+                // Typed explicitly: a null byte[] carries no type the provider can infer.
+                parameters.Add(
+                    "ConnectionString",
+                    encryptionService.Encrypt(command.ConnectionString),
+                    DbType.Binary
+                );
+            }
 
             var affectedRows = await connection.ExecuteAsync(sql, parameters);
             if (affectedRows == 0)
@@ -243,6 +282,22 @@ public class DataStoreDerivativeRepository(
             logger.LogWarning(ex, "Data store not found");
             return new DataStoreDerivativeUpdateResult.FailureForeignKeyViolation();
         }
+        catch (PostgresException ex)
+            when (ex.SqlState == PostgresErrorCodes.UniqueViolation
+                && ex.ConstraintName == "UX_DataStoreDerivative_DataStoreId_DerivativeType"
+            )
+        {
+            logger.LogWarning(
+                ex,
+                "Data store derivative already exists for DataStoreId '{DataStoreId}' and DerivativeType '{DerivativeType}'",
+                command.DataStoreId,
+                LoggingUtility.SanitizeForLog(command.DerivativeType)
+            );
+            return new DataStoreDerivativeUpdateResult.FailureDuplicateDataStoreDerivative(
+                command.DataStoreId,
+                command.DerivativeType
+            );
+        }
         catch (Exception ex)
         {
             logger.LogError(ex, "Update DataStoreDerivative failure");
@@ -250,7 +305,7 @@ public class DataStoreDerivativeRepository(
         }
     }
 
-    public async Task<DataStoreDerivativeDeleteResult> DeleteDataStoreDerivative(long id)
+    public async Task<DataStoreDerivativeDeleteResult> DeleteDataStoreDerivative(int id)
     {
         await using var connection = new NpgsqlConnection(databaseOptions.Value.DatabaseConnection);
         try
@@ -279,7 +334,7 @@ public class DataStoreDerivativeRepository(
     }
 
     public async Task<DataStoreDerivativeQueryByDataStoreResult> GetDataStoreDerivativesByDataStore(
-        long dataStoreId
+        int dataStoreId
     )
     {
         await using var connection = new NpgsqlConnection(databaseOptions.Value.DatabaseConnection);
@@ -294,8 +349,8 @@ public class DataStoreDerivativeRepository(
                 """;
 
             var results = await connection.QueryAsync<(
-                long Id,
-                long DataStoreId,
+                int Id,
+                int DataStoreId,
                 string DerivativeType,
                 byte[]? ConnectionString
             )>(sql, new { DataStoreId = dataStoreId, TenantId });
@@ -320,7 +375,7 @@ public class DataStoreDerivativeRepository(
     }
 
     public async Task<DataStoreDerivativeQueryByDataStoreIdsResult> GetDataStoreDerivativesByDataStoreIds(
-        List<long> dataStoreIds
+        List<int> dataStoreIds
     )
     {
         await using var connection = new NpgsqlConnection(databaseOptions.Value.DatabaseConnection);
@@ -335,8 +390,8 @@ public class DataStoreDerivativeRepository(
                 """;
 
             var results = await connection.QueryAsync<(
-                long Id,
-                long DataStoreId,
+                int Id,
+                int DataStoreId,
                 string DerivativeType,
                 byte[]? ConnectionString
             )>(sql, new { DataStoreIds = dataStoreIds, TenantId });
@@ -360,7 +415,7 @@ public class DataStoreDerivativeRepository(
         }
     }
 
-    private async Task<bool> DerivativeExistsForTenant(NpgsqlConnection connection, long id)
+    private async Task<bool> DerivativeExistsForTenant(NpgsqlConnection connection, int id)
     {
         var sql = $"""
             SELECT COUNT(1) FROM "dmscs"."DataStoreDerivative" dd

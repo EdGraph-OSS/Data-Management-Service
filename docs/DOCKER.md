@@ -30,11 +30,26 @@ OAUTH_TOKEN_ENDPOINT=<Authentication service url>
 BYPASS_TYPE_COERCION=<Boolean whether to bypass all schema-guided request value type coercion. This includes boolean strings, numeric strings, and boolean numeric aliases. Eg. "true" = true and 1 = true for schema boolean fields>
 DATABASE_ISOLATION_LEVEL=<The System.Data.IsolationLevel to use for transaction locking. Eg. RepeatableRead>
 ALLOW_IDENTITY_UPDATE_OVERRIDES=<Comma separated list of resource names that allow identity updates, overriding the default behavior to reject identity updates. Eg "accountabilityRatings,bellSchedules">
-FAILURE_RATIO=<decimal between 0 and 1 indicating the failure to success ratio at which the backend circuit breaker will break. Eg. 0.1 represents 10%>
-SAMPLING_DURATION_SECONDS=<This is the duration in seconds of the sampling over which failure ratios are assessed. Eg. 10>
-MINIMUM_THROUGHPUT=<Integer, this many actions or more must pass through the circuit in the time-slice, for statistics to be considered significant and the circuit-breaker to come into action. The minimum value is 2.>
-BREAK_DURATION_SECONDS=<The number of seconds a broken circuit will stay open before resetting. Eg. 30>
+USE_LEGACY_DOCUMENT_ID_ORDERING_FOR_CHANGE_QUERIES=<Boolean, restores legacy DocumentId ordering for change-version-filtered queries (maps to AppSettings__UseLegacyDocumentIdOrderingForChangeQueries). Default: false>
+FAILURE_RATIO=<decimal greater than 0 and at most 1 indicating the failure to success ratio at which the backend circuit breaker will break. Eg. 0.1 represents 10%. A value of 0 is rejected at startup.>
+SAMPLING_DURATION_SECONDS=<This is the duration in seconds of the sampling over which failure ratios are assessed. From 0.5 to 86400 inclusive, and long enough to accumulate MINIMUM_THROUGHPUT calls at the deployment's quietest sustained request rate, or the circuit can never open. Eg. 120>
+MINIMUM_THROUGHPUT=<Integer, this many actions or more must pass through the circuit in the time-slice, for statistics to be considered significant and the circuit-breaker to come into action. The minimum accepted value is 2, but keep FAILURE_RATIO multiplied by MINIMUM_THROUGHPUT above 1 so a single failed request cannot open the circuit.>
+BREAK_DURATION_SECONDS=<The number of seconds a broken circuit will stay open before resetting. From 0.5 to 86400 inclusive. Eg. 30>
 ```
+
+OTLP log export is also available, disabled by default, through the
+`OtlpLogging` configuration section. The compose files forward the core keys
+from `.env`: `OTLP_LOGGING_ENABLED`, `OTLP_LOGGING_ENDPOINT`,
+`OTLP_LOGGING_PROTOCOL`, and `OTLP_LOGGING_DEPLOYMENT_ENVIRONMENT` for DMS,
+with `DMS_CONFIG_`-prefixed equivalents for CMS. The remaining `OtlpLogging`
+keys are not forwarded from `.env`: `ServiceName`, `ServiceVersion`, and
+`ServiceInstanceId` have sensible per-service defaults, and
+`OtlpLogging__Headers__*` names are arbitrary keys. To override any of them,
+add the corresponding `OtlpLogging__<Key>` variable to the compose service's
+`environment` map directly. See
+[LOGGING.md](./LOGGING.md#otlp-export) and
+[CONFIGURATION.md](./CONFIGURATION.md#otlplogging) for details, including the
+security guidance for the export path.
 
 For example, you might have a `.env` file like the following:
 
@@ -48,8 +63,8 @@ BYPASS_TYPE_COERCION=false
 DATABASE_ISOLATION_LEVEL=RepeatableRead
 ALLOW_IDENTITY_UPDATE_OVERRIDES=""
 FAILURE_RATIO=0.1
-SAMPLING_DURATION_SECONDS=10
-MINIMUM_THROUGHPUT=2
+SAMPLING_DURATION_SECONDS=120
+MINIMUM_THROUGHPUT=20
 BREAK_DURATION_SECONDS=30
 ```
 
@@ -100,6 +115,8 @@ These will be replaced with the corresponding keycloak or self-contained values 
 | `IdentityProvider`                 | Selects the identity provider                                    | `keycloak`                                           | `self-contained`                              |
 | `Authority`                        | URL of the identity provider's authority (issuer)                | `http://dms-keycloak:8080/realms/edfi`              | `http://ed-fi-api-config:8081`              |
 | `EncryptionKey`                    | Key used for token encryption (self-contained only)              | _(not used)_                                         | `QWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo0NTY3ODkwMTIz` |
+| `TokenCleanupEnabled`              | Enables the expired-token cleanup sweep (self-contained only)    | _(not used)_                                         | `true`                                        |
+| `TokenCleanupIntervalMinutes`      | Minutes between expired-token cleanup sweeps (self-contained only) | _(not used)_                                       | `30`                                          |
 
 **JwtAuthentication parameters in `appsettings.json` (dms):**
 

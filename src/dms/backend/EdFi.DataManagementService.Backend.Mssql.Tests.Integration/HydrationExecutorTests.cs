@@ -8,6 +8,7 @@ using EdFi.DataManagementService.Backend.External.Plans;
 using EdFi.DataManagementService.Backend.Plans;
 using EdFi.DataManagementService.Backend.Tests.Common;
 using EdFi.DataManagementService.Backend.Tests.Integration.Common;
+using EdFi.DataManagementService.Core.External.Model;
 using FluentAssertions;
 using Microsoft.Data.SqlClient;
 using NUnit.Framework;
@@ -51,9 +52,7 @@ public class Given_A_Page_With_Multiple_Documents_Mssql
                 DocumentUuid uniqueidentifier NOT NULL,
                 ResourceKeyId smallint NOT NULL DEFAULT 0,
                 ContentVersion bigint NOT NULL DEFAULT 1,
-                IdentityVersion bigint NOT NULL DEFAULT 1,
                 ContentLastModifiedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset(),
-                IdentityLastModifiedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset(),
                 CreatedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset()
             );
 
@@ -83,10 +82,10 @@ public class Given_A_Page_With_Multiple_Documents_Mssql
         await ExecuteSql(
             connection,
             """
-            INSERT INTO dms.Document (DocumentId, DocumentUuid, ContentVersion, IdentityVersion)
+            INSERT INTO dms.Document (DocumentId, DocumentUuid, ContentVersion)
             VALUES
-                (101, 'aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa', 10, 10),
-                (102, 'bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb', 20, 20);
+                (101, 'aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa', 10),
+                (102, 'bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb', 20);
 
             INSERT INTO hydtest.School (DocumentId, SchoolId)
             VALUES
@@ -127,7 +126,8 @@ public class Given_A_Page_With_Multiple_Documents_Mssql
                 ],
                 TotalCountParametersInOrder: null
             ),
-            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L }
+            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L },
+            PageOrderingMode.DocumentId
         );
 
         await using var hydrationConnection = new SqlConnection(_connectionString);
@@ -315,9 +315,7 @@ public class Given_A_Single_DocumentId_Keyset_Mssql
                 DocumentUuid uniqueidentifier NOT NULL,
                 ResourceKeyId smallint NOT NULL DEFAULT 0,
                 ContentVersion bigint NOT NULL DEFAULT 1,
-                IdentityVersion bigint NOT NULL DEFAULT 1,
                 ContentLastModifiedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset(),
-                IdentityLastModifiedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset(),
                 CreatedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset()
             );
 
@@ -468,9 +466,7 @@ public class Given_A_Query_With_TotalCount_Requested_Mssql
                 DocumentUuid uniqueidentifier NOT NULL,
                 ResourceKeyId smallint NOT NULL DEFAULT 0,
                 ContentVersion bigint NOT NULL DEFAULT 1,
-                IdentityVersion bigint NOT NULL DEFAULT 1,
                 ContentLastModifiedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset(),
-                IdentityLastModifiedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset(),
                 CreatedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset()
             );
 
@@ -527,7 +523,8 @@ public class Given_A_Query_With_TotalCount_Requested_Mssql
                 ],
                 TotalCountParametersInOrder: []
             ),
-            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 2L }
+            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 2L },
+            PageOrderingMode.DocumentId
         );
 
         await using var hydrationConnection = new SqlConnection(_connectionString);
@@ -607,9 +604,7 @@ public class Given_A_Reference_Bearing_Resource_Mssql
                 DocumentUuid uniqueidentifier NOT NULL,
                 ResourceKeyId smallint NOT NULL DEFAULT 0,
                 ContentVersion bigint NOT NULL DEFAULT 1,
-                IdentityVersion bigint NOT NULL DEFAULT 1,
                 ContentLastModifiedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset(),
-                IdentityLastModifiedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset(),
                 CreatedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset()
             );
 
@@ -657,7 +652,8 @@ public class Given_A_Reference_Bearing_Resource_Mssql
                 ],
                 TotalCountParametersInOrder: null
             ),
-            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L }
+            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L },
+            PageOrderingMode.DocumentId
         );
 
         await using var hydrationConnection = new SqlConnection(_connectionString);
@@ -777,6 +773,913 @@ public class Given_A_Reference_Bearing_Resource_Mssql
         var projections = ReferenceIdentityProjector.ProjectTable(hydratedRows, projectionPlan);
 
         projections.Should().NotContainKey(402L);
+    }
+
+    private static async Task ExecuteSql(SqlConnection connection, string sql)
+    {
+        await using var cmd = new SqlCommand(sql, connection);
+        await cmd.ExecuteNonQueryAsync();
+    }
+}
+
+[TestFixture]
+[Category(MssqlCiShards.Shard4)]
+public class Given_HydrationExecutor_Single_Document_Fast_Path_With_DescriptorProjection_And_DocumentReferenceLookup_Mssql
+{
+    private const string TestSchema = "hydfastpath";
+    private const long ResourceDocumentId = 10001L;
+    private static readonly PageKeysetSpec.Single _keyset = new(ResourceDocumentId);
+    private static readonly HydrationExecutionOptions _keysetOptions = new(
+        IncludeDescriptorProjection: true,
+        IncludeDocumentReferenceLookup: true,
+        UseSingleDocumentFastPath: false
+    );
+    private static readonly HydrationExecutionOptions _fastPathOptions = new(
+        IncludeDescriptorProjection: true,
+        IncludeDocumentReferenceLookup: true,
+        UseSingleDocumentFastPath: true
+    );
+
+    private string _databaseName = null!;
+    private string _connectionString = null!;
+    private ResourceReadPlan _plan = null!;
+    private HydratedPage _keysetResult = null!;
+    private HydratedPage _fastPathResult = null!;
+    private string _keysetBatchSql = null!;
+    private string _fastPathBatchSql = null!;
+
+    [OneTimeSetUp]
+    public async Task OneTimeSetUp()
+    {
+        if (!MssqlTestDatabaseHelper.IsConfigured())
+        {
+            Assert.Ignore("MSSQL connection string not configured.");
+        }
+
+        _databaseName = MssqlTestDatabaseHelper.GenerateUniqueDatabaseName();
+        MssqlTestDatabaseHelper.CreateDatabase(_databaseName);
+        _connectionString = MssqlTestDatabaseHelper.BuildConnectionString(_databaseName);
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await ExecuteSql(
+            connection,
+            """
+            IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = 'dms') EXEC('CREATE SCHEMA [dms]');
+            IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = 'hydfastpath') EXEC('CREATE SCHEMA [hydfastpath]');
+
+            CREATE TABLE dms.Document (
+                DocumentId bigint PRIMARY KEY,
+                DocumentUuid uniqueidentifier NOT NULL,
+                ResourceKeyId smallint NOT NULL DEFAULT 0,
+                ContentVersion bigint NOT NULL DEFAULT 1,
+                ContentLastModifiedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset(),
+                CreatedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset()
+            );
+
+            CREATE TABLE dms.Descriptor (
+                DocumentId bigint PRIMARY KEY,
+                Namespace varchar(255) NOT NULL DEFAULT '',
+                CodeValue varchar(50) NOT NULL DEFAULT '',
+                ShortDescription varchar(75) NOT NULL DEFAULT '',
+                Description varchar(1024) NULL,
+                EffectiveBeginDate date NULL,
+                EffectiveEndDate date NULL,
+                Discriminator varchar(128) NOT NULL DEFAULT '',
+                Uri varchar(306) NOT NULL
+            );
+
+            CREATE TABLE hydfastpath.StudentSchoolAssociation (
+                DocumentId bigint PRIMARY KEY,
+                School_DocumentId bigint NULL,
+                School_SchoolId bigint NULL,
+                EntryGradeLevelDescriptor_DescriptorId bigint NULL
+            );
+
+            CREATE TABLE hydfastpath.StudentSchoolAssociationProgram (
+                CollectionItemId bigint PRIMARY KEY,
+                StudentSchoolAssociation_DocumentId bigint NOT NULL REFERENCES hydfastpath.StudentSchoolAssociation(DocumentId),
+                Ordinal int NOT NULL,
+                Program_DocumentId bigint NULL,
+                Program_ProgramName varchar(100) NULL,
+                ProgramTypeDescriptor_DescriptorId bigint NULL
+            );
+            """
+        );
+
+        await ExecuteSql(
+            connection,
+            """
+            INSERT INTO dms.Document (DocumentId, DocumentUuid, ResourceKeyId, ContentVersion)
+            VALUES
+                (10001, '00000000-0000-0000-0000-000000010001', 1, 11),
+                (10002, '00000000-0000-0000-0000-000000010002', 1, 12),
+                (11001, '00000000-0000-0000-0000-000000011001', 2, 1),
+                (11002, '00000000-0000-0000-0000-000000011002', 3, 1),
+                (11003, '00000000-0000-0000-0000-000000011003', 4, 1),
+                (12001, '00000000-0000-0000-0000-000000012001', 5, 1),
+                (12002, '00000000-0000-0000-0000-000000012002', 6, 1),
+                (12003, '00000000-0000-0000-0000-000000012003', 7, 1);
+
+            INSERT INTO dms.Descriptor (DocumentId, Namespace, CodeValue, ShortDescription, Discriminator, Uri)
+            VALUES
+                (12001, 'uri://ed-fi.org/GradeLevelDescriptor', 'Ninth grade', 'Ninth grade', 'edfi.GradeLevelDescriptor', 'uri://ed-fi.org/GradeLevelDescriptor#Ninth grade'),
+                (12002, 'uri://ed-fi.org/ProgramTypeDescriptor', 'Gifted', 'Gifted', 'edfi.ProgramTypeDescriptor', 'uri://ed-fi.org/ProgramTypeDescriptor#Gifted'),
+                (12003, 'uri://ed-fi.org/GradeLevelDescriptor', 'Tenth grade', 'Tenth grade', 'edfi.GradeLevelDescriptor', 'uri://ed-fi.org/GradeLevelDescriptor#Tenth grade');
+
+            INSERT INTO hydfastpath.StudentSchoolAssociation
+                (DocumentId, School_DocumentId, School_SchoolId, EntryGradeLevelDescriptor_DescriptorId)
+            VALUES
+                (10001, 11001, 255901, 12001),
+                (10002, 11003, 255902, 12003);
+
+            INSERT INTO hydfastpath.StudentSchoolAssociationProgram
+                (CollectionItemId, StudentSchoolAssociation_DocumentId, Ordinal, Program_DocumentId, Program_ProgramName, ProgramTypeDescriptor_DescriptorId)
+            VALUES
+                (20001, 10001, 0, 11002, 'Gifted', 12002),
+                (20002, 10001, 1, NULL, NULL, NULL),
+                (20003, 10002, 0, 11003, 'Other', 12003);
+            """
+        );
+
+        _plan = BuildReadPlan();
+        _keysetBatchSql = HydrationBatchBuilder.Build(_plan, _keyset, SqlDialect.Mssql, _keysetOptions);
+        _fastPathBatchSql = HydrationBatchBuilder.Build(_plan, _keyset, SqlDialect.Mssql, _fastPathOptions);
+
+        await using var keysetConnection = new SqlConnection(_connectionString);
+        await keysetConnection.OpenAsync();
+        _keysetResult = await HydrationExecutor.ExecuteAsync(
+            keysetConnection,
+            _plan,
+            _keyset,
+            SqlDialect.Mssql,
+            _keysetOptions,
+            CancellationToken.None
+        );
+
+        await using var fastPathConnection = new SqlConnection(_connectionString);
+        await fastPathConnection.OpenAsync();
+        _fastPathResult = await HydrationExecutor.ExecuteAsync(
+            fastPathConnection,
+            _plan,
+            _keyset,
+            SqlDialect.Mssql,
+            _fastPathOptions,
+            CancellationToken.None
+        );
+    }
+
+    [OneTimeTearDown]
+    public void OneTimeTearDown()
+    {
+        if (_databaseName is not null && MssqlTestDatabaseHelper.IsConfigured())
+        {
+            MssqlTestDatabaseHelper.DropDatabaseIfExists(_databaseName);
+        }
+    }
+
+    [Test]
+    public void It_generates_a_batch_without_the_page_temp_table()
+    {
+        _fastPathBatchSql.Should().NotContain("[#page]");
+        _fastPathBatchSql.Should().NotContain("CREATE TABLE");
+        _fastPathBatchSql.Should().NotContain("DROP TABLE");
+    }
+
+    [Test]
+    public void It_generates_a_keyset_batch_that_does_use_the_page_temp_table()
+    {
+        _keysetBatchSql.Should().Contain("[#page]");
+    }
+
+    [Test]
+    public void It_generates_different_batch_sql_for_the_keyset_and_fast_paths()
+    {
+        _fastPathBatchSql.Should().NotBe(_keysetBatchSql);
+    }
+
+    [Test]
+    public void It_matches_the_existing_keyset_hydration_result()
+    {
+        AssertHydratedPagesMatch(_keysetResult, _fastPathResult);
+    }
+
+    [Test]
+    public void It_filters_child_descriptor_and_lookup_rows_to_the_single_document()
+    {
+        _fastPathResult.DocumentMetadata.Should().ContainSingle();
+        _fastPathResult.DocumentMetadata[0].DocumentId.Should().Be(ResourceDocumentId);
+
+        var childRows = _fastPathResult.TableRowsInDependencyOrder[1].Rows;
+        childRows.Should().HaveCount(2);
+        childRows.Select(row => (long)row[1]!).Should().Equal(ResourceDocumentId, ResourceDocumentId);
+        childRows.Select(row => row[5]).Should().Equal(12002L, null);
+
+        _fastPathResult
+            .DescriptorRowsInPlanOrder.Should()
+            .ContainSingle()
+            .Which.Rows.Select(row => row.DescriptorId)
+            .Should()
+            .Equal(12001L, 12002L);
+
+        var documentReferenceLookup = _fastPathResult.DocumentReferenceLookup;
+
+        documentReferenceLookup.Should().NotBeNull();
+        documentReferenceLookup!.Rows.Select(row => row.DocumentId).Should().Equal(11001L, 11002L);
+    }
+
+    private static ResourceReadPlan BuildReadPlan()
+    {
+        var schema = new DbSchemaName(TestSchema);
+        var rootTableName = new DbTableName(schema, "StudentSchoolAssociation");
+        var childTableName = new DbTableName(schema, "StudentSchoolAssociationProgram");
+
+        var schoolReferencePath = new JsonPathExpression(
+            "$.schoolReference",
+            [new JsonPathSegment.Property("schoolReference")]
+        );
+        var schoolIdPath = new JsonPathExpression(
+            "$.schoolReference.schoolId",
+            [new JsonPathSegment.Property("schoolReference"), new JsonPathSegment.Property("schoolId")]
+        );
+        var entryGradePath = new JsonPathExpression(
+            "$.entryGradeLevelDescriptor",
+            [new JsonPathSegment.Property("entryGradeLevelDescriptor")]
+        );
+        var programsPath = new JsonPathExpression(
+            "$.programs[*]",
+            [new JsonPathSegment.Property("programs"), new JsonPathSegment.AnyArrayElement()]
+        );
+        var programReferencePath = new JsonPathExpression(
+            "$.programs[*].programReference",
+            [
+                new JsonPathSegment.Property("programs"),
+                new JsonPathSegment.AnyArrayElement(),
+                new JsonPathSegment.Property("programReference"),
+            ]
+        );
+        var programNamePath = new JsonPathExpression(
+            "$.programs[*].programReference.programName",
+            [
+                new JsonPathSegment.Property("programs"),
+                new JsonPathSegment.AnyArrayElement(),
+                new JsonPathSegment.Property("programReference"),
+                new JsonPathSegment.Property("programName"),
+            ]
+        );
+        var programTypeDescriptorPath = new JsonPathExpression(
+            "$.programs[*].programTypeDescriptor",
+            [
+                new JsonPathSegment.Property("programs"),
+                new JsonPathSegment.AnyArrayElement(),
+                new JsonPathSegment.Property("programTypeDescriptor"),
+            ]
+        );
+
+        var schoolResource = new QualifiedResourceName("Ed-Fi", "School");
+        var programResource = new QualifiedResourceName("Ed-Fi", "Program");
+        var gradeLevelDescriptorResource = new QualifiedResourceName("Ed-Fi", "GradeLevelDescriptor");
+        var programTypeDescriptorResource = new QualifiedResourceName("Ed-Fi", "ProgramTypeDescriptor");
+
+        var rootTable = new DbTableModel(
+            Table: rootTableName,
+            JsonScope: new JsonPathExpression("$", []),
+            Key: new TableKey(
+                ConstraintName: "PK_StudentSchoolAssociation",
+                Columns: [new DbKeyColumn(new DbColumnName("DocumentId"), ColumnKind.ParentKeyPart)]
+            ),
+            Columns:
+            [
+                CreateColumn("DocumentId", ColumnKind.ParentKeyPart, ScalarKind.Int64, false, null, null),
+                CreateColumn(
+                    "School_DocumentId",
+                    ColumnKind.DocumentFk,
+                    ScalarKind.Int64,
+                    true,
+                    schoolReferencePath,
+                    schoolResource
+                ),
+                CreateColumn(
+                    "School_SchoolId",
+                    ColumnKind.Scalar,
+                    ScalarKind.Int64,
+                    true,
+                    schoolIdPath,
+                    null
+                ),
+                CreateColumn(
+                    "EntryGradeLevelDescriptor_DescriptorId",
+                    ColumnKind.DescriptorFk,
+                    ScalarKind.Int64,
+                    true,
+                    entryGradePath,
+                    gradeLevelDescriptorResource
+                ),
+            ],
+            Constraints: []
+        )
+        {
+            IdentityMetadata = new DbTableIdentityMetadata(
+                TableKind: DbTableKind.Root,
+                PhysicalRowIdentityColumns: [],
+                RootScopeLocatorColumns: [new DbColumnName("DocumentId")],
+                ImmediateParentScopeLocatorColumns: [],
+                SemanticIdentityBindings: []
+            ),
+        };
+
+        var childTable = new DbTableModel(
+            Table: childTableName,
+            JsonScope: programsPath,
+            Key: new TableKey(
+                ConstraintName: "PK_StudentSchoolAssociationProgram",
+                Columns:
+                [
+                    new DbKeyColumn(
+                        new DbColumnName("StudentSchoolAssociation_DocumentId"),
+                        ColumnKind.ParentKeyPart
+                    ),
+                    new DbKeyColumn(new DbColumnName("Ordinal"), ColumnKind.Ordinal),
+                ]
+            ),
+            Columns:
+            [
+                CreateColumn(
+                    "CollectionItemId",
+                    ColumnKind.CollectionKey,
+                    ScalarKind.Int64,
+                    false,
+                    null,
+                    null
+                ),
+                CreateColumn(
+                    "StudentSchoolAssociation_DocumentId",
+                    ColumnKind.ParentKeyPart,
+                    ScalarKind.Int64,
+                    false,
+                    null,
+                    null
+                ),
+                CreateColumn("Ordinal", ColumnKind.Ordinal, ScalarKind.Int32, false, null, null),
+                CreateColumn(
+                    "Program_DocumentId",
+                    ColumnKind.DocumentFk,
+                    ScalarKind.Int64,
+                    true,
+                    programReferencePath,
+                    programResource
+                ),
+                CreateColumn(
+                    "Program_ProgramName",
+                    ColumnKind.Scalar,
+                    ScalarKind.String,
+                    true,
+                    programNamePath,
+                    null
+                ),
+                CreateColumn(
+                    "ProgramTypeDescriptor_DescriptorId",
+                    ColumnKind.DescriptorFk,
+                    ScalarKind.Int64,
+                    true,
+                    programTypeDescriptorPath,
+                    programTypeDescriptorResource
+                ),
+            ],
+            Constraints: []
+        )
+        {
+            IdentityMetadata = new DbTableIdentityMetadata(
+                TableKind: DbTableKind.Collection,
+                PhysicalRowIdentityColumns: [new DbColumnName("CollectionItemId")],
+                RootScopeLocatorColumns: [new DbColumnName("StudentSchoolAssociation_DocumentId")],
+                ImmediateParentScopeLocatorColumns: [new DbColumnName("StudentSchoolAssociation_DocumentId")],
+                SemanticIdentityBindings: []
+            ),
+        };
+
+        var model = new RelationalResourceModel(
+            Resource: new QualifiedResourceName("Ed-Fi", "StudentSchoolAssociation"),
+            PhysicalSchema: schema,
+            StorageKind: ResourceStorageKind.RelationalTables,
+            Root: rootTable,
+            TablesInDependencyOrder: [rootTable, childTable],
+            DocumentReferenceBindings:
+            [
+                new DocumentReferenceBinding(
+                    IsIdentityComponent: true,
+                    ReferenceObjectPath: schoolReferencePath,
+                    Table: rootTableName,
+                    FkColumn: new DbColumnName("School_DocumentId"),
+                    TargetResource: schoolResource,
+                    IdentityBindings:
+                    [
+                        new ReferenceIdentityBinding(
+                            IdentityJsonPath: schoolIdPath,
+                            ReferenceJsonPath: schoolIdPath,
+                            Column: new DbColumnName("School_SchoolId")
+                        ),
+                    ]
+                ),
+                new DocumentReferenceBinding(
+                    IsIdentityComponent: false,
+                    ReferenceObjectPath: programReferencePath,
+                    Table: childTableName,
+                    FkColumn: new DbColumnName("Program_DocumentId"),
+                    TargetResource: programResource,
+                    IdentityBindings:
+                    [
+                        new ReferenceIdentityBinding(
+                            IdentityJsonPath: programNamePath,
+                            ReferenceJsonPath: programNamePath,
+                            Column: new DbColumnName("Program_ProgramName")
+                        ),
+                    ]
+                ),
+            ],
+            DescriptorEdgeSources:
+            [
+                new DescriptorEdgeSource(
+                    IsIdentityComponent: false,
+                    DescriptorValuePath: entryGradePath,
+                    Table: rootTableName,
+                    FkColumn: new DbColumnName("EntryGradeLevelDescriptor_DescriptorId"),
+                    DescriptorResource: gradeLevelDescriptorResource
+                ),
+                new DescriptorEdgeSource(
+                    IsIdentityComponent: false,
+                    DescriptorValuePath: programTypeDescriptorPath,
+                    Table: childTableName,
+                    FkColumn: new DbColumnName("ProgramTypeDescriptor_DescriptorId"),
+                    DescriptorResource: programTypeDescriptorResource
+                ),
+            ]
+        );
+
+        return new ReadPlanCompiler(SqlDialect.Mssql).Compile(model);
+    }
+
+    private static DbColumnModel CreateColumn(
+        string name,
+        ColumnKind kind,
+        ScalarKind scalarKind,
+        bool isNullable,
+        JsonPathExpression? sourceJsonPath,
+        QualifiedResourceName? targetResource
+    ) =>
+        new(
+            ColumnName: new DbColumnName(name),
+            Kind: kind,
+            ScalarType: scalarKind is ScalarKind.String
+                ? new RelationalScalarType(scalarKind, MaxLength: 100)
+                : new RelationalScalarType(scalarKind),
+            IsNullable: isNullable,
+            SourceJsonPath: sourceJsonPath,
+            TargetResource: targetResource
+        );
+
+    private static void AssertHydratedPagesMatch(HydratedPage expected, HydratedPage actual)
+    {
+        actual.TotalCount.Should().Be(expected.TotalCount);
+        actual.DocumentMetadata.Should().Equal(expected.DocumentMetadata);
+        actual.TableRowsInDependencyOrder.Should().HaveCount(expected.TableRowsInDependencyOrder.Count);
+
+        for (var tableIndex = 0; tableIndex < expected.TableRowsInDependencyOrder.Count; tableIndex++)
+        {
+            var expectedRows = expected.TableRowsInDependencyOrder[tableIndex].Rows;
+            var actualRows = actual.TableRowsInDependencyOrder[tableIndex].Rows;
+
+            actualRows.Should().HaveCount(expectedRows.Count);
+
+            for (var rowIndex = 0; rowIndex < expectedRows.Count; rowIndex++)
+            {
+                actualRows[rowIndex].Should().Equal(expectedRows[rowIndex]);
+            }
+        }
+
+        actual.DescriptorRowsInPlanOrder.Should().HaveCount(expected.DescriptorRowsInPlanOrder.Count);
+
+        for (var planIndex = 0; planIndex < expected.DescriptorRowsInPlanOrder.Count; planIndex++)
+        {
+            actual
+                .DescriptorRowsInPlanOrder[planIndex]
+                .Rows.Should()
+                .Equal(expected.DescriptorRowsInPlanOrder[planIndex].Rows);
+        }
+
+        actual.DocumentReferenceLookup.Should().NotBeNull();
+        expected.DocumentReferenceLookup.Should().NotBeNull();
+        actual.DocumentReferenceLookup!.Rows.Should().Equal(expected.DocumentReferenceLookup!.Rows);
+    }
+
+    private static async Task ExecuteSql(SqlConnection connection, string sql)
+    {
+        await using var cmd = new SqlCommand(sql, connection);
+        await cmd.ExecuteNonQueryAsync();
+    }
+}
+
+/// <summary>
+/// The keyset materialization's <c>OUTPUT INSERTED</c> clause carries the selected page keyset out of
+/// hydration on the same command that hydrates it. These cases run the real batch against SQL Server,
+/// because the clause is only valid if the server accepts it.
+/// </summary>
+[TestFixture]
+[Category(MssqlCiShards.Shard4)]
+public class Given_A_Mssql_Query_Keyset_That_Returns_Its_Selected_Ids
+{
+    private string _databaseName = null!;
+    private string _connectionString = null!;
+
+    private const string TestSchema = "hydselected";
+
+    /// <summary>
+    /// Sparse ids, so a maximum cannot be confused with a count or a row position.
+    /// </summary>
+    private const long FirstDocumentId = 501L;
+    private const long SecondDocumentId = 509L;
+    private const long ThirdDocumentId = 517L;
+
+    /// <summary>
+    /// Content versions that run counter to the ids and share no value with them, so an anchored page's
+    /// maximum cannot be mistaken for a <c>DocumentId</c>, a count, or the last returned row.
+    /// </summary>
+    private const long FirstDocumentContentVersion = 73L;
+    private const long SecondDocumentContentVersion = 61L;
+    private const long ThirdDocumentContentVersion = 67L;
+
+    [OneTimeSetUp]
+    public async Task OneTimeSetUp()
+    {
+        if (!MssqlTestDatabaseHelper.IsConfigured())
+        {
+            Assert.Ignore("MSSQL connection string not configured.");
+        }
+
+        _databaseName = MssqlTestDatabaseHelper.GenerateUniqueDatabaseName();
+        MssqlTestDatabaseHelper.CreateDatabase(_databaseName);
+        _connectionString = MssqlTestDatabaseHelper.BuildConnectionString(_databaseName);
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await ExecuteSql(
+            connection,
+            """
+            IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = 'dms') EXEC('CREATE SCHEMA [dms]');
+            IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = 'hydselected') EXEC('CREATE SCHEMA [hydselected]');
+
+            CREATE TABLE dms.Document (
+                DocumentId bigint PRIMARY KEY,
+                DocumentUuid uniqueidentifier NOT NULL,
+                ResourceKeyId smallint NOT NULL DEFAULT 0,
+                ContentVersion bigint NOT NULL DEFAULT 1,
+                ContentLastModifiedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset(),
+                CreatedAt datetimeoffset NOT NULL DEFAULT sysdatetimeoffset()
+            );
+
+            CREATE TABLE hydselected.School (
+                DocumentId bigint PRIMARY KEY,
+                SchoolId int NOT NULL
+            );
+
+            CREATE TABLE hydselected.SchoolAddress (
+                CollectionItemId bigint PRIMARY KEY,
+                School_DocumentId bigint NOT NULL REFERENCES hydselected.School(DocumentId),
+                Ordinal int NOT NULL,
+                City varchar(100) NOT NULL
+            );
+
+            CREATE TABLE hydselected.SchoolAddressPeriod (
+                CollectionItemId bigint PRIMARY KEY,
+                School_DocumentId bigint NOT NULL,
+                ParentCollectionItemId bigint NOT NULL REFERENCES hydselected.SchoolAddress(CollectionItemId),
+                Ordinal int NOT NULL,
+                BeginDate varchar(10) NOT NULL
+            );
+            """
+        );
+    }
+
+    [SetUp]
+    public async Task Setup()
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await ExecuteSql(
+            connection,
+            """
+            DELETE FROM hydselected.SchoolAddressPeriod;
+            DELETE FROM hydselected.SchoolAddress;
+            DELETE FROM hydselected.School;
+            DELETE FROM dms.Document;
+
+            INSERT INTO dms.Document (DocumentId, DocumentUuid, ContentVersion)
+            VALUES
+                (501, '22222222-8888-8888-8888-222222222222', 73),
+                (509, '33333333-9999-9999-9999-333333333333', 61),
+                (517, '44444444-aaaa-aaaa-aaaa-444444444444', 67);
+
+            INSERT INTO hydselected.School (DocumentId, SchoolId)
+            VALUES (501, 910001), (509, 910002), (517, 910003);
+            """
+        );
+    }
+
+    [OneTimeTearDown]
+    public void OneTimeTearDown()
+    {
+        if (_databaseName is not null && MssqlTestDatabaseHelper.IsConfigured())
+        {
+            MssqlTestDatabaseHelper.DropDatabaseIfExists(_databaseName);
+        }
+    }
+
+    [Test]
+    public async Task It_returns_the_maximum_selected_document_id_for_a_cursor_page()
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        var result = await HydrationExecutor.ExecuteAsync(
+            connection,
+            HydrationTestHelper.BuildSchoolReadPlan(TestSchema, SqlDialect.Mssql),
+            CreateCursorKeyset(pageSize: 2L),
+            SqlDialect.Mssql,
+            CancellationToken.None
+        );
+
+        result.HighestSelectedAnchor.Should().Be(SecondDocumentId);
+        result
+            .DocumentMetadata.Select(static documentMetadata => documentMetadata.DocumentId)
+            .Should()
+            .Equal(FirstDocumentId, SecondDocumentId);
+    }
+
+    [Test]
+    public async Task It_returns_no_maximum_for_a_zero_size_cursor_page()
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        var result = await HydrationExecutor.ExecuteAsync(
+            connection,
+            HydrationTestHelper.BuildSchoolReadPlan(TestSchema, SqlDialect.Mssql),
+            CreateCursorKeyset(pageSize: 0L),
+            SqlDialect.Mssql,
+            CancellationToken.None
+        );
+
+        result.HighestSelectedAnchor.Should().BeNull();
+        result.DocumentMetadata.Should().BeEmpty();
+    }
+
+    [Test]
+    public async Task It_returns_no_maximum_when_the_range_selects_nothing()
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        var result = await HydrationExecutor.ExecuteAsync(
+            connection,
+            HydrationTestHelper.BuildSchoolReadPlan(TestSchema, SqlDialect.Mssql),
+            CreateCursorKeyset(pageSize: 25L, inclusiveMinimum: 600L, inclusiveMaximum: 700L),
+            SqlDialect.Mssql,
+            CancellationToken.None
+        );
+
+        result.HighestSelectedAnchor.Should().BeNull();
+        result.DocumentMetadata.Should().BeEmpty();
+    }
+
+    /// <summary>
+    /// Deletes every selected row inside the hydration batch, between the materialization that
+    /// selected them and the hydration selects that follow it. This is a deterministic stand-in for a
+    /// delete that commits in that same window — not a separate concurrent transaction — and it is the
+    /// case a body-derived boundary would answer wrongly by stalling the walk.
+    /// </summary>
+    [Test]
+    public async Task It_returns_the_maximum_when_every_selected_row_was_deleted_before_hydration()
+    {
+        const string SpliceAfter = "SELECT [DocumentId] FROM page_ids;";
+        const string DeleteEverySelectedRow = """
+
+            DELETE FROM hydselected.SchoolAddressPeriod;
+            DELETE FROM hydselected.SchoolAddress;
+            DELETE FROM hydselected.School;
+            DELETE FROM dms.Document;
+            """;
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+        var splicedBatches = new List<string>();
+
+        var result = await HydrationExecutor.ExecuteAsync(
+            batchSql =>
+            {
+                CountOccurrences(batchSql, SpliceAfter)
+                    .Should()
+                    .Be(
+                        1,
+                        "the materialization statement is the splice point, so it must appear exactly once"
+                    );
+
+                var splicedBatch = batchSql.Replace(
+                    SpliceAfter,
+                    SpliceAfter + DeleteEverySelectedRow,
+                    StringComparison.Ordinal
+                );
+                splicedBatches.Add(splicedBatch);
+
+                var command = connection.CreateCommand();
+                command.CommandText = splicedBatch;
+                return command;
+            },
+            HydrationTestHelper.BuildSchoolReadPlan(TestSchema, SqlDialect.Mssql),
+            CreateCursorKeyset(pageSize: 25L),
+            SqlDialect.Mssql,
+            new HydrationExecutionOptions(),
+            CancellationToken.None
+        );
+
+        splicedBatches.Should().ContainSingle();
+        result.HighestSelectedAnchor.Should().Be(ThirdDocumentId);
+        result.DocumentMetadata.Should().BeEmpty();
+        result.TableRowsInDependencyOrder.Should().OnlyContain(tableRows => tableRows.Rows.Count == 0);
+    }
+
+    /// <summary>
+    /// A <c>ContentVersion</c>-anchored page reports the maximum anchor among the rows selection
+    /// returned, not the anchor of the last one. <c>OUTPUT INSERTED</c> promises no order, and the page
+    /// selection here orders by <c>DocumentId</c> while the content versions run the other way, so a
+    /// reader that took the final row would report the wrong anchor and rewind the walk.
+    /// </summary>
+    [Test]
+    public async Task It_returns_the_maximum_selected_content_version_regardless_of_the_returned_row_order()
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        var result = await HydrationExecutor.ExecuteAsync(
+            connection,
+            HydrationTestHelper.BuildSchoolReadPlan(TestSchema, SqlDialect.Mssql),
+            CreateContentVersionAnchoredKeyset(pageSize: 2L),
+            SqlDialect.Mssql,
+            CancellationToken.None
+        );
+
+        result.HighestSelectedAnchor.Should().Be(FirstDocumentContentVersion);
+        result
+            .DocumentMetadata.Select(static documentMetadata => documentMetadata.DocumentId)
+            .Should()
+            .Equal(FirstDocumentId, SecondDocumentId);
+    }
+
+    /// <summary>
+    /// The concurrency regression for a <c>ContentVersion</c> anchor: every selected row is deleted
+    /// inside the hydration batch, between the materialization that selected them and the hydration
+    /// selects that follow it. The anchor still has to arrive, because an empty body with no anchor is
+    /// indistinguishable from a completed walk and would end the walk early.
+    /// </summary>
+    [Test]
+    public async Task It_returns_the_content_version_maximum_when_every_selected_row_was_deleted_before_hydration()
+    {
+        const string SpliceAfter = "SELECT [DocumentId], [ContentVersion] FROM page_ids;";
+        const string DeleteEverySelectedRow = """
+
+            DELETE FROM hydselected.SchoolAddressPeriod;
+            DELETE FROM hydselected.SchoolAddress;
+            DELETE FROM hydselected.School;
+            DELETE FROM dms.Document;
+            """;
+
+        // Every row is selected, so the anchor is the maximum content version across all three.
+        var expectedAnchor = Math.Max(
+            FirstDocumentContentVersion,
+            Math.Max(SecondDocumentContentVersion, ThirdDocumentContentVersion)
+        );
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+        var splicedBatches = new List<string>();
+
+        var result = await HydrationExecutor.ExecuteAsync(
+            batchSql =>
+            {
+                CountOccurrences(batchSql, SpliceAfter)
+                    .Should()
+                    .Be(
+                        1,
+                        "the anchored materialization statement is the splice point, so it must appear exactly once"
+                    );
+
+                var splicedBatch = batchSql.Replace(
+                    SpliceAfter,
+                    SpliceAfter + DeleteEverySelectedRow,
+                    StringComparison.Ordinal
+                );
+                splicedBatches.Add(splicedBatch);
+
+                var command = connection.CreateCommand();
+                command.CommandText = splicedBatch;
+                return command;
+            },
+            HydrationTestHelper.BuildSchoolReadPlan(TestSchema, SqlDialect.Mssql),
+            CreateContentVersionAnchoredKeyset(pageSize: 25L),
+            SqlDialect.Mssql,
+            new HydrationExecutionOptions(),
+            CancellationToken.None
+        );
+
+        splicedBatches.Should().ContainSingle();
+        result.HighestSelectedAnchor.Should().Be(expectedAnchor);
+        result.DocumentMetadata.Should().BeEmpty();
+        result.TableRowsInDependencyOrder.Should().OnlyContain(tableRows => tableRows.Rows.Count == 0);
+    }
+
+    /// <summary>
+    /// Bounds and orders on <c>ContentVersion</c> the way a max-bearing window's compiled candidate SQL
+    /// does, but orders the projection by <c>DocumentId</c> so the selected maximum is not the last row
+    /// the materialization returns.
+    /// </summary>
+    private static PageKeysetSpec.Query CreateContentVersionAnchoredKeyset(
+        object pageSize,
+        long inclusiveMinimum = 1L,
+        long inclusiveMaximum = long.MaxValue
+    ) =>
+        new(
+            new PageDocumentIdSqlPlan(
+                PageDocumentIdSql: """
+                SELECT TOP (@pageSize) s.DocumentId, d.ContentVersion
+                FROM hydselected.School s
+                JOIN dms.Document d ON d.DocumentId = s.DocumentId
+                WHERE d.ContentVersion >= @cursorMin
+                  AND d.ContentVersion <= @cursorMax
+                ORDER BY s.DocumentId
+                """,
+                TotalCountSql: null,
+                PageParametersInOrder:
+                [
+                    new QuerySqlParameter(QuerySqlParameterRole.CursorInclusiveMinimum, "cursorMin"),
+                    new QuerySqlParameter(QuerySqlParameterRole.CursorInclusiveMaximum, "cursorMax"),
+                    new QuerySqlParameter(QuerySqlParameterRole.PageSize, "pageSize"),
+                ],
+                TotalCountParametersInOrder: null
+            ),
+            new Dictionary<string, object?>
+            {
+                ["cursorMin"] = inclusiveMinimum,
+                ["cursorMax"] = inclusiveMaximum,
+                ["pageSize"] = pageSize,
+            },
+            PageOrderingMode.ContentVersion
+        );
+
+    private static PageKeysetSpec.Query CreateCursorKeyset(
+        object pageSize,
+        long inclusiveMinimum = 1L,
+        long inclusiveMaximum = long.MaxValue
+    ) =>
+        new(
+            new PageDocumentIdSqlPlan(
+                PageDocumentIdSql: """
+                SELECT TOP (@pageSize) DocumentId FROM hydselected.School
+                WHERE DocumentId >= @cursorMin
+                  AND DocumentId <= @cursorMax
+                ORDER BY DocumentId
+                """,
+                TotalCountSql: null,
+                PageParametersInOrder:
+                [
+                    new QuerySqlParameter(QuerySqlParameterRole.CursorInclusiveMinimum, "cursorMin"),
+                    new QuerySqlParameter(QuerySqlParameterRole.CursorInclusiveMaximum, "cursorMax"),
+                    new QuerySqlParameter(QuerySqlParameterRole.PageSize, "pageSize"),
+                ],
+                TotalCountParametersInOrder: null
+            ),
+            new Dictionary<string, object?>
+            {
+                ["cursorMin"] = inclusiveMinimum,
+                ["cursorMax"] = inclusiveMaximum,
+                ["pageSize"] = pageSize,
+            },
+            PageOrderingMode.DocumentId
+        );
+
+    private static int CountOccurrences(string text, string value)
+    {
+        var occurrences = 0;
+        var searchIndex = text.IndexOf(value, StringComparison.Ordinal);
+
+        while (searchIndex >= 0)
+        {
+            occurrences++;
+            searchIndex = text.IndexOf(value, searchIndex + value.Length, StringComparison.Ordinal);
+        }
+
+        return occurrences;
     }
 
     private static async Task ExecuteSql(SqlConnection connection, string sql)

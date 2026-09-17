@@ -557,6 +557,13 @@ function Set-BootstrapStartupEnvironment {
 }
 
 $script:BootstrapEnvVarNames = @(
+    # Startup temporarily selects identity endpoints as well as staged schema/claims. Restore
+    # them before a later phase fingerprints the caller's Compose environment for CDC lifecycle.
+    "DMS_CONFIG_IDENTITY_PROVIDER",
+    "OAUTH_TOKEN_ENDPOINT",
+    "DMS_JWT_AUTHORITY",
+    "DMS_JWT_METADATA_ADDRESS",
+    "DMS_CONFIG_IDENTITY_AUTHORITY",
     "DMS_CONFIG_CLAIMS_SOURCE",
     "DMS_CONFIG_CLAIMS_DIRECTORY",
     "DMS_CONFIG_CLAIMS_MOUNT_SOURCE",
@@ -589,16 +596,16 @@ function Restore-BootstrapEnvSnapshot {
         $Snapshot
     )
 
+    # A $null snapshot value means the variable was absent and must be removed. Remove-Item is
+    # required for that: calling SetEnvironmentVariable with $null from PowerShell coerces the
+    # value to "", which newer pwsh/.NET on Unix stores as a present-but-blank variable instead
+    # of removing it, leaking blank bootstrap overrides into the calling shell.
     foreach ($name in $script:BootstrapEnvVarNames) {
-        if ($Snapshot.ContainsKey($name)) {
-            $value = $Snapshot[$name]
-            if ($null -eq $value) {
-                [System.Environment]::SetEnvironmentVariable($name, $null)
-            } else {
-                [System.Environment]::SetEnvironmentVariable($name, $value)
-            }
+        $value = if ($Snapshot.ContainsKey($name)) { $Snapshot[$name] } else { $null }
+        if ($null -eq $value) {
+            Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
         } else {
-            [System.Environment]::SetEnvironmentVariable($name, $null)
+            [System.Environment]::SetEnvironmentVariable($name, $value)
         }
     }
 }
@@ -676,6 +683,11 @@ function Remove-BootstrapWorkspaceIfRequested {
     }
 
     $bootstrapDir = Get-BootstrapRoot
+    Import-Module (Join-Path $PSScriptRoot 'cdc-lifecycle.psm1')
+    if (Test-CdcBootstrapWorkspaceProtected -BootstrapRoot $bootstrapDir) {
+        Write-Output 'Retaining CDC configuration workspace and any nested state roots after governed teardown.'
+        return
+    }
     if (Test-Path -LiteralPath $bootstrapDir) {
         Write-Output "Removing bootstrap workspace at $(Format-LogSafeText $bootstrapDir)"
         # Remove-Item is non-terminating by default; promote to a terminating error so a failed

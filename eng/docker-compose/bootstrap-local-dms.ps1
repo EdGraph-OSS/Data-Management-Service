@@ -102,6 +102,24 @@
 .PARAMETER IdentityProvider
     Forwarded to all phase commands for OAuth endpoint selection.
 
+.PARAMETER EnableKafkaCdc
+    Run the deployment controller after schema provisioning and before DMS or seed writes.
+    Requires -SeparateConfigDatabase, -CdcSettingsPath and a dedicated -DataStoreDatabaseName.
+    The supplied DataManagement:DocumentCache target must match the configure phase's selected ID.
+
+.PARAMETER CdcSettingsPath
+    Explicit DMS and CDC settings JSON. Bootstrap snapshots the settings with the ordinary staged
+    schema and selected Compose environment. DMS_CDC__ environment overrides are rejected so the
+    controller and eventual DMS receive the same target configuration. Protect this credential file.
+
+.PARAMETER CdcBindingStatePath
+    Original durable controller state root (defaults to .cdc-state beside these scripts for CDC).
+    Without -EnableKafkaCdc, opts ordinary provisioning into managed creation/source receipts.
+
+.PARAMETER DataStoreDatabaseName
+    Database name forwarded to configure-local-data-store.ps1. CDC requires a dedicated new name,
+    distinct from the database created by infrastructure initialization and the CMS database.
+
 .PARAMETER EnableKafkaUI
     Forwarded to `start-local-dms.ps1`.
 
@@ -220,6 +238,11 @@ param(
 
     [Switch]$EnableKafkaUI,
 
+    [Switch]$EnableKafkaCdc,
+    [string]$CdcBindingStatePath,
+    [string]$CdcSettingsPath,
+    [string]$DataStoreDatabaseName,
+
     [Switch]$EnableSwaggerUI,
 
     [Switch]$EnableConfig,
@@ -253,6 +276,15 @@ param(
     [ValidateSet("postgresql", "mssql")]
     [string]$DatabaseEngine = "postgresql",
 
+    # Redirects the CMS (Configuration Service) database to a dedicated edfi_configurationservice
+    # database instead of sharing the DMS datastore database. Forwarded unchanged to
+    # start-local-dms.ps1 and to both datastore phases, each of which enforces one half of the rule
+    # that the DMS datastore may not land in the dedicated Configuration Service database: the
+    # configure phase judges a name it is about to register, and the provision phase judges the
+    # database each selected target resolves to - the only place a REUSED data store's stored
+    # connection string is known. Supported on both database engines.
+    [Switch]$SeparateConfigDatabase,
+
     # Data standard version for the local-bootstrap package surface. The .env.bootstrap.<token>
     # overlay is always composed onto -EnvironmentFile: DS 5.2 (default) stages core + TPDM,
     # DS 6.1 stages core only (TPDM is folded into core in 6.1). Distinct from
@@ -270,6 +302,16 @@ $ErrorActionPreference = "Stop"
 if ($v -and -not $d) {
     throw "-v requires -d. Use bootstrap-local-dms.ps1 -d -v to stop services, delete volumes, and remove the .bootstrap workspace."
 }
+if ((-not $EnableKafkaCdc -or $d) -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot '.cdc-deployments/dms-local.json'))) {
+    Import-Module (Join-Path $PSScriptRoot 'cdc-lifecycle.psm1')
+    $lifecycleArgs = @{} + $PSBoundParameters
+    if ($d -and $v) { $lifecycleArgs.RemoveBootstrap = $true }
+    Invoke-CdcDeploymentLifecycle -Project 'dms-local' -StartScript (Join-Path $PSScriptRoot 'start-local-dms.ps1') -Parameters $lifecycleArgs
+    return
+}
+if ($d -and ($EnableKafkaCdc -or $CdcBindingStatePath -or $CdcSettingsPath)) {
+    throw 'CDC lifecycle requires its original retained deployment inventory.'
+}
 if ($d) {
     $teardownArgs = @{ d = $true }
     if ($v) {
@@ -284,6 +326,11 @@ if ($d) {
     # overlay only rewrites env values such as SCHEMA_PACKAGES), so they are omitted. Each is forwarded
     # only when the caller bound it; the unbound defaults (postgresql, no switches) match
     # start-local-dms.ps1's own, so an omitted flag and its default forward identically.
+    #
+    # -SeparateConfigDatabase is deliberately omitted too: local-config.yml is unconditional in
+    # start-local-dms.ps1's compose set, so the switch changes which database CMS targets but never
+    # which compose files a teardown must cover. (It does shape the set in start-published-dms.ps1,
+    # but that script owns its own teardown; this wrapper offers none for the published path.)
     foreach ($name in 'EnvironmentFile', 'IdentityProvider', 'EnableKafkaUI', 'EnableSwaggerUI', 'DatabaseEngine') {
         if ($PSBoundParameters.ContainsKey($name)) {
             $teardownArgs[$name] = $PSBoundParameters[$name]

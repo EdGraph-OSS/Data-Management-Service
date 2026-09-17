@@ -84,6 +84,44 @@ internal static class RelationalWriteExecutorResults
         };
     }
 
+    public static RelationalWriteExecutorResult BuildOwnershipAuthorizationFailureResult(
+        RelationalWriteOperationKind operationKind,
+        OwnershipAuthorizationFailure ownershipFailure
+    )
+    {
+        ArgumentNullException.ThrowIfNull(ownershipFailure);
+
+        return operationKind switch
+        {
+            RelationalWriteOperationKind.Post => new RelationalWriteExecutorResult.Upsert(
+                new UpsertResult.UpsertFailureOwnershipNotAuthorized(ownershipFailure)
+            ),
+            RelationalWriteOperationKind.Put => new RelationalWriteExecutorResult.Update(
+                new UpdateResult.UpdateFailureOwnershipNotAuthorized(ownershipFailure)
+            ),
+            _ => throw new ArgumentOutOfRangeException(nameof(operationKind), operationKind, null),
+        };
+    }
+
+    public static RelationalWriteExecutorResult BuildCustomViewAuthorizationFailureResult(
+        RelationalWriteOperationKind operationKind,
+        CustomViewAuthorizationFailure customViewFailure
+    )
+    {
+        ArgumentNullException.ThrowIfNull(customViewFailure);
+
+        return operationKind switch
+        {
+            RelationalWriteOperationKind.Post => new RelationalWriteExecutorResult.Upsert(
+                new UpsertResult.UpsertFailureCustomViewNotAuthorized(customViewFailure)
+            ),
+            RelationalWriteOperationKind.Put => new RelationalWriteExecutorResult.Update(
+                new UpdateResult.UpdateFailureCustomViewNotAuthorized(customViewFailure)
+            ),
+            _ => throw new ArgumentOutOfRangeException(nameof(operationKind), operationKind, null),
+        };
+    }
+
     /// <summary>
     /// Maps a stale-target namespace authorization result to a write conflict (POST) or not-exists (PUT)
     /// outcome, mirroring the single-record relationship authorization stale-target mapping. Locked write

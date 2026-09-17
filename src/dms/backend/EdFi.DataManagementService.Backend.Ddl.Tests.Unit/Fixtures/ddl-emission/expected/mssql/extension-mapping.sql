@@ -87,16 +87,19 @@ BEGIN
     END
     ELSE IF (UPDATE([SchoolId]))
     BEGIN
-        DECLARE @changedDocs TABLE ([DocumentId] bigint NOT NULL);
+        DECLARE @changedDocs TABLE ([DocumentId] bigint NOT NULL PRIMARY KEY);
         INSERT INTO @changedDocs ([DocumentId])
         SELECT i.[DocumentId]
         FROM inserted i INNER JOIN deleted d ON d.[DocumentId] = i.[DocumentId]
         WHERE (i.[SchoolId] <> d.[SchoolId] OR (i.[SchoolId] IS NULL AND d.[SchoolId] IS NOT NULL) OR (i.[SchoolId] IS NOT NULL AND d.[SchoolId] IS NULL));
-        DELETE FROM [dms].[ReferentialIdentity]
-        WHERE [DocumentId] IN (SELECT [DocumentId] FROM @changedDocs) AND [ResourceKeyId] = 1;
-        INSERT INTO [dms].[ReferentialIdentity] ([ReferentialId], [DocumentId], [ResourceKeyId])
-        SELECT [dms].[uuidv5]('edf1edf1-3df1-3df1-3df1-3df1edf1edf1', CAST(N'Ed-FiSchool' AS nvarchar(max)) + N'$.schoolId=' + CAST(i.[SchoolId] AS nvarchar(max))), i.[DocumentId], 1
-        FROM inserted i INNER JOIN @changedDocs cd ON cd.[DocumentId] = i.[DocumentId];
+        IF EXISTS (SELECT 1 FROM @changedDocs)
+        BEGIN
+            DELETE FROM [dms].[ReferentialIdentity]
+            WHERE [DocumentId] IN (SELECT [DocumentId] FROM @changedDocs) AND [ResourceKeyId] = 1;
+            INSERT INTO [dms].[ReferentialIdentity] ([ReferentialId], [DocumentId], [ResourceKeyId])
+            SELECT [dms].[uuidv5]('edf1edf1-3df1-3df1-3df1-3df1edf1edf1', CAST(N'Ed-FiSchool' AS nvarchar(max)) + N'$.schoolId=' + CAST(i.[SchoolId] AS nvarchar(max))), i.[DocumentId], 1
+            FROM inserted i INNER JOIN @changedDocs cd ON cd.[DocumentId] = i.[DocumentId];
+        END
     END
 END;
 GO
@@ -118,38 +121,32 @@ BEGIN
     INNER JOIN inserted i ON d.[DocumentId] = i.[DocumentId]
     LEFT JOIN deleted del ON del.[DocumentId] = i.[DocumentId]
     WHERE del.[DocumentId] IS NULL;
-    ;WITH affectedDocs AS (
-        SELECT i.[DocumentId]
-        FROM inserted i
-        LEFT JOIN deleted del ON del.[DocumentId] = i.[DocumentId]
-        WHERE del.[DocumentId] IS NOT NULL AND ((i.[DocumentId] <> del.[DocumentId] OR (i.[DocumentId] IS NULL AND del.[DocumentId] IS NOT NULL) OR (i.[DocumentId] IS NOT NULL AND del.[DocumentId] IS NULL)) OR (i.[SchoolId] <> del.[SchoolId] OR (i.[SchoolId] IS NULL AND del.[SchoolId] IS NOT NULL) OR (i.[SchoolId] IS NOT NULL AND del.[SchoolId] IS NULL)))
-        UNION ALL
-        SELECT del.[DocumentId]
-        FROM deleted del
-        LEFT JOIN inserted i ON i.[DocumentId] = del.[DocumentId]
-        WHERE i.[DocumentId] IS NULL
-    )
-    UPDATE d
-    SET d.[ContentVersion] = NEXT VALUE FOR [dms].[ChangeVersionSequence], d.[ContentLastModifiedAt] = sysutcdatetime()
-    OUTPUT inserted.[DocumentId], inserted.[ContentVersion], inserted.[ContentLastModifiedAt] INTO @stamped
-    FROM [dms].[Document] d
-    INNER JOIN affectedDocs a ON d.[DocumentId] = a.[DocumentId];
+    IF EXISTS (SELECT 1 FROM deleted) AND (NOT EXISTS (SELECT 1 FROM inserted) OR UPDATE([DocumentId]) OR UPDATE([SchoolId]))
+    BEGIN
+        ;WITH affectedDocs AS (
+            SELECT i.[DocumentId]
+            FROM inserted i
+            LEFT JOIN deleted del ON del.[DocumentId] = i.[DocumentId]
+            WHERE del.[DocumentId] IS NOT NULL AND ((i.[DocumentId] <> del.[DocumentId] OR (i.[DocumentId] IS NULL AND del.[DocumentId] IS NOT NULL) OR (i.[DocumentId] IS NOT NULL AND del.[DocumentId] IS NULL)) OR (i.[SchoolId] <> del.[SchoolId] OR (i.[SchoolId] IS NULL AND del.[SchoolId] IS NOT NULL) OR (i.[SchoolId] IS NOT NULL AND del.[SchoolId] IS NULL)))
+            UNION ALL
+            SELECT del.[DocumentId]
+            FROM deleted del
+            LEFT JOIN inserted i ON i.[DocumentId] = del.[DocumentId]
+            WHERE i.[DocumentId] IS NULL
+        )
+        UPDATE d
+        SET d.[ContentVersion] = NEXT VALUE FOR [dms].[ChangeVersionSequence], d.[ContentLastModifiedAt] = sysutcdatetime()
+        OUTPUT inserted.[DocumentId], inserted.[ContentVersion], inserted.[ContentLastModifiedAt] INTO @stamped
+        FROM [dms].[Document] d
+        INNER JOIN affectedDocs a ON d.[DocumentId] = a.[DocumentId];
+    END
     IF EXISTS (SELECT 1 FROM @stamped)
     BEGIN
         UPDATE r
         SET r.[ContentVersion] = s.[ContentVersion],
             r.[ContentLastModifiedAt] = s.[ContentLastModifiedAt]
-        FROM [edfi].[School] r
+        FROM [edfi].[School] r WITH (FORCESEEK)
         INNER JOIN @stamped s ON s.[DocumentId] = r.[DocumentId];
-    END
-    IF EXISTS (SELECT 1 FROM deleted) AND (UPDATE([SchoolId]))
-    BEGIN
-        UPDATE d
-        SET d.[IdentityVersion] = NEXT VALUE FOR [dms].[ChangeVersionSequence], d.[IdentityLastModifiedAt] = sysutcdatetime()
-        FROM [dms].[Document] d
-        INNER JOIN inserted i ON d.[DocumentId] = i.[DocumentId]
-        INNER JOIN deleted del ON del.[DocumentId] = i.[DocumentId]
-        WHERE (i.[SchoolId] <> del.[SchoolId] OR (i.[SchoolId] IS NULL AND del.[SchoolId] IS NOT NULL) OR (i.[SchoolId] IS NOT NULL AND del.[SchoolId] IS NULL));
     END
 END;
 GO
@@ -187,7 +184,7 @@ BEGIN
         UPDATE r
         SET r.[ContentVersion] = s.[ContentVersion],
             r.[ContentLastModifiedAt] = s.[ContentLastModifiedAt]
-        FROM [edfi].[School] r
+        FROM [edfi].[School] r WITH (FORCESEEK)
         INNER JOIN @stamped s ON s.[DocumentId] = r.[DocumentId];
     END
 END;
@@ -226,7 +223,7 @@ BEGIN
         UPDATE r
         SET r.[ContentVersion] = s.[ContentVersion],
             r.[ContentLastModifiedAt] = s.[ContentLastModifiedAt]
-        FROM [edfi].[School] r
+        FROM [edfi].[School] r WITH (FORCESEEK)
         INNER JOIN @stamped s ON s.[DocumentId] = r.[DocumentId];
     END
 END;
@@ -265,7 +262,7 @@ BEGIN
         UPDATE r
         SET r.[ContentVersion] = s.[ContentVersion],
             r.[ContentLastModifiedAt] = s.[ContentLastModifiedAt]
-        FROM [edfi].[School] r
+        FROM [edfi].[School] r WITH (FORCESEEK)
         INNER JOIN @stamped s ON s.[DocumentId] = r.[DocumentId];
     END
 END;

@@ -4,6 +4,7 @@
 // See the LICENSE and NOTICES files in the project root for more information.
 
 using System.Linq;
+using EdFi.Api.Plugins.Hosting;
 using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Core.Configuration;
 using EdFi.DataManagementService.Core.External.Model;
@@ -18,6 +19,7 @@ using Microsoft.AspNetCore.ResponseCompression;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.Options;
 using AppSettings = EdFi.DataManagementService.Frontend.AspNetCore.Configuration.AppSettings;
+using CoreAppSettings = EdFi.DataManagementService.Core.Configuration.AppSettings;
 using ResponseCompressionDefaults = Microsoft.AspNetCore.ResponseCompression.ResponseCompressionDefaults;
 
 // Disable reload to work around .NET file watcher bug on Linux. See:
@@ -33,6 +35,18 @@ var bootstrapStartupStatusSignal = new FileStartupStatusSignal(
 bool enableAspNetCompression = false;
 bool useReverseProxyHeaders = false;
 
+// Before ConfigureServices, because AddServices reads configuration and composes against what this
+// returns, and after the status signal above, so a loader fatal has somewhere to record itself. A
+// deployment that allowlisted nothing gets LoadedPlugins.Empty without the loader touching the
+// filesystem, which is what keeps a plugin-free boot on exactly the path it took before.
+LoadedPlugins loadedPlugins = RunBootstrapPhaseWithResult(
+    DmsStartupPhases.LoadPlugins,
+    "Loading plugins named in Plugins:Allowed.",
+    "Loaded plugins named in Plugins:Allowed.",
+    "Loading plugins failed before DMS services were configured.",
+    () => PluginLoader.Load(builder.Configuration, DmsPluginContracts.Registry.ContractAssemblyNames)
+);
+
 RunBootstrapPhase(
     DmsStartupPhases.ConfigureServices,
     "Configuring DMS services and shared HTTP infrastructure.",
@@ -41,7 +55,7 @@ RunBootstrapPhase(
     () =>
     {
         builder.Services.AddHttpClient();
-        builder.AddServices();
+        builder.AddServices(loadedPlugins);
         builder.Services.ConfigureHttpJsonOptions(options =>
         {
             options.SerializerOptions.Encoder = EdFi.DataManagementService
@@ -132,6 +146,13 @@ app.Logger.LogInformation(
     startupPhaseExecutor.StatusFilePath
 );
 
+// Here and nowhere later. The logger exists from the line above, and no startup task has run: the
+// executor is not entered until the RunFatalAsync calls further down, so the inventory reaches an
+// operator before any check that can abort startup naming a type and not the plugin that supplied
+// it. The per-file loaded flags are read at this moment rather than carried from loading, because an
+// assembly first touched inside a contribution hook loaded after that phase returned.
+PluginInventoryLog.Emit(app.Logger, app.Services.GetRequiredService<PluginAuditInput>());
+
 var pathBase = app.Configuration.GetValue<string>("AppSettings:PathBase");
 if (!string.IsNullOrEmpty(pathBase))
 {
@@ -182,48 +203,64 @@ if (invalidConfigurationException is null)
         exitCode: 1
     );
 
-    if (enableAspNetCompression)
-    {
-        app.UseResponseCompression();
-    }
-
     startupPhaseExecutor.WriteStarting(
         DmsStartupPhases.ConfigureEndpoints,
         "Configuring DMS middleware and endpoints."
     );
 
-    app.UseRouting();
-
-    if (app.Configuration.GetSection(RateLimitOptions.RateLimit).Exists())
+    try
     {
-        app.UseRateLimiter();
+        if (enableAspNetCompression)
+        {
+            app.UseResponseCompression();
+        }
+
+        app.UseRouting();
+
+        if (app.Configuration.GetSection(RateLimitOptions.RateLimit).Exists())
+        {
+            app.UseRateLimiter();
+        }
+
+        app.UseCors("AllowSwaggerUI");
+
+        app.MapRouteEndpoints();
+
+        app.MapHealthChecks("/health");
+
+        // Catch-all fallback for unmatched routes
+        app.MapFallback(context =>
+        {
+            context.Response.StatusCode = 404;
+            context.Response.ContentType = "application/problem+json";
+
+            var traceId = context.Request.Headers.TryGetValue(
+                app.Configuration.GetValue<string>("AppSettings:CorrelationIdHeader") ?? "correlationid",
+                out var correlationId
+            )
+                ? correlationId.ToString()
+                : context.TraceIdentifier;
+
+            var response = FailureResponse.ForNotFound(
+                "The specified data could not be found.",
+                new TraceId(traceId)
+            );
+            return context.Response.WriteAsJsonAsync(response);
+        });
     }
-
-    app.UseCors("AllowSwaggerUI");
-
-    app.MapRouteEndpoints();
-
-    app.MapHealthChecks("/health");
-
-    // Catch-all fallback for unmatched routes
-    app.MapFallback(context =>
+    catch (Exception ex)
     {
-        context.Response.StatusCode = 404;
-        context.Response.ContentType = "application/problem+json";
-
-        var traceId = context.Request.Headers.TryGetValue(
-            app.Configuration.GetValue<string>("AppSettings:CorrelationIdHeader") ?? "correlationid",
-            out var correlationId
-        )
-            ? correlationId.ToString()
-            : context.TraceIdentifier;
-
-        var response = FailureResponse.ForNotFound(
-            "The specified data could not be found.",
-            new TraceId(traceId)
+        // Endpoint configuration is fatal, and the throw below preserves that. RunFatalAsync is
+        // the wrong tool here: endpoint mapping is synchronous and RunFatalAsync would invoke the
+        // process-exit hook, whereas the rethrow already terminates the process. Without this the
+        // status file would be stranded at Starting, losing ErrorType and ErrorMessage.
+        startupPhaseExecutor.WriteFatalFailure(
+            DmsStartupPhases.ConfigureEndpoints,
+            "Middleware and endpoint configuration failed. DMS cannot serve requests without mapped HTTP endpoints.",
+            ex
         );
-        return context.Response.WriteAsJsonAsync(response);
-    });
+        throw;
+    }
 
     startupPhaseExecutor.WriteReady("DMS startup completed successfully and HTTP endpoints are configured.");
 }
@@ -248,14 +285,45 @@ OptionsValidationException? ReportInvalidConfiguration(WebApplication app)
     {
         // Accessing IOptions<T> forces validation
         _ = app.Services.GetRequiredService<IOptions<AppSettings>>().Value;
+        // Core AppSettings is validated at startup by ValidateOnStart. Resolving it here as well is
+        // what routes a failure into the graceful path below instead of surfacing later, during host
+        // start, past every guard in this file.
+        _ = app.Services.GetRequiredService<IOptions<CoreAppSettings>>().Value;
         _ = app.Services.GetRequiredService<IOptions<ConfigurationServiceSettings>>().Value;
         _ = app.Services.GetRequiredService<IOptions<MappingSetProviderOptions>>().Value;
         _ = app.Services.GetRequiredService<IOptions<ReverseProxySettings>>().Value;
+        DocumentCacheOptions documentCacheOptions = app
+            .Services.GetRequiredService<IOptions<DocumentCacheOptions>>()
+            .Value;
+        DocumentCacheStartupDiagnostics.Log(app.Logger, documentCacheOptions);
     }
     catch (OptionsValidationException ex)
     {
         app.UseMiddleware<ReportInvalidConfigurationMiddleware>(ex.Failures);
         return ex;
+    }
+    catch (Exception ex)
+    {
+        // Options binding is lazy, so the accesses above are the first eager IOptions<T>.Value in
+        // startup. A value that cannot be converted to its target type - a non-numeric
+        // AppSettings__MaxRequestBodySizeMegabytes, say - surfaces here as InvalidOperationException
+        // rather than OptionsValidationException, and carries no Failures collection for the
+        // short-circuit middleware to report. Recording it matters because this call is the last
+        // statement in the unguarded window between the BuildApplication phase and the first
+        // RunFatalAsync: without this the status file would be left reading Completed/BuildApplication
+        // on a process that is about to die, which is worse than a stranded Starting because
+        // Completed reads as success. The statements ahead of it in that window - resolving
+        // StartupPhaseExecutor, the startup log line, the path-base call, and the middleware
+        // registrations - are unguarded too, deliberately: they fail on a missing DI registration or
+        // a malformed middleware type, which breaks in every environment rather than on one
+        // deployment's configuration. Anything added there that a configuration value can break
+        // needs its own guard; bootstrapStartupStatusSignal is still in scope for that.
+        startupPhaseExecutor.WriteFatalFailure(
+            DmsStartupPhases.ConfigureEndpoints,
+            "Configuration could not be read or bound. DMS cannot start without valid configuration values.",
+            ex
+        );
+        throw;
     }
     return null;
 }

@@ -61,7 +61,8 @@ Related redesign discussion:
 - high-level architecture and existing profile split: [overview.md:81](overview.md#L81)
 - authorization interaction: [auth.md:1](auth.md#L1)
 - write/reconstitution mechanics: [flattening-reconstitution.md:399](flattening-reconstitution.md#L399)
-- concurrency and guarded execution: [transactions-and-concurrency.md:322](transactions-and-concurrency.md#L322)
+- concurrency and guarded execution:
+  [transactions-and-concurrency.md § Concurrency](transactions-and-concurrency.md#concurrency-etag-preconditions)
 
 ## Goals and Constraints
 
@@ -155,7 +156,8 @@ Backend MAY use Core-supplied profile outputs to:
 Related redesign discussion:
 - Core/backend split and current contract summary: [overview.md:83](overview.md#L83)
 - prohibition on backend-evaluated profile predicates during merge execution: [flattening-reconstitution.md:401](flattening-reconstitution.md#L401)
-- profile-scoped write/concurrency notes: [transactions-and-concurrency.md:338](transactions-and-concurrency.md#L338)
+- profile-scoped write/concurrency notes:
+  [transactions-and-concurrency.md § Concurrency](transactions-and-concurrency.md#concurrency-etag-preconditions)
 
 ## Everything DMS Core Is Expected to Own
 
@@ -180,7 +182,7 @@ Core is expected to own all of the following:
 5. **Writable request validation**
    - validate that the submitted request does not include data forbidden by the writable profile,
    - reject submitted collection items that fail writable profile value filters,
-   - reject submitted collection/common-type/extension collection items that collide on compiled semantic identity within the same stable parent scope after writable-profile shaping, and
+   - reject submitted collection/common-type/extension collection items that collide under Core's request-local compiled semantic identity within the same stable parent scope after writable-profile shaping, and
    - return structured validation/policy failures rather than silently pruning invalid submitted data.
 
 6. **Creatability analysis**
@@ -239,8 +241,9 @@ Core is expected to own all of the following:
 Backend is expected to own all of the following:
 
 - load the current persisted document state needed for auth, reconstitution, no-op detection, and profile-constrained merge execution,
-- resolve document and descriptor references to `DocumentId`,
+- resolve document references to `DocumentId` and descriptor references to `DescriptorId`,
 - flatten the `WritableRequestBody` into row candidates,
+- run post-resolution collection duplicate validation with resolved `DocumentId`/`DescriptorId` values and backend schema equality before merge/no-op/DML,
 - use compiled semantic identities to match visible stored collection rows to request candidates,
 - reserve new `CollectionItemId` values for unmatched inserts,
 - preserve hidden rows, hidden columns, and hidden scopes using Core-supplied visibility/creatability information,
@@ -254,10 +257,12 @@ Backend is expected to own all of the following:
 Profile-constrained backend support depends on the following redesign elements:
 
 Related redesign discussion:
-- stable child-row identity and collection table shape: [data-model.md:621](data-model.md#L621)
+- stable child-row identity and collection table shape:
+  [data-model.md § Child tables for collections](data-model.md#child-tables-for-collections)
 - compiled collection merge plans and executor behavior: [compiled-mapping-set.md:377](compiled-mapping-set.md#L377)
 - flattened write candidates, semantic identities, and merge binding: [flattening-reconstitution.md:427](flattening-reconstitution.md#L427)
-- branch-level summary of the merged design: [summary.md:159](summary.md#L159)
+- branch-level summary of the merged design:
+  [summary.md § Write path](summary.md#write-path-post-upsert--put-by-id)
 
 1. **Stable collection row identity**
    - every persisted collection row has a stable `CollectionItemId`,
@@ -294,7 +299,8 @@ The existing branch design already introduces:
 Related redesign discussion:
 - high-level Core/backend contract statement: [overview.md:85](overview.md#L85)
 - current request/context assembly design: [flattening-reconstitution.md:399](flattening-reconstitution.md#L399)
-- summarized contract wording: [summary.md:159](summary.md#L159)
+- summarized contract wording:
+  [summary.md § Write path](summary.md#write-path-post-upsert--put-by-id)
 
 For backend profile support to be correct across collection and non-collection scopes, the minimum contract must be concrete and executable. Filtered JSON alone is insufficient.
 
@@ -370,7 +376,8 @@ Normative requirements:
 - `RequestScopeStates` and `StoredScopeStates` MUST distinguish `VisiblePresent`, `VisibleAbsent`, and `Hidden` for every compiled non-collection scope instance that can affect write behavior, including root-adjacent 1:1 scopes, nested/common-type scopes, and `_ext` scopes.
 - `RequestScopeState.Creatable` MUST answer only the "create a new visible scope instance here" question. When `Visibility=VisiblePresent` and a visible stored scope already exists at `Address`, backend may update that scope even when `Creatable=false`. For `VisibleAbsent` and `Hidden`, `Creatable` MUST be `false`.
 - `VisibleRequestCollectionItems` MUST include every visible submitted item for collection/common-type/extension collection scopes. If an item does not match an existing visible stored row, backend may insert it only when `Creatable=true`.
-- `VisibleRequestCollectionItems` MUST contain at most one item per `CollectionRowAddress`. If writable-profile shaping would emit two visible submitted items with the same stable parent address and compiled semantic identity, Core MUST reject the request before backend flattening, merge planning, or DML begins.
+- `VisibleRequestCollectionItems` MUST contain at most one item per request-local `CollectionRowAddress`. If writable-profile shaping would emit two visible submitted items with the same stable parent address and compiled semantic identity under Core's comparison, Core MUST reject the request before backend flattening, merge planning, or DML begins.
+- That Core uniqueness guarantee is not the final storage-equality guarantee. Backend MUST still run the post-resolution duplicate validator over flattened collection semantic identities before merge/no-op/DML, because resolved reference/descriptor ids and SQL Server identity string comparison can collapse two different request-local addresses.
 - `VisibleRequestCollectionItem.Creatable` MUST answer only the "insert a new visible row here" question. A matched visible stored row may be updated even when `Creatable=false`.
 - `VisibleStoredCollectionRows` MUST identify visible persisted rows by compiled semantic identity, not by array ordinal.
 - Every `JsonScope` in the contract MUST equal the compiled `DbTableModel.JsonScope` / `TableWritePlan.TableModel.JsonScope` for the addressed scope.
@@ -734,7 +741,8 @@ For collection scopes, backend classifies each row candidate or stored row by co
 Additional collection-state clarifications:
 
 - A request item that fails writable profile value filtering is rejected by Core before it reaches this dispatcher. Backend never interprets that case as `Preserve` or `Delete`.
-- Duplicate visible request items at the same `CollectionRowAddress` are invalid dispatcher input. Core MUST reject them as request-validation failures before runtime merge execution; backend MUST NOT pick a first-wins/last-wins tie-breaker or defer the public error behavior to a relational unique-constraint violation.
+- Duplicate visible request items at the same request-local `CollectionRowAddress` are invalid dispatcher input. Core MUST reject them as request-validation failures before runtime merge execution.
+- The dispatcher also requires the incoming candidate set to have passed backend's storage-resolved duplicate validator. Backend MUST NOT pick a first-wins/last-wins tie-breaker or defer the public error behavior to a relational unique-constraint violation.
 - A semantic-identity change is not an in-place rename. It decomposes into `Delete` for the old visible row plus `Insert` for the new visible row, and the `Insert` branch still requires `Creatable=true`.
 - Hidden stored rows never suppress the create branch for a new visible request item. They remain on the `Preserve` path unless the same row is also visible and matched under the profile.
 
@@ -831,9 +839,11 @@ The write flow under a writable profile is:
 
 Related redesign discussion:
 - end-to-end write-path mechanics: [flattening-reconstitution.md:427](flattening-reconstitution.md#L427)
-- transactional write ordering and guarded execution: [transactions-and-concurrency.md:208](transactions-and-concurrency.md#L208)
+- transactional write ordering and guarded execution:
+  [transactions-and-concurrency.md § Common steps](transactions-and-concurrency.md#common-steps)
 - compiled runtime write-plan usage: [compiled-mapping-set.md:377](compiled-mapping-set.md#L377)
-- authorization ordering and integration: [transactions-and-concurrency.md:233](transactions-and-concurrency.md#L233)
+- authorization ordering and integration:
+  [transactions-and-concurrency.md § Authorization](transactions-and-concurrency.md#authorization-crud-checks)
 
 1. **Core validates profile usage**
    - select the writable profile definition for the request,
@@ -886,9 +896,11 @@ For profile-constrained writes:
 
 Related redesign discussion:
 - normative merge and ordering rules: [flattening-reconstitution.md:483](flattening-reconstitution.md#L483)
-- write-path/concurrency constraints on accepted profile writes: [transactions-and-concurrency.md:338](transactions-and-concurrency.md#L338)
+- write-path/concurrency constraints on accepted profile writes:
+  [transactions-and-concurrency.md § Concurrency](transactions-and-concurrency.md#concurrency-etag-preconditions)
 - compiled executor behavior for current sibling sets, updates, deletes, and inserts: [compiled-mapping-set.md:389](compiled-mapping-set.md#L389)
-- collection table identity and constraints: [data-model.md:621](data-model.md#L621)
+- collection table identity and constraints:
+  [data-model.md § Child tables for collections](data-model.md#child-tables-for-collections)
 
 - visible stored rows are the persisted rows that the writable profile exposes for that scope instance,
 - hidden stored rows are persisted rows excluded from that scope instance by the writable profile,
@@ -983,7 +995,9 @@ Profile support must also define behavior for non-collection scopes:
 Related redesign discussion:
 - current 1:1 execution mechanics (`UpdateSql` / `DeleteByParentSql`): [flattening-reconstitution.md:456](flattening-reconstitution.md#L456)
 - root and scope-aligned extension table mapping: [extensions.md:96](extensions.md#L96)
-- key strategy for root-scope and extension-scope tables: [data-model.md:916](data-model.md#L916)
+- root and extension scope key strategies:
+  [data-model.md § Root table](data-model.md#root-table-schemar) and
+  [data-model.md § Extensions](data-model.md#extensions)
 
 - **Hidden 1:1 or common-type scope**
   - backend preserves the persisted scope if it exists,
@@ -1011,7 +1025,8 @@ Profile semantics apply to extensions under the same rules as base resource data
 
 Related redesign discussion:
 - normative `_ext` mapping rules: [extensions.md:96](extensions.md#L96)
-- extension table keys and naming in the relational model: [data-model.md:841](data-model.md#L841)
+- extension table keys and naming in the relational model:
+  [data-model.md § Extensions](data-model.md#extensions)
 - write/reconstitution integration for extension rows: [flattening-reconstitution.md:470](flattening-reconstitution.md#L470)
 - compiled read/write plan interaction with extension tables: [compiled-mapping-set.md:440](compiled-mapping-set.md#L440)
 
@@ -1047,9 +1062,11 @@ Profile-constrained writes participate in the same no-op and concurrency rules a
 
 Related redesign discussion:
 - whole-document no-op detection details: [flattening-reconstitution.md:524](flattening-reconstitution.md#L524)
-- provisional no-op decisions, `ContentVersion`, and `If-Match`: [transactions-and-concurrency.md:322](transactions-and-concurrency.md#L322)
+- provisional no-op decisions, `ContentVersion`, and `If-Match`:
+  [transactions-and-concurrency.md § No-op update detection](transactions-and-concurrency.md#no-op-update-detection)
 - compiled executor no-op candidate handling: [compiled-mapping-set.md:366](compiled-mapping-set.md#L366)
-- `ContentVersion` storage and stamping fields: [data-model.md:84](data-model.md#L84)
+- `ContentVersion` storage and stamping fields:
+  [data-model.md § `dms.Document`](data-model.md#1-dmsdocument)
 
 - no-op comparison occurs in storage space after applying the same post-merge rules the real write path would use,
 - guarded no-op comparison MUST reuse the same merge-ordering and post-merge rowset-synthesis logic as the real executor, either by invoking the same helper or by sharing a helper built from the same `CollectionMergePlan` / `TableWritePlan` metadata,
@@ -1076,7 +1093,8 @@ The design expects these behaviors:
 Related redesign discussion:
 - high-level profile contract and semantic-identity compatibility requirement: [overview.md:85](overview.md#L85)
 - request/context assembly and runtime merge preconditions: [flattening-reconstitution.md:399](flattening-reconstitution.md#L399)
-- write-path validity and concurrency notes for accepted profile writes: [transactions-and-concurrency.md:338](transactions-and-concurrency.md#L338)
+- write-path validity and concurrency notes for accepted profile writes:
+  [transactions-and-concurrency.md § Concurrency](transactions-and-concurrency.md#concurrency-etag-preconditions)
 
 - invalid profile definitions fail metadata validation/compilation,
 - writable profiles that hide required semantic-identity fields fail validation/compilation rather than falling back at runtime,
@@ -1084,7 +1102,8 @@ Related redesign discussion:
 - invalid request usage of a readable vs writable profile fails before persistence logic runs,
 - Core/backend contract mismatches in emitted scope/row addresses or stored-side visibility metadata fail deterministically before DML or readable response shaping continues; backend does not guess or recover by ordinal,
 - submitted collection items that violate writable profile filters fail request validation,
-- submitted collection/common-type/extension collection items that duplicate an earlier visible item at the same stable parent address by compiled semantic identity fail request validation with the same `400 Data Validation Failed` category DMS already uses for `arrayUniquenessConstraints`; they are not deferred to DB unique-constraint mapping,
+- submitted collection/common-type/extension collection items that duplicate an earlier visible item at the same stable parent address by Core's request-local compiled semantic identity fail request validation with the same `400 Data Validation Failed` category DMS already uses for `arrayUniquenessConstraints`,
+- submitted collection/common-type/extension collection items that become duplicate only after backend storage resolution fail with the same path-attributed 400 duplicate-item response before merge/no-op/DML; they are not deferred to DB unique-constraint mapping,
 - attempts to create a new scope/item that the writable profile does not permit fail as a profile-based write validation/policy error,
 - creatability failures apply only to create-of-new-visible-data cases; matched visible scope/item updates remain valid even when the same profile would forbid creation of a brand-new visible instance because required members are hidden,
 - backend must not silently prune invalid submitted data to make the write succeed,

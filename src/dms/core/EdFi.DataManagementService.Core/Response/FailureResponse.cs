@@ -18,6 +18,26 @@ namespace EdFi.DataManagementService.Core.Response;
 /// </summary>
 public static class FailureResponse
 {
+    /// <summary>
+    /// The <c>detail</c> that <see cref="Middleware.ValidateDocumentMiddleware" /> and
+    /// <see cref="Middleware.CustomResourceValidationMiddleware" /> put on the <c>errors</c> arm of a
+    /// write-path 400. Those two share it because custom validation is required to produce a body a
+    /// client cannot tell apart from core schema validation's, and two separate copies of the string
+    /// would let one of them change alone.
+    /// This is deliberately not the codebase-wide source of truth for the literal: other production
+    /// call sites across Core and Backend still spell both write-path 400 detail literals out inline,
+    /// so changing this constant diverges these two from the rest rather than renaming the value
+    /// everywhere.
+    /// </summary>
+    internal const string ErrorsArmDetail = "The request could not be processed. See 'errors' for details.";
+
+    /// <summary>
+    /// The <c>detail</c> a write-path 400 carries on the <c>validationErrors</c> arm. Shared for the
+    /// same reason as <see cref="ErrorsArmDetail" />.
+    /// </summary>
+    internal const string ValidationErrorsArmDetail =
+        "Data validation failed. See 'validationErrors' for details.";
+
     private static readonly string _typePrefix = "urn:ed-fi:api";
     private static readonly string _badRequestTypePrefix = $"{_typePrefix}:bad-request";
     private static readonly string _unauthorizedType = $"{_typePrefix}:unauthorized";
@@ -27,6 +47,8 @@ public static class FailureResponse
     private static readonly string _keyChangeNotSupported =
         $"{_badRequestTypePrefix}:data-validation-failed:key-change-not-supported";
     private static readonly string _methodNotAllowed = $"{_typePrefix}:method-not-allowed";
+    private static readonly string _snapshotMethodNotAllowedType =
+        $"{_typePrefix}:snapshots:method-not-allowed";
     private static readonly string _forbiddenType = $"{_typePrefix}:security:authorization";
     private static readonly string _authorizationDeniedType = $"{_typePrefix}:authorization-denied";
     private static readonly string _routeResolutionErrorType = $"{_typePrefix}:route-resolution-error";
@@ -45,6 +67,8 @@ public static class FailureResponse
     private static readonly string _parameterValidationFailedType =
         $"{_badRequestTypePrefix}:parameter-validation-failed";
     private static readonly string _unsupportedMediaTypeType = $"{_typePrefix}:unsupported-media-type";
+    private static readonly string _tooManyRequestsType = $"{_typePrefix}:too-many-requests";
+    private static readonly string _serviceUnavailableType = $"{_typePrefix}:service-unavailable";
 
     internal static JsonObject CreateBaseJsonObject(
         string detail,
@@ -238,6 +262,27 @@ public static class FailureResponse
             errors
         );
 
+    /// <summary>
+    /// Produces the 405 problem details for a mutation that asked for a snapshot. It is distinct from
+    /// <see cref="ForMethodNotAllowed" /> in type, title, and detail because the rejection is about the
+    /// selected target being read-only rather than about the route construction: the same route is
+    /// perfectly valid against the primary. Both are 405, so a caller — and every test — must compare
+    /// type, title, and detail rather than the status code to tell the two apart.
+    /// The response header that accompanies this body is <c>Allow: GET</c>, stating what is permitted in
+    /// snapshot context rather than what the route permits on the primary; the header itself is supplied
+    /// by the caller that builds the response.
+    /// </summary>
+    public static JsonNode ForSnapshotMethodNotAllowed(TraceId traceId) =>
+        CreateBaseJsonObject(
+            detail: "An attempt was made to modify data in a Snapshot, but this data is read-only.",
+            type: _snapshotMethodNotAllowedType,
+            title: "Method Not Allowed with Snapshots",
+            status: 405,
+            correlationId: traceId.Value,
+            validationErrors: [],
+            errors: []
+        );
+
     public static JsonNode ForUnsupportedMediaType(string detail, TraceId traceId, string[] errors) =>
         CreateBaseJsonObject(
             detail: detail,
@@ -247,6 +292,39 @@ public static class FailureResponse
             correlationId: traceId.Value,
             validationErrors: [],
             errors: errors
+        );
+
+    /// <summary>
+    /// Produces the 503 problem details served when the backend is shedding load, so a client reads
+    /// the failure as retriable rather than as a rejected request. Retry timing is carried by the
+    /// Retry-After response header when it is known, so the body stays constant either way, and the
+    /// internal reason is logged rather than disclosed.
+    /// </summary>
+    public static JsonNode ForServiceUnavailable(TraceId traceId) =>
+        CreateBaseJsonObject(
+            detail: "The service is temporarily unable to handle the request. Retry the request later.",
+            type: _serviceUnavailableType,
+            title: "Service Unavailable",
+            status: 503,
+            correlationId: traceId.Value,
+            validationErrors: [],
+            errors: []
+        );
+
+    /// <summary>
+    /// Produces the 429 rate-limit rejection problem details. Retry timing is carried by the
+    /// Retry-After response header when the limiter supplies it, so the body stays constant
+    /// whether or not that metadata is available.
+    /// </summary>
+    public static JsonNode ForTooManyRequests(TraceId traceId) =>
+        CreateBaseJsonObject(
+            detail: "The number of allowed requests has been exceeded. Retry the request later.",
+            type: _tooManyRequestsType,
+            title: "Too Many Requests",
+            status: 429,
+            correlationId: traceId.Value,
+            validationErrors: [],
+            errors: []
         );
 
     public static JsonNode ForUnauthorized(TraceId traceId, string error, string description) =>

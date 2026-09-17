@@ -37,7 +37,10 @@ public class GetByIdHandlerTests
 
         public IGetRequest? CapturedRequest { get; private set; }
 
-        public override Task<GetResult> GetDocumentById(IGetRequest getRequest)
+        public override Task<GetResult> GetDocumentById(
+            IGetRequest getRequest,
+            CancellationToken cancellationToken = default
+        )
         {
             CapturedRequest = getRequest;
             return Task.FromResult<GetResult>(
@@ -168,7 +171,10 @@ public class GetByIdHandlerTests
         private sealed class Repository(InvalidEtagValue invalidEtagValue)
             : NotImplementedDocumentStoreRepository
         {
-            public override Task<GetResult> GetDocumentById(IGetRequest getRequest)
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
             {
                 JsonObject responseBody = invalidEtagValue switch
                 {
@@ -234,7 +240,10 @@ public class GetByIdHandlerTests
         {
             public IGetRequest? CapturedRequest { get; private set; }
 
-            public override Task<GetResult> GetDocumentById(IGetRequest getRequest)
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
             {
                 CapturedRequest = getRequest;
                 return Task.FromResult<GetResult>(
@@ -347,7 +356,10 @@ public class GetByIdHandlerTests
                 ["_etag"] = "5-a1b2c3d4.j._.l.i",
             };
 
-            public override Task<GetResult> GetDocumentById(IGetRequest getRequest)
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
             {
                 return Task.FromResult<GetResult>(
                     new GetSuccess(No.DocumentUuid, ResponseBody, DateTime.UtcNow, null)
@@ -379,7 +391,10 @@ public class GetByIdHandlerTests
     {
         internal class Repository : NotImplementedDocumentStoreRepository
         {
-            public override Task<GetResult> GetDocumentById(IGetRequest getRequest)
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
             {
                 return Task.FromResult<GetResult>(new GetFailureNotExists());
             }
@@ -409,7 +424,10 @@ public class GetByIdHandlerTests
     {
         internal class Repository : NotImplementedDocumentStoreRepository
         {
-            public override Task<GetResult> GetDocumentById(IGetRequest getRequest)
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
             {
                 return Task.FromResult<GetResult>(
                     new GetFailureRelationshipNotAuthorized(CreateRelationshipFailure())
@@ -467,7 +485,10 @@ public class GetByIdHandlerTests
         {
             public static readonly string ResponseBody = "FailureMessage";
 
-            public override Task<GetResult> GetDocumentById(IGetRequest getRequest)
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
             {
                 return Task.FromResult<GetResult>(new GetFailureNotImplemented(ResponseBody));
             }
@@ -516,7 +537,10 @@ public class GetByIdHandlerTests
                 "Resource 'Ed-Fi.School' has relationship authorization metadata that cannot be resolved.",
             ];
 
-            public override Task<GetResult> GetDocumentById(IGetRequest getRequest)
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
             {
                 return Task.FromResult<GetResult>(new GetFailureSecurityConfiguration(ResponseErrors));
             }
@@ -561,6 +585,129 @@ public class GetByIdHandlerTests
 
     [TestFixture]
     [Parallelizable]
+    public class Given_A_Repository_That_Returns_Custom_View_Not_Authorized : GetByIdHandlerTests
+    {
+        internal static readonly CustomViewAuthorizationFailure CustomViewFailure = new(
+            CustomViewAuthorizationFailureKind.NoMatchingRow,
+            CustomViewAuthorizationFailureValueSource.Stored,
+            EmittedAuth1Index: 0,
+            StrategyName: "StudentWithCTECourseEnrollments",
+            ReadableSecurableElements: ["StudentUniqueId"],
+            Hint: "You may need a Student with CTE Course Enrollments."
+        );
+
+        internal class Repository : NotImplementedDocumentStoreRepository
+        {
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
+            {
+                return Task.FromResult<GetResult>(new GetFailureCustomViewNotAuthorized(CustomViewFailure));
+            }
+        }
+
+        private static readonly string _customViewTraceId = "custom-view-get-403";
+        private readonly RequestInfo _customViewRequestInfo = RequestInfoWithRelationalMappingSet(
+            _customViewTraceId
+        );
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var (getByIdHandler, serviceProvider) = Handler(new Repository());
+            _customViewRequestInfo.ScopedServiceProvider = serviceProvider;
+
+            await getByIdHandler.Execute(_customViewRequestInfo, NullNext);
+        }
+
+        [Test]
+        public void It_maps_the_custom_view_denial_to_the_canonical_problem_details_403()
+        {
+            _customViewRequestInfo.FrontendResponse.StatusCode.Should().Be(403);
+            _customViewRequestInfo.FrontendResponse.ContentType.Should().Be("application/problem+json");
+
+            var expected = CustomViewAuthorizationFailureResponse.ForFailure(
+                CustomViewFailure,
+                new TraceId(_customViewTraceId)
+            );
+
+            _customViewRequestInfo.FrontendResponse.Body.Should().NotBeNull();
+            JsonNode
+                .DeepEquals(_customViewRequestInfo.FrontendResponse.Body, expected)
+                .Should()
+                .BeTrue(
+                    $"""
+                    expected: {expected}
+
+                    actual: {_customViewRequestInfo.FrontendResponse.Body}
+                    """
+                );
+        }
+    }
+
+    [TestFixture]
+    [Parallelizable]
+    public class Given_A_Repository_That_Returns_Ownership_Not_Authorized : GetByIdHandlerTests
+    {
+        internal static readonly OwnershipAuthorizationFailure OwnershipFailure = new(
+            OwnershipAuthorizationFailureKind.OwnershipTokenMismatch,
+            ConfiguredStrategyIndex: 1,
+            StrategyName: AuthorizationStrategyNameConstants.OwnershipBased
+        );
+
+        internal class Repository : NotImplementedDocumentStoreRepository
+        {
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
+            {
+                return Task.FromResult<GetResult>(new GetFailureOwnershipNotAuthorized(OwnershipFailure));
+            }
+        }
+
+        private static readonly string _ownershipTraceId = "ownership-get-403";
+        private readonly RequestInfo _ownershipRequestInfo = RequestInfoWithRelationalMappingSet(
+            _ownershipTraceId
+        );
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var (getByIdHandler, serviceProvider) = Handler(new Repository());
+            _ownershipRequestInfo.ScopedServiceProvider = serviceProvider;
+
+            await getByIdHandler.Execute(_ownershipRequestInfo, NullNext);
+        }
+
+        [Test]
+        public void It_maps_the_ownership_denial_to_the_canonical_problem_details_403()
+        {
+            _ownershipRequestInfo.FrontendResponse.StatusCode.Should().Be(403);
+            _ownershipRequestInfo.FrontendResponse.ContentType.Should().Be("application/problem+json");
+
+            var expected = OwnershipAuthorizationFailureResponse.ForFailure(
+                OwnershipFailure,
+                new TraceId(_ownershipTraceId)
+            );
+
+            _ownershipRequestInfo.FrontendResponse.Body.Should().NotBeNull();
+            JsonNode
+                .DeepEquals(_ownershipRequestInfo.FrontendResponse.Body, expected)
+                .Should()
+                .BeTrue(
+                    $"""
+                    expected: {expected}
+
+                    actual: {_ownershipRequestInfo.FrontendResponse.Body}
+                    """
+                );
+        }
+    }
+
+    [TestFixture]
+    [Parallelizable]
     public class Given_A_Repository_That_Returns_Namespace_Not_Authorized : GetByIdHandlerTests
     {
         internal static readonly NamespaceAuthorizationFailure Failure = new(
@@ -573,7 +720,10 @@ public class GetByIdHandlerTests
 
         internal class Repository : NotImplementedDocumentStoreRepository
         {
-            public override Task<GetResult> GetDocumentById(IGetRequest getRequest)
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
             {
                 return Task.FromResult<GetResult>(new GetFailureNamespaceNotAuthorized(Failure));
             }
@@ -627,7 +777,10 @@ public class GetByIdHandlerTests
                 + "authorization strategies or with 'NamespaceBased' and/or "
                 + "'NoFurtherAuthorizationRequired' are currently supported.";
 
-            public override Task<GetResult> GetDocumentById(IGetRequest getRequest)
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
             {
                 return Task.FromResult<GetResult>(new GetFailureNotImplemented(ResponseBody));
             }
@@ -703,7 +856,10 @@ public class GetByIdHandlerTests
         {
             public static readonly string ResponseBody = "FailureMessage";
 
-            public override Task<GetResult> GetDocumentById(IGetRequest getRequest)
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
             {
                 return Task.FromResult<GetResult>(new UnknownFailure(ResponseBody));
             }
@@ -727,8 +883,13 @@ public class GetByIdHandlerTests
 
             var expected = $$"""
 {
-  "error": "FailureMessage",
-  "correlationId": "{{_traceId}}"
+  "detail": "An unexpected problem has occurred.",
+  "type": "urn:ed-fi:api:system",
+  "title": "System Error",
+  "status": 500,
+  "correlationId": "{{_traceId}}",
+  "validationErrors": {},
+  "errors": []
 }
 """;
 
@@ -769,7 +930,10 @@ actual: {requestInfo.FrontendResponse.Body}
         {
             public IGetRequest? CapturedRequest { get; private set; }
 
-            public override Task<GetResult> GetDocumentById(IGetRequest getRequest)
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
             {
                 CapturedRequest = getRequest;
 
@@ -842,6 +1006,15 @@ actual: {requestInfo.FrontendResponse.Body}
                 ],
                 DataStoreIds: []
             );
+            _requestInfo.ApplicationContext = new(
+                Id: 1,
+                ApplicationId: 2,
+                ClientId: "client-id",
+                ClientUuid: Guid.Parse("22222222-2222-2222-2222-222222222222"),
+                DataStoreIds: [],
+                CreatorOwnershipTokenId: 303,
+                OwnershipTokenIds: [202, 404]
+            );
             _requestInfo.ProfileContext = new ProfileContext(
                 ProfileName: "ReadableProfile",
                 ContentType: ProfileContentType.Read,
@@ -888,6 +1061,8 @@ actual: {requestInfo.FrontendResponse.Body}
             _repository
                 .CapturedRequest.AuthorizationContext.NamespacePrefixes.Should()
                 .Equal("uri://sample-a.org", "uri://sample-b.org");
+            _repository.CapturedRequest.AuthorizationContext.CreatorOwnershipTokenId.Should().Be(303);
+            _repository.CapturedRequest.AuthorizationContext.OwnershipTokenIds.Should().Equal(202, 404);
             _repository.CapturedRequest.ReadableProfileProjectionContext.Should().NotBeNull();
             _repository
                 .CapturedRequest.ReadableProfileProjectionContext!.ContentTypeDefinition.Should()
@@ -921,7 +1096,10 @@ actual: {requestInfo.FrontendResponse.Body}
         {
             public IGetRequest? CapturedRequest { get; private set; }
 
-            public override Task<GetResult> GetDocumentById(IGetRequest getRequest)
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
             {
                 CapturedRequest = getRequest;
 
@@ -1056,6 +1234,41 @@ actual: {requestInfo.FrontendResponse.Body}
 
     [TestFixture]
     [Parallelizable]
+    public class Given_A_Request_Cancellation_Token : GetByIdHandlerTests
+    {
+        private sealed class Repository : NotImplementedDocumentStoreRepository
+        {
+            public CancellationToken CapturedCancellationToken { get; private set; }
+
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
+            {
+                CapturedCancellationToken = cancellationToken;
+                return Task.FromResult<GetResult>(new GetFailureNotExists());
+            }
+        }
+
+        [Test]
+        public async Task It_passes_the_request_token_to_the_repository()
+        {
+            using var cancellationSource = new CancellationTokenSource();
+            var repository = new Repository();
+            var requestInfo = RequestInfoWithRelationalMappingSet();
+            requestInfo.RequestCancellationToken = cancellationSource.Token;
+
+            var (getByIdHandler, serviceProvider) = Handler(repository);
+            requestInfo.ScopedServiceProvider = serviceProvider;
+
+            await getByIdHandler.Execute(requestInfo, NullNext);
+
+            repository.CapturedCancellationToken.Should().Be(cancellationSource.Token);
+        }
+    }
+
+    [TestFixture]
+    [Parallelizable]
     public class Given_A_Descriptor_Request_With_Relational_Read_Metadata : GetByIdHandlerTests
     {
         private static ResourceInfo CreateResourceInfo(
@@ -1077,7 +1290,10 @@ actual: {requestInfo.FrontendResponse.Body}
         {
             public IGetRequest? CapturedRequest { get; private set; }
 
-            public override Task<GetResult> GetDocumentById(IGetRequest getRequest)
+            public override Task<GetResult> GetDocumentById(
+                IGetRequest getRequest,
+                CancellationToken cancellationToken = default
+            )
             {
                 CapturedRequest = getRequest;
 

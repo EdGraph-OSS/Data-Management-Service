@@ -4,9 +4,13 @@
 // See the LICENSE and NOTICES files in the project root for more information.
 
 using System.Data;
+using System.Text.Json;
 using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Backend.External.Plans;
+using EdFi.DataManagementService.Core.External.Model;
 using FluentAssertions;
+using Microsoft.Data.SqlClient;
+using Npgsql;
 using NUnit.Framework;
 using static EdFi.DataManagementService.Backend.Plans.Tests.Unit.HydrationBatchBuilderTestHelper;
 
@@ -79,7 +83,7 @@ public class Given_HydrationBatchBuilder_With_Single_Keyset
             .StartWith(
                 """
                 DROP TABLE IF EXISTS "page";
-                CREATE TEMP TABLE "page" ("DocumentId" bigint PRIMARY KEY) ON COMMIT DROP;
+                CREATE TEMP TABLE "page" ("DocumentId" bigint PRIMARY KEY, "Ordinal" int NULL) ON COMMIT DROP;
 
                 INSERT INTO "page" ("DocumentId") VALUES (@DocumentId);
 
@@ -87,7 +91,11 @@ public class Given_HydrationBatchBuilder_With_Single_Keyset
                     d."DocumentId",
                 """
             );
-        _pgsqlBatch.Should().Contain("ORDER BY d.\"DocumentId\";\n\nSELECT root columns FROM root;\n\n");
+        _pgsqlBatch
+            .Should()
+            .Contain(
+                "ORDER BY COALESCE(k.\"Ordinal\", d.\"DocumentId\"), d.\"DocumentId\";\n\nSELECT root columns FROM root;\n\n"
+            );
         _pgsqlBatch.Should().Contain("SELECT root columns FROM root;\n\nSELECT child columns FROM child;\n");
 
         _mssqlBatch
@@ -96,7 +104,7 @@ public class Given_HydrationBatchBuilder_With_Single_Keyset
                 """
                 IF OBJECT_ID('tempdb..[#page]') IS NOT NULL
                     DROP TABLE [#page];
-                CREATE TABLE [#page] ([DocumentId] bigint PRIMARY KEY);
+                CREATE TABLE [#page] ([DocumentId] bigint PRIMARY KEY, [Ordinal] int NULL);
 
                 INSERT INTO [#page] ([DocumentId]) VALUES (@DocumentId);
 
@@ -104,7 +112,11 @@ public class Given_HydrationBatchBuilder_With_Single_Keyset
                     d.[DocumentId],
                 """
             );
-        _mssqlBatch.Should().Contain("ORDER BY d.[DocumentId];\n\nSELECT root columns FROM root;\n\n");
+        _mssqlBatch
+            .Should()
+            .Contain(
+                "ORDER BY COALESCE(k.[Ordinal], d.[DocumentId]), d.[DocumentId];\n\nSELECT root columns FROM root;\n\n"
+            );
         _mssqlBatch.Should().Contain("SELECT root columns FROM root;\n\nSELECT child columns FROM child;\n");
     }
 
@@ -113,9 +125,7 @@ public class Given_HydrationBatchBuilder_With_Single_Keyset
     {
         _pgsqlBatch.Should().Contain("\"DocumentUuid\"");
         _pgsqlBatch.Should().Contain("\"ContentVersion\"");
-        _pgsqlBatch.Should().Contain("\"IdentityVersion\"");
         _pgsqlBatch.Should().Contain("\"ContentLastModifiedAt\"");
-        _pgsqlBatch.Should().Contain("\"IdentityLastModifiedAt\"");
         _pgsqlBatch.Should().Contain("\"dms\".\"Document\"");
     }
 
@@ -127,26 +137,24 @@ public class Given_HydrationBatchBuilder_With_Single_Keyset
             "d.\"DocumentId\"",
             "d.\"DocumentUuid\"",
             "d.\"ContentVersion\"",
-            "d.\"IdentityVersion\"",
             "d.\"ContentLastModifiedAt\"",
-            "d.\"IdentityLastModifiedAt\""
+            "d.\"ResourceKeyId\""
         );
         AssertAppearsInOrder(
             _mssqlBatch,
             "d.[DocumentId]",
             "d.[DocumentUuid]",
             "d.[ContentVersion]",
-            "d.[IdentityVersion]",
             "d.[ContentLastModifiedAt]",
-            "d.[IdentityLastModifiedAt]"
+            "d.[ResourceKeyId]"
         );
     }
 
     [Test]
     public void It_should_emit_deterministic_order_by_on_document_metadata()
     {
-        _pgsqlBatch.Should().Contain("ORDER BY d.\"DocumentId\"");
-        _mssqlBatch.Should().Contain("ORDER BY d.[DocumentId]");
+        _pgsqlBatch.Should().Contain("ORDER BY COALESCE(k.\"Ordinal\", d.\"DocumentId\"), d.\"DocumentId\"");
+        _mssqlBatch.Should().Contain("ORDER BY COALESCE(k.[Ordinal], d.[DocumentId]), d.[DocumentId]");
     }
 
     [Test]
@@ -176,6 +184,125 @@ public class Given_HydrationBatchBuilder_With_Single_Keyset
         docMetadataIndex.Should().BePositive();
         rootSelectIndex.Should().BeGreaterThan(docMetadataIndex);
         childSelectIndex.Should().BeGreaterThan(rootSelectIndex);
+    }
+}
+
+[TestFixture]
+public class Given_HydrationBatchBuilder_With_Pgsql_Selected_Page_Keyset
+{
+    private readonly long[] _documentIds = [300L, 100L, 200L];
+    private string _batch = null!;
+
+    [SetUp]
+    public void Setup()
+    {
+        _batch = HydrationBatchBuilder.Build(
+            BuildTestReadPlan(SqlDialect.Pgsql),
+            new PageKeysetSpec.SelectedPage(_documentIds),
+            SqlDialect.Pgsql
+        );
+    }
+
+    [Test]
+    public void It_should_materialize_the_selected_page_with_zero_based_ordinals()
+    {
+        _batch
+            .Should()
+            .Contain(
+                "CREATE TEMP TABLE \"page\" (\"DocumentId\" bigint PRIMARY KEY, \"Ordinal\" int NULL) ON COMMIT DROP;"
+            );
+        _batch.Should().Contain("INSERT INTO \"page\" (\"DocumentId\", \"Ordinal\")");
+        _batch.Should().Contain("(@selectedDocumentId_0, @selectedOrdinal_0)");
+        _batch.Should().Contain("(@selectedDocumentId_1, @selectedOrdinal_1)");
+        _batch.Should().Contain("(@selectedDocumentId_2, @selectedOrdinal_2)");
+        _batch.Should().Contain("ORDER BY COALESCE(k.\"Ordinal\", d.\"DocumentId\"), d.\"DocumentId\";");
+    }
+
+    [Test]
+    public void It_should_bind_selected_page_document_ids_and_ordinals()
+    {
+        using var command = new NpgsqlCommand();
+
+        HydrationBatchBuilder.AddParameters(command, new PageKeysetSpec.SelectedPage(_documentIds));
+
+        command.Parameters.Count.Should().Be(6);
+        command.Parameters["@selectedDocumentId_0"].Value.Should().Be(300L);
+        command.Parameters["@selectedOrdinal_0"].Value.Should().Be(0);
+        command.Parameters["@selectedDocumentId_1"].Value.Should().Be(100L);
+        command.Parameters["@selectedOrdinal_1"].Value.Should().Be(1);
+        command.Parameters["@selectedDocumentId_2"].Value.Should().Be(200L);
+        command.Parameters["@selectedOrdinal_2"].Value.Should().Be(2);
+    }
+}
+
+[TestFixture]
+public class Given_HydrationBatchBuilder_With_Mssql_Selected_Page_Keyset
+{
+    private const int ValidPageSizeAboveScalarParameterLimit =
+        MssqlCommandLimits.MaxUserParametersPerCommand + 1;
+
+    private long[] _documentIds = null!;
+    private string _batch = null!;
+
+    [SetUp]
+    public void Setup()
+    {
+        _documentIds =
+        [
+            .. Enumerable
+                .Range(0, ValidPageSizeAboveScalarParameterLimit)
+                .Select(static index => 10_000L + index),
+        ];
+        _batch = HydrationBatchBuilder.Build(
+            BuildTestReadPlan(SqlDialect.Mssql),
+            new PageKeysetSpec.SelectedPage(_documentIds),
+            SqlDialect.Mssql
+        );
+    }
+
+    [Test]
+    public void It_should_materialize_the_selected_page_from_one_json_candidate_set_parameter()
+    {
+        _batch
+            .Should()
+            .Contain("CREATE TABLE [#page] ([DocumentId] bigint PRIMARY KEY, [Ordinal] int NULL);");
+        _batch.Should().Contain("INSERT INTO [#page] ([DocumentId], [Ordinal])");
+        _batch.Should().Contain("FROM OPENJSON(@selectedDocumentIdsJson)");
+        _batch.Should().Contain("[DocumentId] bigint '$.DocumentId'");
+        _batch.Should().Contain("[Ordinal] int '$.Ordinal'");
+        _batch.Should().Contain("ORDER BY COALESCE(k.[Ordinal], d.[DocumentId]), d.[DocumentId];");
+        _batch.Should().NotContain("@selectedDocumentId_");
+    }
+
+    [Test]
+    public void It_should_bind_the_selected_page_as_one_nvarchar_max_json_parameter()
+    {
+        using var command = new SqlCommand();
+
+        HydrationBatchBuilder.AddParameters(command, new PageKeysetSpec.SelectedPage(_documentIds));
+
+        command.Parameters.Count.Should().Be(1);
+        command.Parameters.Contains("@selectedDocumentIdsJson").Should().BeTrue();
+        var parameter = command.Parameters["@selectedDocumentIdsJson"];
+        parameter.SqlDbType.Should().Be(SqlDbType.NVarChar);
+        parameter.Size.Should().Be(-1);
+
+        using var jsonDocument = JsonDocument.Parse((string)parameter.Value);
+        jsonDocument.RootElement.GetArrayLength().Should().Be(ValidPageSizeAboveScalarParameterLimit);
+        jsonDocument.RootElement[0].GetProperty("DocumentId").GetInt64().Should().Be(10_000L);
+        jsonDocument.RootElement[0].GetProperty("Ordinal").GetInt32().Should().Be(0);
+        jsonDocument
+            .RootElement[ValidPageSizeAboveScalarParameterLimit - 1]
+            .GetProperty("DocumentId")
+            .GetInt64()
+            .Should()
+            .Be(10_000L + ValidPageSizeAboveScalarParameterLimit - 1);
+        jsonDocument
+            .RootElement[ValidPageSizeAboveScalarParameterLimit - 1]
+            .GetProperty("Ordinal")
+            .GetInt32()
+            .Should()
+            .Be(ValidPageSizeAboveScalarParameterLimit - 1);
     }
 }
 
@@ -225,9 +352,8 @@ public class Given_HydrationBatchBuilder_With_Pgsql_Single_Document_Fast_Path
                     d."DocumentId",
                     d."DocumentUuid",
                     d."ContentVersion",
-                    d."IdentityVersion",
                     d."ContentLastModifiedAt",
-                    d."IdentityLastModifiedAt"
+                    d."ResourceKeyId"
                 FROM "dms"."Document" d
                 WHERE d."DocumentId" = @DocumentId
                 ORDER BY d."DocumentId";
@@ -441,7 +567,8 @@ public class Given_HydrationBatchBuilder_With_Pgsql_Single_Document_Fast_Path
         );
         var keyset = new PageKeysetSpec.Query(
             queryPlan,
-            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L }
+            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L },
+            PageOrderingMode.DocumentId
         );
 
         var batch = HydrationBatchBuilder.Build(
@@ -473,7 +600,8 @@ public class Given_HydrationBatchBuilder_With_Pgsql_Single_Document_Fast_Path
         );
         var keyset = new PageKeysetSpec.Query(
             queryPlan,
-            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L }
+            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L },
+            PageOrderingMode.DocumentId
         );
         var readPlan = BuildTestReadPlan(SqlDialect.Pgsql, includeSingleDocumentSql: true);
 
@@ -487,44 +615,6 @@ public class Given_HydrationBatchBuilder_With_Pgsql_Single_Document_Fast_Path
             readPlan,
             keyset,
             SqlDialect.Pgsql,
-            new HydrationExecutionOptions(UseSingleDocumentFastPath: true)
-        );
-
-        fastPathFlaggedBatch.Should().Be(expectedKeysetBatch);
-    }
-
-    [Test]
-    public void It_should_keep_the_keyset_path_for_sql_server_even_when_the_feature_flag_is_enabled()
-    {
-        var batch = HydrationBatchBuilder.Build(
-            BuildTestReadPlan(SqlDialect.Mssql),
-            new PageKeysetSpec.Single(42L),
-            SqlDialect.Mssql,
-            new HydrationExecutionOptions(UseSingleDocumentFastPath: true)
-        );
-
-        batch.Should().Contain("CREATE TABLE [#page]");
-        batch.Should().Contain("INSERT INTO [#page] ([DocumentId]) VALUES (@DocumentId);");
-        batch.Should().Contain("SELECT root columns FROM root;");
-        batch.Should().NotContain(HydrationBatchBuilderTestHelper.RootSingleDocumentSql);
-    }
-
-    [Test]
-    public void It_should_match_the_existing_sql_server_keyset_batch_when_the_feature_flag_is_enabled()
-    {
-        var readPlan = BuildTestReadPlan(SqlDialect.Mssql);
-        var keyset = new PageKeysetSpec.Single(42L);
-
-        var expectedKeysetBatch = HydrationBatchBuilder.Build(
-            readPlan,
-            keyset,
-            SqlDialect.Mssql,
-            new HydrationExecutionOptions(UseSingleDocumentFastPath: false)
-        );
-        var fastPathFlaggedBatch = HydrationBatchBuilder.Build(
-            readPlan,
-            keyset,
-            SqlDialect.Mssql,
             new HydrationExecutionOptions(UseSingleDocumentFastPath: true)
         );
 
@@ -564,6 +654,144 @@ public class Given_HydrationBatchBuilder_With_Pgsql_Single_Document_Fast_Path
             ],
             SelectBySingleDocumentSql: LookupSingleDocumentSql
         );
+}
+
+[TestFixture]
+public class Given_HydrationBatchBuilder_With_Mssql_Single_Document_Fast_Path
+{
+    /// <summary>
+    /// Stands in for the composite carrier's captured-target-present predicate. The read path never
+    /// supplies one; only the guarded write-path builder does.
+    /// </summary>
+    private const string GuardPredicateSql = "@dms_composite_target_documentid IS NOT NULL";
+
+    [Test]
+    public void It_should_emit_the_sql_server_keyset_batch_when_the_feature_flag_is_disabled()
+    {
+        var batch = HydrationBatchBuilder.Build(
+            BuildTestReadPlan(SqlDialect.Mssql, includeSingleDocumentSql: true),
+            new PageKeysetSpec.Single(42L),
+            SqlDialect.Mssql,
+            new HydrationExecutionOptions(UseSingleDocumentFastPath: false)
+        );
+
+        batch.Should().Contain("CREATE TABLE [#page]");
+        batch.Should().Contain("INSERT INTO [#page] ([DocumentId]) VALUES (@DocumentId);");
+        batch.Should().Contain("SELECT root columns FROM root;");
+        batch.Should().NotContain(HydrationBatchBuilderTestHelper.RootSingleDocumentSql);
+    }
+
+    [Test]
+    public void It_should_not_emit_sql_server_page_temp_table_work_when_the_single_document_fast_path_is_enabled()
+    {
+        var batch = HydrationBatchBuilder.Build(
+            BuildTestReadPlan(SqlDialect.Mssql, includeSingleDocumentSql: true),
+            new PageKeysetSpec.Single(42L),
+            SqlDialect.Mssql,
+            new HydrationExecutionOptions(UseSingleDocumentFastPath: true)
+        );
+
+        batch.Should().NotContain("CREATE TABLE [#page]");
+        batch.Should().NotContain("DROP TABLE [#page]");
+        batch.Should().NotContain("INSERT INTO [#page]");
+        batch
+            .Should()
+            .Contain(
+                """
+                SELECT
+                    d.[DocumentId],
+                    d.[DocumentUuid],
+                    d.[ContentVersion],
+                    d.[ContentLastModifiedAt],
+                    d.[ResourceKeyId]
+                FROM [dms].[Document] d
+                WHERE d.[DocumentId] = @DocumentId
+                ORDER BY d.[DocumentId];
+                """
+            );
+    }
+
+    [Test]
+    public void It_should_emit_the_sql_server_single_document_fast_path_when_the_feature_flag_is_enabled()
+    {
+        var readPlan = BuildTestReadPlan(SqlDialect.Mssql, includeSingleDocumentSql: true);
+        var keyset = new PageKeysetSpec.Single(42L);
+
+        var keysetBatch = HydrationBatchBuilder.Build(
+            readPlan,
+            keyset,
+            SqlDialect.Mssql,
+            new HydrationExecutionOptions(UseSingleDocumentFastPath: false)
+        );
+        var fastPathBatch = HydrationBatchBuilder.Build(
+            readPlan,
+            keyset,
+            SqlDialect.Mssql,
+            new HydrationExecutionOptions(UseSingleDocumentFastPath: true)
+        );
+
+        fastPathBatch.Should().NotBe(keysetBatch);
+        fastPathBatch.Should().NotContain("CREATE TABLE [#page]");
+        fastPathBatch.Should().Contain(HydrationBatchBuilderTestHelper.RootSingleDocumentSql);
+        fastPathBatch.Should().Contain(HydrationBatchBuilderTestHelper.ChildSingleDocumentSql);
+    }
+
+    /// <summary>
+    /// Negative control for the guarded write-path builder: with the flag off it still materializes
+    /// <c>[#page]</c> behind the caller's guard predicate. Without this the enabled case below could
+    /// pass against a builder that never emitted the preamble in the first place.
+    /// </summary>
+    [Test]
+    public void It_should_emit_the_sql_server_guarded_keyset_batch_when_the_feature_flag_is_disabled()
+    {
+        var batch = HydrationBatchBuilder.BuildGuardedSingleDocumentBatch(
+            BuildTestReadPlan(SqlDialect.Mssql, includeSingleDocumentSql: true),
+            SqlDialect.Mssql,
+            new HydrationExecutionOptions(UseSingleDocumentFastPath: false),
+            GuardPredicateSql
+        );
+
+        batch.Should().Contain("CREATE TABLE [#page]");
+        batch.Should().Contain("INSERT INTO [#page]");
+        batch.Should().Contain(GuardPredicateSql);
+    }
+
+    /// <summary>
+    /// A composite write hydrates current state through the guarded builder, so the preamble has to be
+    /// gone on that path and not only on the read path covered above.
+    /// </summary>
+    [Test]
+    public void It_should_not_emit_sql_server_page_temp_table_work_on_the_guarded_write_path_when_the_fast_path_is_enabled()
+    {
+        var batch = HydrationBatchBuilder.BuildGuardedSingleDocumentBatch(
+            BuildTestReadPlan(SqlDialect.Mssql, includeSingleDocumentSql: true),
+            SqlDialect.Mssql,
+            new HydrationExecutionOptions(UseSingleDocumentFastPath: true),
+            GuardPredicateSql
+        );
+
+        batch.Should().NotContain("CREATE TABLE [#page]");
+        batch.Should().NotContain("DROP TABLE [#page]");
+        batch.Should().NotContain("INSERT INTO [#page]");
+        batch.Should().Contain(HydrationBatchBuilderTestHelper.RootSingleDocumentSql);
+    }
+
+    /// <summary>
+    /// The fast path is pure selects, so an absent captured id yields zero-row result sets on its own
+    /// and the caller's guard predicate is dropped rather than carried into the batch.
+    /// </summary>
+    [Test]
+    public void It_should_drop_the_guard_predicate_on_the_sql_server_fast_path()
+    {
+        var batch = HydrationBatchBuilder.BuildGuardedSingleDocumentBatch(
+            BuildTestReadPlan(SqlDialect.Mssql, includeSingleDocumentSql: true),
+            SqlDialect.Mssql,
+            new HydrationExecutionOptions(UseSingleDocumentFastPath: true),
+            GuardPredicateSql
+        );
+
+        batch.Should().NotContain(GuardPredicateSql);
+    }
 }
 
 [TestFixture]
@@ -741,6 +969,33 @@ public class Given_HydrationBatchBuilder_With_Pgsql_Single_Document_Fast_Path_Mi
     }
 }
 
+/// <summary>
+/// The guard is dialect-parameterized on <c>DisplayName</c>, and its SQL Server wording became
+/// reachable only once SQL Server started supporting single-document hydration.
+/// </summary>
+[TestFixture]
+public class Given_HydrationBatchBuilder_With_Mssql_Single_Document_Fast_Path_Missing_Sql
+{
+    [Test]
+    public void It_should_throw_when_a_table_plan_is_missing_single_document_sql()
+    {
+        var act = () =>
+            HydrationBatchBuilder.Build(
+                BuildTestReadPlan(SqlDialect.Mssql),
+                new PageKeysetSpec.Single(42L),
+                SqlDialect.Mssql,
+                new HydrationExecutionOptions(UseSingleDocumentFastPath: true)
+            );
+
+        var exception = act.Should().Throw<InvalidOperationException>().Which;
+        exception
+            .Message.Should()
+            .Be(
+                "SQL Server single-document hydration requires table read plan at index '0' for table 'edfi.School' to provide SelectBySingleDocumentSql."
+            );
+    }
+}
+
 [TestFixture]
 public class Given_HydrationBatchBuilder_With_Query_Keyset
 {
@@ -762,7 +1017,8 @@ public class Given_HydrationBatchBuilder_With_Query_Keyset
         );
         var keyset = new PageKeysetSpec.Query(
             queryPlan,
-            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L }
+            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L },
+            PageOrderingMode.DocumentId
         );
 
         _pgsqlBatch = HydrationBatchBuilder.Build(plan, keyset, SqlDialect.Pgsql);
@@ -800,13 +1056,13 @@ public class Given_HydrationBatchBuilder_With_Query_Keyset
             .StartWith(
                 """
                 DROP TABLE IF EXISTS "page";
-                CREATE TEMP TABLE "page" ("DocumentId" bigint PRIMARY KEY) ON COMMIT DROP;
+                CREATE TEMP TABLE "page" ("DocumentId" bigint PRIMARY KEY, "Ordinal" int NULL) ON COMMIT DROP;
 
                 WITH page_ids AS (
                 SELECT r."DocumentId" FROM "edfi"."School" r ORDER BY r."DocumentId" LIMIT @limit OFFSET @offset
                 )
                 INSERT INTO "page" ("DocumentId")
-                SELECT "DocumentId" FROM page_ids;
+                SELECT "DocumentId" FROM page_ids RETURNING "DocumentId";
 
                 SELECT COUNT(*) AS TotalCount FROM "edfi"."School" r;
 
@@ -834,12 +1090,13 @@ public class Given_HydrationBatchBuilder_With_Compiled_Query_Keyset
                     RootTable: new DbTableName(new DbSchemaName("edfi"), "School"),
                     Predicates: [],
                     UnifiedAliasMappingsByColumn: new Dictionary<DbColumnName, ColumnStorage.UnifiedAlias>(),
-                    IncludeTotalCountSql: true
+                    Mode: new PageCandidateMode.Traditional(IncludeTotalCountSql: true)
                 )
             );
             var keyset = new PageKeysetSpec.Query(
                 compiledQueryPlan,
-                new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L }
+                new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L },
+                PageOrderingMode.DocumentId
             );
 
             var batch = HydrationBatchBuilder.Build(plan, keyset, dialect);
@@ -879,7 +1136,7 @@ public class Given_HydrationBatchBuilder_With_Compiled_Query_Keyset
     public void It_should_emit_valid_cte_structure()
     {
         _pgsqlBatch.Should().Contain("WITH page_ids AS (");
-        _pgsqlBatch.Should().Contain("FROM page_ids;");
+        _pgsqlBatch.Should().Contain("FROM page_ids RETURNING \"DocumentId\";");
         _mssqlBatch.Should().Contain("WITH page_ids AS (");
         _mssqlBatch.Should().Contain("FROM page_ids;");
     }
@@ -991,7 +1248,8 @@ public class Given_HydrationBatchBuilder_With_Zero_Limit_Query_Keyset
                 PageParametersInOrder: [new QuerySqlParameter(QuerySqlParameterRole.Offset, "offset")],
                 TotalCountParametersInOrder: null
             ),
-            new Dictionary<string, object?> { ["offset"] = 0L }
+            new Dictionary<string, object?> { ["offset"] = 0L },
+            PageOrderingMode.DocumentId
         );
 
         var batch = HydrationBatchBuilder.Build(plan, keyset, SqlDialect.Mssql);
@@ -1017,13 +1275,14 @@ public class Given_HydrationBatchBuilder_With_Zero_Limit_Query_Keyset
                 RootTable: new DbTableName(new DbSchemaName("edfi"), "School"),
                 Predicates: [],
                 UnifiedAliasMappingsByColumn: new Dictionary<DbColumnName, ColumnStorage.UnifiedAlias>(),
-                IncludeTotalCountSql: includeTotalCountSql
+                Mode: new PageCandidateMode.Traditional(IncludeTotalCountSql: includeTotalCountSql)
             )
         );
 
         return new PageKeysetSpec.Query(
             compiledQueryPlan,
-            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = limitValue }
+            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = limitValue },
+            PageOrderingMode.DocumentId
         );
     }
 
@@ -1055,7 +1314,8 @@ public class Given_HydrationBatchBuilder_With_Query_Keyset_Without_TotalCount
         );
         var keyset = new PageKeysetSpec.Query(
             queryPlan,
-            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L }
+            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L },
+            PageOrderingMode.DocumentId
         );
 
         _pgsqlBatch = HydrationBatchBuilder.Build(plan, keyset, SqlDialect.Pgsql);
@@ -1077,7 +1337,8 @@ public class Given_HydrationBatchBuilder_AddParameters_With_Query_Keyset
         var command = new RecordingDbCommand(new DataTable().CreateDataReader());
         var keyset = new PageKeysetSpec.Query(
             CreateQueryPlan(totalCountParameterNames: null),
-            new Dictionary<string, object?> { ["offset"] = 0L }
+            new Dictionary<string, object?> { ["offset"] = 0L },
+            PageOrderingMode.DocumentId
         );
 
         var act = () => HydrationBatchBuilder.AddParameters(command, keyset);
@@ -1093,7 +1354,8 @@ public class Given_HydrationBatchBuilder_AddParameters_With_Query_Keyset
         var command = new RecordingDbCommand(new DataTable().CreateDataReader());
         var keyset = new PageKeysetSpec.Query(
             CreateQueryPlan(totalCountParameterNames: ["schoolYear"]),
-            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L }
+            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L },
+            PageOrderingMode.DocumentId
         );
 
         var act = () => HydrationBatchBuilder.AddParameters(command, keyset);
@@ -1117,7 +1379,8 @@ public class Given_HydrationBatchBuilder_AddParameters_With_Query_Keyset
                 ["schoolYear"] = null,
                 ["offset"] = 0L,
                 ["limit"] = 25L,
-            }
+            },
+            PageOrderingMode.DocumentId
         );
 
         HydrationBatchBuilder.AddParameters(command, keyset);

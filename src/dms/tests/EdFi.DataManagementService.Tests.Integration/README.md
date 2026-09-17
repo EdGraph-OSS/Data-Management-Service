@@ -62,7 +62,7 @@ Start SQL Server in a container. The example maps SQL Server to host port
 `14333` to avoid collisions with a developer SQL Server on `1433`:
 
 ```powershell
-docker run --name dms-mssql-integration -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='EdFi_Dms1!' -p 14333:1433 -d mcr.microsoft.com/mssql/server:2022-latest
+docker run --name dms-mssql-integration-2025 -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='EdFi_Dms1!' -p 14333:1433 -d mcr.microsoft.com/mssql/server:2025-latest
 ```
 
 Then set the admin connection string:
@@ -71,7 +71,10 @@ Then set the admin connection string:
 $env:ConnectionStrings__MssqlAdmin = "Server=localhost,14333;User Id=sa;Password=EdFi_Dms1!;TrustServerCertificate=true"
 ```
 
-If the container already exists, use `docker start dms-mssql-integration`.
+If the container already exists, use `docker start dms-mssql-integration-2025`.
+The version-suffixed name keeps SQL Server 2025 separate from any `dms-mssql-integration` container created from the earlier SQL Server 2022 instructions.
+Do not reuse that legacy container: it still runs SQL Server 2022, so the MSSQL tests would run against an unsupported runtime and tests gated on SQL Server 2025 (such as the native-json evaluation fixture) would silently skip.
+Remove it with `docker rm -f dms-mssql-integration` once anything you need from it is saved.
 If `14333` is busy, map another host port and use that port in
 `ConnectionStrings__MssqlAdmin`.
 
@@ -123,6 +126,7 @@ effective schema.
 | `ProfileNestedAndRootExtensionChildren` | `src/dms/backend/EdFi.DataManagementService.Backend.IntegrationFixtures/profile-nested-and-root-extension-children/` | Nested children plus root-level extension children under a profile. |
 | `ProfileCollectionAlignedExtension` | `src/dms/backend/EdFi.DataManagementService.Backend.IntegrationFixtures/profile-collection-aligned-extension/` | Extension scope aligned to a profile-visible collection. |
 | `ProfileCollectionAlignedExtensionHiddenDescendant` | `src/dms/backend/EdFi.DataManagementService.Backend.IntegrationFixtures/profile-collection-aligned-extension-hidden-descendant/` | Same shape with a hidden descendant; loaded only by scenarios that need it. |
+| `CursorPartitionContract` | `src/dms/backend/EdFi.DataManagementService.Backend.IntegrationFixtures/cursor-partition-contract/` | The descriptor-runtime core schema plus one standalone extension resource, giving a regular, an extension, and a descriptor collection in one fixture for cursor and partition walk coverage. The extension resource declares a query field literally named `number`, which is what makes the approved ODS collision difference executable: that key filters on the collection GET and is consumed as the partition count on `/partitions`. |
 | `AuthorizationQuery` | `src/dms/backend/Fixtures/synthetic/authorization-query/` | Synthetic EdOrg relationship authorization resources used for API-level relationship ProblemDetails response coverage. |
 | `AuthoritativeDs52` | `src/dms/backend/Fixtures/authoritative/ds-5.2/` | Full Ed-Fi Data Standard 5.2 schema. Loaded only by scenarios that need production resource shapes the focused fixtures do not model (e.g. School/ClassPeriod/BellSchedule identity-propagation regressions). Baseline provisioning is heavier than focused fixtures. |
 | `AuthoritativeDs52Tpdm` | `src/dms/backend/Fixtures/authoritative/ds-5.2-tpdm/` | Full Ed-Fi Data Standard 5.2 schema plus the checked-in TPDM ApiSchema. Loaded only by SurveyResponse/TPDM production-shape regressions that need the responder-choice reference model. Baseline provisioning is heavier than focused fixtures. |
@@ -198,6 +202,36 @@ extensions, and the catalog walker matches the lowercase pattern.
    bind to the chosen `FixtureKey`, and exposes one `[Test]` method per
    scenario entry point.
 
+## Cross-engine API parity convention
+
+Required cross-engine API behaviors are tracked in the machine-readable parity
+catalog (`ParityScenarioCatalog.Api.cs` in
+`EdFi.DataManagementService.Backend.Tests.Common`) and enforced by the
+`Given_The_Api_Parity_Catalog_Resolution` reflection meta-test in this project,
+which resolves every Api-layer catalog row's declared PostgreSQL and SQL Server
+locations to real `[Test]` methods without needing a database connection.
+
+When you add an API behavior that must hold on both engines:
+
+1. **Implement the scenario logic once** as a `static` method in `Scenarios/`
+   (see [Adding a new scenario](#adding-a-new-scenario)).
+2. **Add independently named PostgreSQL and SQL Server `[Test]` wrappers** in
+   `Tests/Postgresql/` and `Tests/Mssql/`. The wrapper class names differ by
+   dialect; both expose the **same stable method entry point** (the `[Test]`
+   method name recorded in the catalog).
+3. **Record the exact locations** — file, fixture class, and method — for both
+   engines in the matching `ParityScenarioCatalog.Api.cs` row.
+4. **Run the API parity meta-test**
+   (`dotnet test src/dms/tests/EdFi.DataManagementService.Tests.Integration --filter "FullyQualifiedName~Parity"`);
+   it fails with an actionable `scenario [engine] File::Fixture::Method` message
+   when a declared covered location does not resolve.
+
+This convention is **catalog-driven**: it enforces only the wrappers the catalog
+declares. It does **not** ban legitimate single-engine regression tests, and it
+does **not** require global PostgreSQL/SQL Server wrapper-name or file-name
+symmetry — only that each catalog-declared covered location resolves to exactly
+one `[Test]` method.
+
 ## Debugging
 
 When a runtime failure produces little useful output in the test console,
@@ -217,6 +251,6 @@ Useful checks:
 ```powershell
 Get-ChildItem Env:ConnectionStrings__MssqlAdmin -ErrorAction SilentlyContinue
 Test-NetConnection -ComputerName localhost -Port 14333
-docker ps --filter name=dms-mssql-integration
-docker logs dms-mssql-integration --tail 80
+docker ps --filter name=dms-mssql-integration-2025
+docker logs dms-mssql-integration-2025 --tail 80
 ```

@@ -16,10 +16,17 @@ services:
       AppSettings__AuthenticationService: ${OAUTH_TOKEN_ENDPOINT:-http://host.docker.internal:8080/oauth/token}
       AppSettings__BypassTypeCoercion: ${BYPASS_TYPE_COERCION:-false}
       AppSettings__AllowIdentityUpdateOverrides: ${ALLOW_IDENTITY_UPDATE_OVERRIDES:-}
-      Serilog__MinimumLevel__Default: ${LOG_LEVEL:-DEBUG}
+      Serilog__MinimumLevel__Default: ${LOG_LEVEL:-Information}
+      OtlpLogging__Enabled: ${OTLP_LOGGING_ENABLED:-false}
+      OtlpLogging__Endpoint: ${OTLP_LOGGING_ENDPOINT:-}
+      OtlpLogging__Protocol: ${OTLP_LOGGING_PROTOCOL:-HttpProtobuf}
+      OtlpLogging__DeploymentEnvironment: ${OTLP_LOGGING_DEPLOYMENT_ENVIRONMENT:-}
       # Mask incoming HTTP POST and PUT request body structures in DEBUG logging
       AppSettings__MaskRequestBodyInLogs: ${MASK_REQUEST_BODY_IN_LOGS:-true}
       AppSettings__MaximumPageSize: ${MAXIMUM_PAGE_SIZE:-500}
+      AppSettings__DefaultPartitionCount: ${DEFAULT_PARTITION_COUNT:-10}
+      # Restores legacy DocumentId ordering for change-version-filtered queries (deployment rollback switch)
+      AppSettings__UseLegacyDocumentIdOrderingForChangeQueries: ${USE_LEGACY_DOCUMENT_ID_ORDERING_FOR_CHANGE_QUERIES:-false}
       # Segment of the url to use as base for all request. The default path base is deliberately blank on the following line
       AppSettings__PathBase: ${PATH_BASE:-}
       AppSettings__ReverseProxy__UseForwardedHeaders: ${USE_REVERSE_PROXY_HEADERS:-false}
@@ -34,12 +41,12 @@ services:
       DatabaseOptions__IsolationLevel: ${DATABASE_ISOLATION_LEVEL:-RepeatableRead}
       # "DATABASE_CONNECTION_STRING_ADMIN" can have alternate credentials with elevated permissions for creating database objects
       DATABASE_CONNECTION_STRING_ADMIN: ${DATABASE_CONNECTION_STRING_ADMIN:-host=dms-postgresql;port=5432;username=postgres;password=${POSTGRES_PASSWORD};database=${POSTGRES_DB_NAME};}
-      RateLimit__PermitLimit: ${DMS_RATE_LIMIT_PERMIT_LIMIT:-5000}
+      RateLimit__PermitLimit: ${DMS_RATE_LIMIT_PERMIT_LIMIT:-20000}
       RateLimit__QueueLimit: ${DMS_RATE_LIMIT_QUEUE_LIMIT:-0}
       RateLimit__Window: ${DMS_RATE_LIMIT_WINDOW:-10}
-      CircuitBreaker__FailureRatio: ${FAILURE_RATIO:-0.01}
-      CircuitBreaker__SamplingDurationSeconds: ${SAMPLING_DURATION_SECONDS:-10}
-      CircuitBreaker__MinimumThroughput: ${MINIMUM_THROUGHPUT:-2}
+      CircuitBreaker__FailureRatio: ${FAILURE_RATIO:-0.1}
+      CircuitBreaker__SamplingDurationSeconds: ${SAMPLING_DURATION_SECONDS:-120}
+      CircuitBreaker__MinimumThroughput: ${MINIMUM_THROUGHPUT:-20}
       CircuitBreaker__BreakDurationSeconds: ${BREAK_DURATION_SECONDS:-30}
       ConfigurationServiceSettings__BaseUrl: ${CONFIG_SERVICE_URL:-http://ed-fi-api-config:8081}
       ConfigurationServiceSettings__ClientId: ${CONFIG_SERVICE_CLIENT_ID:-CMSReadOnlyAccess}
@@ -52,15 +59,28 @@ services:
       Cors__SwaggerUIOrigin: ${DMS_SWAGGER_UI_URL:-http://localhost:8082}
       AppSettings__EnableManagementEndpoints: ${DMS_ENABLE_MANAGEMENT_ENDPOINTS:-false}
       AppSettings__EnableClaimsetReload: ${DMS_ENABLE_CLAIMSET_RELOAD:-false}
+      AppSettings__ManagementEndpoints__RequiredRole: ${DMS_MANAGEMENT_REQUIRED_ROLE:-}
       CacheSettings__ClaimSetsCacheExpirationSeconds: ${DMS_CLAIMSETS_CACHE_EXPIRATION_SECONDS:-600}
       CacheSettings__ApplicationContextCacheExpirationSeconds: ${DMS_APPLICATION_CONTEXT_CACHE_EXPIRATION_SECONDS:-600}
       CacheSettings__TokenCacheExpirationSeconds: ${DMS_TOKEN_CACHE_EXPIRATION_SECONDS:-1500}
       CacheSettings__ProfileCacheExpirationSeconds: ${DMS_PROFILE_CACHE_EXPIRATION_SECONDS:-1800}
       CacheSettings__DataStoreCacheExpirationSeconds: ${DMS_DATASTORE_CACHE_EXPIRATION_SECONDS:-600}
       CacheSettings__DataStoreCacheRefreshEnabled: ${DMS_DATASTORE_CACHE_REFRESH_ENABLED:-true}
+      CacheSettings__DerivativeValidationCacheExpirationSeconds: ${DMS_DERIVATIVE_VALIDATION_CACHE_EXPIRATION_SECONDS:-600}
       AppSettings__DomainsExcludedFromOpenApi: ${DOMAINS_EXCLUDED_FROM_OPEN_API:-}
       AppSettings__RouteQualifierSegments: ${ROUTE_QUALIFIER_SEGMENTS:-}
       SCHEMA_PACKAGES: ${SCHEMA_PACKAGES:-}
+      DataManagement__DocumentCache__ReadAcceleration__Enabled: ${DMS_DOCUMENTCACHE_READ_ACCELERATION_ENABLED:-false}
+      DataManagement__DocumentCache__ReadAcceleration__DirectFillTimeout: ${DMS_DOCUMENTCACHE_READ_ACCELERATION_DIRECT_FILL_TIMEOUT:-00:00:00.250}
+      DataManagement__DocumentCache__Projector__PollInterval: ${DMS_DOCUMENTCACHE_PROJECTOR_POLL_INTERVAL:-00:00:05}
+      DataManagement__DocumentCache__Projector__PageSize: ${DMS_DOCUMENTCACHE_PROJECTOR_PAGE_SIZE:-100}
+      DataManagement__DocumentCache__Projector__MaxConcurrentTargets: ${DMS_DOCUMENTCACHE_PROJECTOR_MAX_CONCURRENT_TARGETS:-2}
+      DataManagement__DocumentCache__Projector__FailureBackoff: ${DMS_DOCUMENTCACHE_PROJECTOR_FAILURE_BACKOFF:-00:00:30}
+      DataManagement__DocumentCache__Projector__BaselineHighWaterMark: ${DMS_DOCUMENTCACHE_PROJECTOR_BASELINE_HIGH_WATER_MARK:-1000}
+      DataManagement__DocumentCache__Administration__WorkflowTimeout: ${DMS_DOCUMENTCACHE_ADMINISTRATION_WORKFLOW_TIMEOUT:-1.00:00:00}
+      DataManagement__DocumentCache__Status__StatusObservationTimeout: ${DMS_DOCUMENTCACHE_STATUS_OBSERVATION_TIMEOUT:-00:00:05}
+      DataManagement__DocumentCache__Status__EndpointTimeout: ${DMS_DOCUMENTCACHE_STATUS_ENDPOINT_TIMEOUT:-00:00:30}
+      DataManagement__DocumentCache__Status__RequiredRole: ${DMS_DOCUMENTCACHE_STATUS_REQUIRED_ROLE:-}
       # JWT Authentication
       JwtAuthentication__Authority: ${DMS_JWT_AUTHORITY:-http://dms-keycloak:8080/realms/edfi}
       JwtAuthentication__Audience: ${DMS_JWT_AUDIENCE:-account}
@@ -82,6 +102,11 @@ services:
       timeout: 10s
       retries: 50
     hostname: ed-fi-api
+    logging:
+      driver: json-file
+      options:
+        max-size: "${DOCKER_LOG_MAX_SIZE:-50m}"
+        max-file: "${DOCKER_LOG_MAX_FILE:-5}"
 
 networks:
   dms:

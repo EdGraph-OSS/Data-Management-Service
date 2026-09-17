@@ -110,6 +110,25 @@ internal static class NamespaceAuthorizationProviderFailureMapper
 
         string providerOrPlannerFailureKind = dispatchResult switch
         {
+            // An undecodable payload the dispatcher recognized as another family's is not ours to report,
+            // even though nothing in it can be decoded. Its discriminator is the only trustworthy thing
+            // left in it, and it names the family whose statement raised the abort — so that family's
+            // mapper owns the diagnostic. Without this, a command carrying a namespace statement beside a
+            // custom-view, relationship, or ownership one files that family's defect under NamespaceBased:
+            // the composite classifier reaches this arm before the relationship one, so a malformed
+            // relationship or custom-view payload never gets back to its owner.
+            //
+            // Written as "any recognized family that is not ours" rather than as a list of the three
+            // foreign families on purpose. A list would have to be extended whenever a family is added,
+            // and an omission does not fail a build — it silently misattributes that family's malformed
+            // payloads, which is the defect this arm exists to prevent.
+            RelationalAuthorizationAuth1DispatchResult.InvalidPayload
+            {
+                RecognizedFamily: not null and not RelationalAuthorizationAuth1PayloadFamily.Namespace
+            } => string.Empty,
+            // A malformed namespace payload, or one leading with no known discriminator at all. Both are
+            // ours: the first by its own discriminator, the second because no family owns it, and dropping
+            // it would lose the diagnostic entirely rather than route it somewhere better.
             RelationalAuthorizationAuth1DispatchResult.InvalidPayload =>
                 AuthorizationSecurityConfigurationDiagnostics.NamespaceInvalidAuth1Payload,
             RelationalAuthorizationAuth1DispatchResult.Namespace { Payload: var payload }
@@ -117,7 +136,14 @@ internal static class NamespaceAuthorizationProviderFailureMapper
                 AuthorizationSecurityConfigurationDiagnostics.NamespaceInvalidStaleTargetPayload,
             RelationalAuthorizationAuth1DispatchResult.Namespace =>
                 AuthorizationSecurityConfigurationDiagnostics.NamespaceAuth1PayloadMappingFailed,
+            // A payload belonging to another AUTH1 family shares the transport but is not ours to
+            // classify. Yield so the codec that owns the discriminator reports it. Without this,
+            // a command carrying both namespace and custom-view statements would turn a custom-view
+            // 403 into a namespace invalid-metadata 500, because the catch-all below claims anything
+            // it does not recognize.
             RelationalAuthorizationAuth1DispatchResult.Relationship => string.Empty,
+            RelationalAuthorizationAuth1DispatchResult.CustomView => string.Empty,
+            RelationalAuthorizationAuth1DispatchResult.Ownership => string.Empty,
             _ => AuthorizationSecurityConfigurationDiagnostics.NamespaceInvalidAuthorizationMetadata,
         };
 

@@ -94,7 +94,7 @@ public class Given_RelationalCurrentEtagPreconditionChecker
 
         result.Should().NotBeNull();
         result!.IsSatisfied.Should().BeFalse();
-        _capturedLockCommand.CommandText.Should().Contain("WITH (UPDLOCK, HOLDLOCK, ROWLOCK)");
+        _capturedLockCommand.CommandText.Should().Contain("WITH (UPDLOCK, ROWLOCK)");
         _capturedLockCommand.CommandText.Should().Contain("WHERE document.[DocumentId] = @documentId");
         _capturedLockCommand.Parameters.Should().ContainSingle();
         _capturedLockCommand.Parameters[0].Name.Should().Be("@documentId");
@@ -326,9 +326,8 @@ public class Given_RelationalCurrentEtagPreconditionChecker
                 DocumentId,
                 _documentUuid.Value,
                 contentVersion,
-                contentVersion,
                 new DateTimeOffset(2026, 4, 11, 17, 30, 45, TimeSpan.Zero),
-                new DateTimeOffset(2026, 4, 11, 17, 30, 45, TimeSpan.Zero)
+                1
             ),
             [],
             []

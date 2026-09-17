@@ -11,6 +11,7 @@ using EdFi.DataManagementService.Core.Backend;
 using EdFi.DataManagementService.Core.External.Backend;
 using EdFi.DataManagementService.Core.External.Frontend;
 using EdFi.DataManagementService.Core.External.Model;
+using EdFi.DataManagementService.Core.External.Security;
 using EdFi.DataManagementService.Core.Handler;
 using EdFi.DataManagementService.Core.Model;
 using EdFi.DataManagementService.Core.Pipeline;
@@ -255,6 +256,16 @@ public class DeleteByIdHandlerTests
             _requestInfo.FrontendResponse.StatusCode.Should().Be(500);
             _requestInfo.FrontendResponse.Body.Should().NotBeNull();
         }
+
+        /// <summary>
+        /// The body is problem details, so the content type has to say so; serving it as plain
+        /// application/json leaves a client content-negotiating on the wrong media type.
+        /// </summary>
+        [Test]
+        public void It_serves_the_problem_details_content_type()
+        {
+            _requestInfo.FrontendResponse.ContentType.Should().Be("application/problem+json");
+        }
     }
 
     [TestFixture]
@@ -420,6 +431,141 @@ public class DeleteByIdHandlerTests
                 .Which.Should()
                 .Be(
                     "No relationships have been established between the caller's education organization id claim ('255901') and the resource item's 'SchoolId' value."
+                );
+        }
+    }
+
+    [TestFixture]
+    [Parallelizable]
+    public class Given_A_Repository_That_Returns_Custom_View_Not_Authorized : DeleteByIdHandlerTests
+    {
+        internal static readonly CustomViewAuthorizationFailure CustomViewFailure = new(
+            CustomViewAuthorizationFailureKind.StoredValueUninitialized,
+            CustomViewAuthorizationFailureValueSource.Stored,
+            EmittedAuth1Index: 0,
+            StrategyName: "StudentWithCTECourseEnrollments",
+            ReadableSecurableElements: ["StudentUniqueId"],
+            Hint: "You may need a Student with CTE Course Enrollments."
+        );
+
+        internal class Repository : NotImplementedDocumentStoreRepository
+        {
+            public override Task<DeleteResult> DeleteDocumentById(IDeleteRequest deleteRequest)
+            {
+                return Task.FromResult<DeleteResult>(
+                    new DeleteFailureCustomViewNotAuthorized(CustomViewFailure)
+                );
+            }
+        }
+
+        private static readonly string _customViewTraceId = "custom-view-delete-403";
+        private readonly RequestInfo _customViewRequestInfo = RequestInfoWithRelationalMappingSet(
+            _customViewTraceId
+        );
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var projectSchemaNode = new JsonObject
+            {
+                ["educationOrganizationTypes"] = new JsonArray { "Type1", "Type2" },
+            };
+            _customViewRequestInfo.ProjectSchema = new ProjectSchema(projectSchemaNode, NullLogger.Instance);
+            _customViewRequestInfo.ResourceSchema = GetResourceSchema();
+
+            var (deleteHandler, serviceProvider) = Handler(new Repository());
+            _customViewRequestInfo.ScopedServiceProvider = serviceProvider;
+
+            await deleteHandler.Execute(_customViewRequestInfo, NullNext);
+        }
+
+        [Test]
+        public void It_maps_the_custom_view_denial_to_the_canonical_problem_details_403()
+        {
+            _customViewRequestInfo.FrontendResponse.StatusCode.Should().Be(403);
+            _customViewRequestInfo.FrontendResponse.ContentType.Should().Be("application/problem+json");
+
+            var expected = CustomViewAuthorizationFailureResponse.ForFailure(
+                CustomViewFailure,
+                new TraceId(_customViewTraceId)
+            );
+
+            _customViewRequestInfo.FrontendResponse.Body.Should().NotBeNull();
+            JsonNode
+                .DeepEquals(_customViewRequestInfo.FrontendResponse.Body, expected)
+                .Should()
+                .BeTrue(
+                    $"""
+                    expected: {expected}
+
+                    actual: {_customViewRequestInfo.FrontendResponse.Body}
+                    """
+                );
+        }
+    }
+
+    [TestFixture]
+    [Parallelizable]
+    public class Given_A_Repository_That_Returns_Ownership_Not_Authorized : DeleteByIdHandlerTests
+    {
+        internal static readonly OwnershipAuthorizationFailure OwnershipFailure = new(
+            OwnershipAuthorizationFailureKind.StoredOwnershipTokenUninitialized,
+            ConfiguredStrategyIndex: 2,
+            StrategyName: AuthorizationStrategyNameConstants.OwnershipBased
+        );
+
+        internal class Repository : NotImplementedDocumentStoreRepository
+        {
+            public override Task<DeleteResult> DeleteDocumentById(IDeleteRequest deleteRequest)
+            {
+                return Task.FromResult<DeleteResult>(
+                    new DeleteFailureOwnershipNotAuthorized(OwnershipFailure)
+                );
+            }
+        }
+
+        private static readonly string _ownershipTraceId = "ownership-delete-403";
+        private readonly RequestInfo _ownershipRequestInfo = RequestInfoWithRelationalMappingSet(
+            _ownershipTraceId
+        );
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var projectSchemaNode = new JsonObject
+            {
+                ["educationOrganizationTypes"] = new JsonArray { "Type1", "Type2" },
+            };
+            _ownershipRequestInfo.ProjectSchema = new ProjectSchema(projectSchemaNode, NullLogger.Instance);
+            _ownershipRequestInfo.ResourceSchema = GetResourceSchema();
+
+            var (deleteHandler, serviceProvider) = Handler(new Repository());
+            _ownershipRequestInfo.ScopedServiceProvider = serviceProvider;
+
+            await deleteHandler.Execute(_ownershipRequestInfo, NullNext);
+        }
+
+        [Test]
+        public void It_maps_the_ownership_denial_to_the_canonical_problem_details_403()
+        {
+            _ownershipRequestInfo.FrontendResponse.StatusCode.Should().Be(403);
+            _ownershipRequestInfo.FrontendResponse.ContentType.Should().Be("application/problem+json");
+
+            var expected = OwnershipAuthorizationFailureResponse.ForFailure(
+                OwnershipFailure,
+                new TraceId(_ownershipTraceId)
+            );
+
+            _ownershipRequestInfo.FrontendResponse.Body.Should().NotBeNull();
+            JsonNode
+                .DeepEquals(_ownershipRequestInfo.FrontendResponse.Body, expected)
+                .Should()
+                .BeTrue(
+                    $"""
+                    expected: {expected}
+
+                    actual: {_ownershipRequestInfo.FrontendResponse.Body}
+                    """
                 );
         }
     }
@@ -629,8 +775,13 @@ public class DeleteByIdHandlerTests
 
             var expected = $$"""
 {
-  "error": "FailureMessage",
-  "correlationId": "{{_traceId}}"
+  "detail": "An unexpected problem has occurred.",
+  "type": "urn:ed-fi:api:system",
+  "title": "System Error",
+  "status": 500,
+  "correlationId": "{{_traceId}}",
+  "validationErrors": {},
+  "errors": []
 }
 """;
 
@@ -722,9 +873,11 @@ actual: {_requestInfo.FrontendResponse.Body}
                 NullLogger.Instance
             );
             _requestInfo.PathComponents = new PathComponents(
-                new ProjectEndpointName("ed-fi"),
-                new EndpointName("assessments"),
-                new DocumentUuid(Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"))
+                ProjectEndpointName: new ProjectEndpointName("ed-fi"),
+                EndpointName: new EndpointName("assessments"),
+                Operation: new ResourcePathOperation.ById(
+                    new DocumentUuid(Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"))
+                )
             );
             _requestInfo.ResourceInfo = CreateResourceInfo();
             _requestInfo.ResourceSchema = GetResourceSchema();
@@ -750,6 +903,15 @@ actual: {_requestInfo.FrontendResponse.Body}
                     new NamespacePrefix("uri://sample-b.org"),
                 ],
                 DataStoreIds: []
+            );
+            _requestInfo.ApplicationContext = new(
+                Id: 1,
+                ApplicationId: 2,
+                ClientId: "client-id",
+                ClientUuid: Guid.Parse("55555555-5555-5555-5555-555555555555"),
+                DataStoreIds: [],
+                CreatorOwnershipTokenId: 303,
+                OwnershipTokenIds: [202, 404]
             );
 
             var (deleteByIdHandler, serviceProvider) = Handler(_repository);
@@ -783,6 +945,8 @@ actual: {_requestInfo.FrontendResponse.Body}
             relationalRequest
                 .AuthorizationContext.NamespacePrefixes.Should()
                 .Equal("uri://sample-a.org", "uri://sample-b.org");
+            relationalRequest.AuthorizationContext.CreatorOwnershipTokenId.Should().Be(303);
+            relationalRequest.AuthorizationContext.OwnershipTokenIds.Should().Equal(202, 404);
         }
     }
 }

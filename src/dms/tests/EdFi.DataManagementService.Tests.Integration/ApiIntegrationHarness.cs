@@ -20,15 +20,25 @@ public sealed class ApiIntegrationHarness : IAsyncDisposable
 {
     public ApiIntegrationHarness(
         HttpClient httpClient,
+        IServiceProvider services,
         DbConnection dbConnection,
         FixtureContext fixture,
-        ApiIntegrationQueryRecorder? queryRecorder = null
+        ApiIntegrationQueryRecorder? queryRecorder = null,
+        ApiIntegrationProviderFailureRecorder? providerFailureRecorder = null,
+        DocumentCacheReadAcquisitionFailureRecorder? documentCacheReadAcquisitionFailureRecorder = null,
+        DocumentCacheDirectFillTimeoutRecorder? documentCacheDirectFillTimeoutRecorder = null,
+        DocumentCacheReadTelemetryRecorder? documentCacheReadTelemetryRecorder = null
     )
     {
         HttpClient = httpClient;
+        Services = services;
         DbConnection = dbConnection;
         Fixture = fixture;
         QueryRecorder = queryRecorder;
+        ProviderFailureRecorder = providerFailureRecorder;
+        DocumentCacheReadAcquisitionFailureRecorder = documentCacheReadAcquisitionFailureRecorder;
+        DocumentCacheDirectFillTimeoutRecorder = documentCacheDirectFillTimeoutRecorder;
+        DocumentCacheReadTelemetryRecorder = documentCacheReadTelemetryRecorder;
 
         HttpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
             "Bearer",
@@ -37,9 +47,22 @@ public sealed class ApiIntegrationHarness : IAsyncDisposable
     }
 
     public HttpClient HttpClient { get; }
+    public IServiceProvider Services { get; }
     public DbConnection DbConnection { get; }
     public FixtureContext Fixture { get; }
     public ApiIntegrationQueryRecorder? QueryRecorder { get; }
+
+    /// <summary>
+    /// Provider exceptions the production authorization path raised, recorded only when the test class supplies
+    /// a <c>ProviderFailureTransform</c>. Null otherwise.
+    /// </summary>
+    public ApiIntegrationProviderFailureRecorder? ProviderFailureRecorder { get; }
+
+    public DocumentCacheReadAcquisitionFailureRecorder? DocumentCacheReadAcquisitionFailureRecorder { get; }
+
+    public DocumentCacheDirectFillTimeoutRecorder? DocumentCacheDirectFillTimeoutRecorder { get; }
+
+    public DocumentCacheReadTelemetryRecorder? DocumentCacheReadTelemetryRecorder { get; }
 
     public async ValueTask DisposeAsync()
     {

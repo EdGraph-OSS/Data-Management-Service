@@ -153,6 +153,11 @@ public class Given_MssqlRelationalWriteExceptionClassifier
 
     [TestCase(1205)]
     [TestCase(1222)]
+    [TestCase(3960)]
+    [TestCase(41325)]
+    [TestCase(41305)]
+    [TestCase(41302)]
+    [TestCase(41301)]
     public void It_does_not_classify_retryable_deadlock_or_contention_exceptions(int errorNumber)
     {
         var exception = CreateSqlException(errorNumber, "Transaction retry should stay owned by DMS-996.");
@@ -161,6 +166,25 @@ public class Given_MssqlRelationalWriteExceptionClassifier
 
         classified.Should().BeFalse();
         classification.Should().BeNull();
+    }
+
+    /// <summary>
+    /// A command timeout expires on the client, so unlike every server-raised code in the transient
+    /// set it carries no evidence about what the server did. Classifying it keeps it out of the
+    /// unrecognized bucket - the engine's behavior here is understood - while the separate
+    /// transience check keeps it out of the retry path.
+    /// </summary>
+    [Test]
+    public void It_classifies_a_command_timeout_as_an_indeterminate_outcome()
+    {
+        var exception = CreateSqlException(-2, "Execution Timeout Expired.");
+
+        var classified = _sut.TryClassify(exception, out var classification);
+
+        classified.Should().BeTrue();
+        classification
+            .Should()
+            .BeSameAs(RelationalWriteExceptionClassification.IndeterminateOutcomeFailure.Instance);
     }
 
     [Test]
@@ -176,11 +200,32 @@ public class Given_MssqlRelationalWriteExceptionClassifier
 
     [TestCase(1205)]
     [TestCase(1222)]
-    public void It_reports_transient_failure_for_deadlock_or_lock_timeout_errors(int errorNumber)
+    [TestCase(3960)]
+    [TestCase(41325)]
+    [TestCase(41305)]
+    [TestCase(41302)]
+    [TestCase(41301)]
+    public void It_reports_transient_failure_for_deadlock_lock_timeout_or_serialization_errors(
+        int errorNumber
+    )
     {
         var exception = CreateSqlException(errorNumber, "Transient SQL Server condition.");
 
         _sut.IsTransientFailure(exception).Should().BeTrue();
+    }
+
+    /// <summary>
+    /// Every other member of the transient set is raised by the server, which proves the statement
+    /// did not commit and makes a replay safe. A command timeout expires on the client while the
+    /// server may still be committing, so replaying it can delete a row the first attempt already
+    /// deleted and answer 404 - a client error for a purely transient condition.
+    /// </summary>
+    [Test]
+    public void It_does_not_report_a_command_timeout_as_transient()
+    {
+        var exception = CreateSqlException(-2, "Execution Timeout Expired.");
+
+        _sut.IsTransientFailure(exception).Should().BeFalse();
     }
 
     [TestCase(547)]
@@ -253,6 +298,11 @@ public class Given_MssqlRelationalWriteExceptionClassifier
     [TestCase(2601)]
     [TestCase(1205)]
     [TestCase(1222)]
+    [TestCase(3960)]
+    [TestCase(41325)]
+    [TestCase(41305)]
+    [TestCase(41302)]
+    [TestCase(41301)]
     [TestCase(8152)]
     public void It_does_not_report_foreign_key_violation_for_other_error_numbers(int errorNumber)
     {
@@ -303,6 +353,11 @@ public class Given_MssqlRelationalWriteExceptionClassifier
     [TestCase(547)]
     [TestCase(1205)]
     [TestCase(1222)]
+    [TestCase(3960)]
+    [TestCase(41325)]
+    [TestCase(41305)]
+    [TestCase(41302)]
+    [TestCase(41301)]
     [TestCase(8152)]
     public void It_does_not_report_unique_constraint_violation_for_other_error_numbers(int errorNumber)
     {

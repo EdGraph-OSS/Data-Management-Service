@@ -32,8 +32,7 @@ public class Given_RelationalWrite_Target_Lookup_Surfaces
             _requestResource,
             referentialId,
             candidateDocumentUuid,
-            writeSession.Connection,
-            writeSession.Transaction
+            ((IRelationalWriteSession)writeSession).CreateCommandExecutor()
         );
 
         result
@@ -64,8 +63,7 @@ public class Given_RelationalWrite_Target_Lookup_Surfaces
             _requestResource,
             referentialId,
             candidateDocumentUuid,
-            writeSession.Connection,
-            writeSession.Transaction
+            ((IRelationalWriteSession)writeSession).CreateCommandExecutor()
         );
 
         result
@@ -160,10 +158,17 @@ public class Given_RelationalWrite_Target_Lookup_Surfaces
         table.Columns.Add("DocumentUuid", typeof(Guid));
         table.Columns.Add("ResourceKeyId", typeof(short));
         table.Columns.Add("ContentVersion", typeof(long));
+        table.Columns.Add("ContentLastModifiedAt", typeof(DateTimeOffset));
 
         foreach (var row in rows)
         {
-            table.Rows.Add(row.DocumentId, row.DocumentUuid, (short)1, row.ContentVersion);
+            table.Rows.Add(
+                row.DocumentId,
+                row.DocumentUuid,
+                (short)1,
+                row.ContentVersion,
+                new DateTimeOffset(2026, 8, 1, 12, 0, 0, TimeSpan.Zero)
+            );
         }
 
         return table.CreateDataReader();
@@ -215,7 +220,29 @@ public class Given_RelationalWrite_Target_Lookup_Surfaces
 
         public DbTransaction Transaction { get; } = transaction;
 
-        public DbCommand CreateCommand(RelationalCommand command) => throw new NotSupportedException();
+        /// <summary>
+        /// Mirrors the production session so the in-session POST target lookup is created through
+        /// this seam rather than straight off the connection.
+        /// </summary>
+        public DbCommand CreateCommand(RelationalCommand command)
+        {
+            ArgumentNullException.ThrowIfNull(command);
+
+            var dbCommand = Connection.CreateCommand();
+            dbCommand.Transaction = Transaction;
+            dbCommand.CommandText = command.CommandText;
+
+            foreach (var parameter in command.Parameters)
+            {
+                var dbParameter = dbCommand.CreateParameter();
+                dbParameter.ParameterName = parameter.Name;
+                dbParameter.Value = parameter.Value ?? DBNull.Value;
+                parameter.ConfigureParameter?.Invoke(dbParameter);
+                dbCommand.Parameters.Add(dbParameter);
+            }
+
+            return dbCommand;
+        }
 
         public Task CommitAsync(CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();

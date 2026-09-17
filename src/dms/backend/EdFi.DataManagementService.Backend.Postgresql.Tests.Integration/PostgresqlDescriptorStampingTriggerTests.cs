@@ -84,16 +84,21 @@ public class Given_A_Provisioned_Postgresql_Database_With_Descriptor_Stamping_Tr
 
     private async Task InsertDescriptorAsync(long documentId, string codeValue = "Female")
     {
+        var resourceKeyId = await _database.ExecuteScalarAsync<short>(
+            """SELECT MIN("ResourceKeyId") FROM dms."ResourceKey";"""
+        );
+
         var uriOrDiscriminator = $"uri://ed-fi.org/SexDescriptor#{codeValue}";
         await _database.ExecuteNonQueryAsync(
             """
             INSERT INTO dms."Descriptor"
-                ("DocumentId", "Namespace", "CodeValue", "ShortDescription", "Description",
+                ("DocumentId", "ResourceKeyId", "Namespace", "CodeValue", "ShortDescription", "Description",
                  "EffectiveBeginDate", "EffectiveEndDate", "Discriminator", "Uri")
-            VALUES (@documentId, @namespace, @codeValue, @shortDescription, @description,
+            VALUES (@documentId, @resourceKeyId, @namespace, @codeValue, @shortDescription, @description,
                     NULL, NULL, @discriminator, @uri);
             """,
             new NpgsqlParameter("documentId", documentId),
+            new NpgsqlParameter("resourceKeyId", resourceKeyId),
             new NpgsqlParameter("namespace", "uri://ed-fi.org/SexDescriptor"),
             new NpgsqlParameter("codeValue", codeValue),
             new NpgsqlParameter("shortDescription", codeValue),
@@ -150,12 +155,24 @@ public class Given_A_Provisioned_Postgresql_Database_With_Descriptor_Stamping_Tr
         return await _database.ExecuteScalarAsync<long>("""SELECT "dms"."GetMaxChangeVersion"();""");
     }
 
-    private async Task DelayForDistinctTimestampsAsync()
+    private async Task<DateTime> BackdateDocumentContentStampAsync(long documentId)
     {
-        // Server-side delay so the post-write ContentLastModifiedAt is strictly greater
-        // than the seed stamp, letting assertions use BeAfter instead of the weaker
-        // BeOnOrAfter (which cannot catch a stamp that never moved).
-        await _database.ExecuteNonQueryAsync("SELECT pg_sleep(0.02);");
+        // Moving the seed stamp deterministically into the past keeps the strict BeAfter
+        // assertions independent of server clock granularity: now() can return an identical
+        // value for two reads milliseconds apart, but never one five minutes stale.
+        // Strictness is what catches a stamp the trigger never wrote, since such a stamp stays
+        // at the backdated value; BeOnOrAfter would accept it.
+        // No trigger exists on dms."Document", so this write neither stamps nor allocates a version.
+        await _database.ExecuteNonQueryAsync(
+            """
+            UPDATE dms."Document"
+            SET "ContentLastModifiedAt" = now() - interval '5 minutes'
+            WHERE "DocumentId" = @documentId;
+            """,
+            new NpgsqlParameter("documentId", documentId)
+        );
+
+        return (await ReadDocumentStampAsync(documentId)).ContentLastModifiedAt;
     }
 
     private sealed record StampPair(StampValues Document, StampValues Mirror);
@@ -183,7 +200,7 @@ public class Given_A_Provisioned_Postgresql_Database_With_Descriptor_Stamping_Tr
     {
         var seed = await SeedAsync();
         var beforeMaxChangeVersion = await ReadMaxChangeVersionAsync();
-        await DelayForDistinctTimestampsAsync();
+        var seedContentLastModifiedAt = await BackdateDocumentContentStampAsync(seed.DocumentId);
 
         await _database.ExecuteNonQueryAsync(
             """
@@ -196,7 +213,7 @@ public class Given_A_Provisioned_Postgresql_Database_With_Descriptor_Stamping_Tr
         var afterMaxChangeVersion = await ReadMaxChangeVersionAsync();
         var afterDocument = await ReadDocumentStampAsync(seed.DocumentId);
         afterDocument.ContentVersion.Should().BeGreaterThan(seed.ContentVersion);
-        afterDocument.ContentLastModifiedAt.Should().BeAfter(seed.ContentLastModifiedAt);
+        afterDocument.ContentLastModifiedAt.Should().BeAfter(seedContentLastModifiedAt);
         (afterMaxChangeVersion - beforeMaxChangeVersion)
             .Should()
             .Be(1L, "a descriptor delete must allocate exactly one content stamp");
@@ -207,7 +224,7 @@ public class Given_A_Provisioned_Postgresql_Database_With_Descriptor_Stamping_Tr
     {
         var seed = await SeedAsync();
         var beforeMaxChangeVersion = await ReadMaxChangeVersionAsync();
-        await DelayForDistinctTimestampsAsync();
+        var seedContentLastModifiedAt = await BackdateDocumentContentStampAsync(seed.DocumentId);
 
         await _database.ExecuteNonQueryAsync(
             """
@@ -222,7 +239,7 @@ public class Given_A_Provisioned_Postgresql_Database_With_Descriptor_Stamping_Tr
         var after = await ReadStampPairAsync(seed.DocumentId);
         after.Mirror.Should().Be(after.Document);
         after.Document.ContentVersion.Should().BeGreaterThan(seed.ContentVersion);
-        after.Document.ContentLastModifiedAt.Should().BeAfter(seed.ContentLastModifiedAt);
+        after.Document.ContentLastModifiedAt.Should().BeAfter(seedContentLastModifiedAt);
         (afterMaxChangeVersion - beforeMaxChangeVersion)
             .Should()
             .Be(1L, "a single descriptor value change must allocate exactly one content stamp");
@@ -237,6 +254,114 @@ public class Given_A_Provisioned_Postgresql_Database_With_Descriptor_Stamping_Tr
             """
             UPDATE dms."Descriptor"
             SET "ShortDescription" = "ShortDescription"
+            WHERE "DocumentId" = @documentId;
+            """,
+            new NpgsqlParameter("documentId", seed.DocumentId)
+        );
+
+        var after = await ReadStampPairAsync(seed.DocumentId);
+        after.Document.ContentVersion.Should().Be(seed.ContentVersion);
+        after.Document.ContentLastModifiedAt.Should().Be(seed.ContentLastModifiedAt);
+        after.Mirror.Should().Be(after.Document);
+    }
+
+    private async Task InsertBenchResourceKeyAsync()
+    {
+        await _database.ExecuteNonQueryAsync(
+            """
+            INSERT INTO dms."ResourceKey" ("ResourceKeyId", "ProjectName", "ResourceName", "ResourceVersion")
+            VALUES (32000, 'Bench', 'BenchDescriptor', '1.0.0')
+            ON CONFLICT DO NOTHING;
+            """
+        );
+    }
+
+    [Test]
+    public async Task It_rejects_a_descriptor_update_whose_resource_key_id_diverges_from_the_document()
+    {
+        // List paging trusts dms.Descriptor.ResourceKeyId while GET-by-id trusts
+        // dms.Document.ResourceKeyId, and no FK ties the two copies together. The trigger's
+        // equality guard must reject the divergent write before the no-op diff (which
+        // deliberately excludes ResourceKeyId) can short-circuit past it.
+        var seed = await SeedAsync();
+        await InsertBenchResourceKeyAsync();
+
+        var act = async () =>
+            await _database.ExecuteNonQueryAsync(
+                """
+                UPDATE dms."Descriptor"
+                SET "ResourceKeyId" = 32000
+                WHERE "DocumentId" = @documentId;
+                """,
+                new NpgsqlParameter("documentId", seed.DocumentId)
+            );
+
+        var exception = (await act.Should().ThrowAsync<PostgresException>()).Which;
+        exception.MessageText.Should().Contain("diverges from the owning dms.Document row");
+
+        var storedResourceKeyId = await _database.ExecuteScalarAsync<short>(
+            """SELECT "ResourceKeyId" FROM dms."Descriptor" WHERE "DocumentId" = @documentId;""",
+            new NpgsqlParameter("documentId", seed.DocumentId)
+        );
+        var documentResourceKeyId = await _database.ExecuteScalarAsync<short>(
+            """SELECT "ResourceKeyId" FROM dms."Document" WHERE "DocumentId" = @documentId;""",
+            new NpgsqlParameter("documentId", seed.DocumentId)
+        );
+        storedResourceKeyId.Should().Be(documentResourceKeyId);
+        var after = await ReadStampPairAsync(seed.DocumentId);
+        after.Document.ContentVersion.Should().Be(seed.ContentVersion);
+        after.Mirror.Should().Be(after.Document);
+    }
+
+    [Test]
+    public async Task It_rejects_a_descriptor_insert_whose_resource_key_id_diverges_from_the_document()
+    {
+        var documentId = await InsertDocumentAsync();
+        await InsertBenchResourceKeyAsync();
+
+        var act = async () =>
+            await _database.ExecuteNonQueryAsync(
+                """
+                INSERT INTO dms."Descriptor"
+                    ("DocumentId", "ResourceKeyId", "Namespace", "CodeValue", "ShortDescription", "Description",
+                     "EffectiveBeginDate", "EffectiveEndDate", "Discriminator", "Uri")
+                VALUES (@documentId, 32000, 'uri://ed-fi.org/SexDescriptor', 'Female', 'Female', 'Female',
+                        NULL, NULL, 'uri://ed-fi.org/SexDescriptor#Female', 'uri://ed-fi.org/SexDescriptor#Female');
+                """,
+                new NpgsqlParameter("documentId", documentId)
+            );
+
+        var exception = (await act.Should().ThrowAsync<PostgresException>()).Which;
+        exception.MessageText.Should().Contain("diverges from the owning dms.Document row");
+
+        var descriptorRowCount = await _database.ExecuteScalarAsync<long>(
+            """SELECT COUNT(*) FROM dms."Descriptor" WHERE "DocumentId" = @documentId;""",
+            new NpgsqlParameter("documentId", documentId)
+        );
+        descriptorRowCount.Should().Be(0L);
+    }
+
+    [Test]
+    public async Task It_does_not_stamp_document_when_a_resource_key_id_backfill_updates_both_tables()
+    {
+        // ResourceKeyId is immutable in production and deliberately excluded from the trigger's
+        // no-op diff so a migration backfill UPDATE of the column cannot bump stamps. The
+        // equality guard requires such a backfill to update dms.Document before dms.Descriptor.
+        var seed = await SeedAsync();
+        await InsertBenchResourceKeyAsync();
+
+        await _database.ExecuteNonQueryAsync(
+            """
+            UPDATE dms."Document"
+            SET "ResourceKeyId" = 32000
+            WHERE "DocumentId" = @documentId;
+            """,
+            new NpgsqlParameter("documentId", seed.DocumentId)
+        );
+        await _database.ExecuteNonQueryAsync(
+            """
+            UPDATE dms."Descriptor"
+            SET "ResourceKeyId" = 32000
             WHERE "DocumentId" = @documentId;
             """,
             new NpgsqlParameter("documentId", seed.DocumentId)

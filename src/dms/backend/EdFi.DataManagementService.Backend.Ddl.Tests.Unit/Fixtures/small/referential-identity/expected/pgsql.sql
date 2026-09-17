@@ -1,8 +1,8 @@
 -- ==========================================================
--- Phase 0: Preflight (fail fast on schema hash mismatch)
+-- Phase 0: Bounded Provisioning Guards
 -- ==========================================================
 
--- Preflight: fail fast if database is provisioned for a different schema hash
+-- Preflight: validate EffectiveSchema hash compatibility
 DO $$
 DECLARE
     _stored_hash text;
@@ -10,9 +10,147 @@ BEGIN
     IF to_regclass('"dms"."EffectiveSchema"') IS NOT NULL THEN
         SELECT "EffectiveSchemaHash" INTO _stored_hash FROM "dms"."EffectiveSchema"
         WHERE "EffectiveSchemaSingletonId" = 1;
-        IF _stored_hash IS NOT NULL AND _stored_hash <> '136957ea965b4c23f513963a407ed08e9203a723da63135a3543a74e48e58136' THEN
-            RAISE EXCEPTION 'EffectiveSchemaHash mismatch: database has ''%'' but expected ''%''', _stored_hash, '136957ea965b4c23f513963a407ed08e9203a723da63135a3543a74e48e58136';
+        IF _stored_hash IS NOT NULL AND _stored_hash <> 'b9a983e51f4474731372243dbedb4d3a6cc272abef943da010ed924f17938e7d' THEN
+            RAISE EXCEPTION 'EffectiveSchemaHash mismatch: database has ''%'' but expected ''%''', _stored_hash, 'b9a983e51f4474731372243dbedb4d3a6cc272abef943da010ed924f17938e7d';
         END IF;
+    END IF;
+END $$;
+
+-- Preflight: protect completed DocumentCache mutable singleton state before mutation
+DO $$
+DECLARE
+    _stored_hash text;
+    _source_identity uuid;
+    _lifecycle_state text;
+    _cache_ahead_recovery_required boolean;
+BEGIN
+    IF to_regclass('"dms"."EffectiveSchema"') IS NOT NULL THEN
+        SELECT "EffectiveSchemaHash" INTO _stored_hash FROM "dms"."EffectiveSchema"
+        WHERE "EffectiveSchemaSingletonId" = 1;
+        IF _stored_hash = 'b9a983e51f4474731372243dbedb4d3a6cc272abef943da010ed924f17938e7d' THEN
+            IF to_regclass('"dms"."DataStoreIdentity"') IS NULL THEN
+                RAISE EXCEPTION 'Completed dms.EffectiveSchema hash matches this DDL, but dms.DataStoreIdentity is missing. Drop and recreate the database before re-provisioning.';
+            END IF;
+
+            SELECT "SourceIdentity" INTO _source_identity FROM "dms"."DataStoreIdentity"
+            WHERE "DataStoreIdentitySingletonId" = 1;
+            IF _source_identity IS NULL THEN
+                RAISE EXCEPTION 'Completed dms.EffectiveSchema hash matches this DDL, but dms.DataStoreIdentity singleton row is missing. Drop and recreate the database before re-provisioning.';
+            END IF;
+            IF _source_identity = '00000000-0000-0000-0000-000000000000'::uuid THEN
+                RAISE EXCEPTION 'dms.DataStoreIdentity.SourceIdentity must not be the zero UUID. Drop and recreate the database before re-provisioning.';
+            END IF;
+
+            IF to_regclass('"dms"."DocumentCacheState"') IS NULL THEN
+                RAISE EXCEPTION 'Completed dms.EffectiveSchema hash matches this DDL, but dms.DocumentCacheState is missing. Drop and recreate the database before re-provisioning.';
+            END IF;
+
+            SELECT "ProjectionLifecycleState", "CacheAheadRecoveryRequired" INTO _lifecycle_state, _cache_ahead_recovery_required
+            FROM "dms"."DocumentCacheState"
+            WHERE "StateId" = 1;
+            IF _lifecycle_state IS NULL THEN
+                RAISE EXCEPTION 'Completed dms.EffectiveSchema hash matches this DDL, but dms.DocumentCacheState singleton row is missing. Drop and recreate the database before re-provisioning.';
+            END IF;
+            IF _lifecycle_state NOT IN ('Disabled', 'Resetting', 'Rebuilding', 'Tracking') THEN
+                RAISE EXCEPTION 'dms.DocumentCacheState.ProjectionLifecycleState has unsupported value % during provisioning preflight.', _lifecycle_state;
+            END IF;
+            IF _cache_ahead_recovery_required IS NULL THEN
+                RAISE EXCEPTION 'dms.DocumentCacheState.CacheAheadRecoveryRequired must not be null during provisioning preflight.';
+            END IF;
+        END IF;
+    END IF;
+END $$;
+
+-- Preflight: reject known legacy DocumentCache artifacts before mutation
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'dms'
+        AND table_name = 'DocumentCache'
+        AND column_name = 'Etag'
+    ) THEN
+        RAISE EXCEPTION 'Known legacy artifact dms.DocumentCache.Etag was found. Drop and recreate the database before provisioning E18 DocumentCache schema.';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_constraint constraint_info
+        WHERE constraint_info.conname = 'UX_DocumentCache_DocumentUuid'
+        AND constraint_info.conrelid = to_regclass('"dms"."DocumentCache"')
+    ) OR to_regclass('"dms"."UX_DocumentCache_DocumentUuid"') IS NOT NULL THEN
+        RAISE EXCEPTION 'Known legacy artifact UX_DocumentCache_DocumentUuid was found. Drop and recreate the database before provisioning E18 DocumentCache schema.';
+    END IF;
+
+    IF to_regclass('"dms"."IX_DocumentCache_ProjectName_ResourceName_LastModifiedAt"') IS NOT NULL THEN
+        RAISE EXCEPTION 'Known legacy artifact IX_DocumentCache_ProjectName_ResourceName_LastModifiedAt was found. Drop and recreate the database before provisioning E18 DocumentCache schema.';
+    END IF;
+END $$;
+
+-- Preflight: validate PostgreSQL enqueue-owner prerequisites
+DO $$
+DECLARE
+    _owner_role oid := pg_catalog.to_regrole('edfi_dms_enqueue_owner');
+    _session_role oid;
+    _session_is_superuser boolean;
+    _session_can_create_role boolean;
+    _has_required_direct_membership boolean;
+BEGIN
+    SELECT oid, rolsuper, rolcreaterole
+    INTO _session_role, _session_is_superuser, _session_can_create_role
+    FROM pg_catalog.pg_roles
+    WHERE rolname = SESSION_USER;
+
+    IF _owner_role IS NULL THEN
+        IF NOT COALESCE(_session_is_superuser OR _session_can_create_role, false) THEN
+            RAISE EXCEPTION 'PostgreSQL provisioning principal must be SUPERUSER or CREATEROLE to create edfi_dms_enqueue_owner before provisioning.';
+        END IF;
+        RETURN;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_roles owner_role
+        WHERE owner_role.oid = _owner_role
+        AND (owner_role.rolcanlogin OR owner_role.rolinherit OR owner_role.rolsuper OR owner_role.rolcreatedb OR owner_role.rolcreaterole OR owner_role.rolreplication OR owner_role.rolbypassrls)
+    ) THEN
+        RAISE EXCEPTION 'PostgreSQL role edfi_dms_enqueue_owner exists but is not locked down as NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS. Drop or repair the role before provisioning.';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members membership
+        WHERE membership.member = _owner_role
+        AND (membership.admin_option OR membership.inherit_option OR membership.set_option)
+    ) THEN
+        RAISE EXCEPTION 'PostgreSQL role edfi_dms_enqueue_owner must not hold outgoing privilege-bearing memberships before provisioning.';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members membership
+        WHERE membership.roleid = _owner_role
+        AND membership.member = _session_role
+        AND NOT (membership.admin_option AND NOT membership.inherit_option AND NOT membership.set_option AND COALESCE(_session_can_create_role, false))
+        AND (membership.admin_option OR membership.inherit_option OR NOT membership.set_option)
+    ) THEN
+        RAISE EXCEPTION 'PostgreSQL provisioning principal has an unsafe direct membership in edfi_dms_enqueue_owner; required options are SET TRUE, INHERIT FALSE, ADMIN FALSE.';
+    END IF;
+
+    _has_required_direct_membership := EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members membership
+        WHERE membership.roleid = _owner_role
+        AND membership.member = _session_role
+        AND NOT membership.admin_option
+        AND NOT membership.inherit_option
+        AND membership.set_option
+    );
+
+    IF NOT COALESCE(_session_is_superuser, false)
+    AND NOT _has_required_direct_membership THEN
+        RAISE EXCEPTION 'PostgreSQL provisioning principal must have direct SET TRUE, INHERIT FALSE, ADMIN FALSE membership in existing edfi_dms_enqueue_owner before provisioning.';
     END IF;
 END $$;
 
@@ -82,9 +220,30 @@ $uuidv5$;
 -- Phase 5: Tables (PK/UNIQUE/CHECK only, no cross-table FKs)
 -- ==========================================================
 
+CREATE TABLE IF NOT EXISTS "dms"."DataStoreIdentity"
+(
+    "DataStoreIdentitySingletonId" smallint NOT NULL,
+    "SourceIdentity" uuid NOT NULL,
+    CONSTRAINT "PK_DataStoreIdentity" PRIMARY KEY ("DataStoreIdentitySingletonId")
+);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'CK_DataStoreIdentity_Singleton'
+        AND conrelid = to_regclass('"dms"."DataStoreIdentity"')
+    )
+    THEN
+        ALTER TABLE "dms"."DataStoreIdentity"
+        ADD CONSTRAINT "CK_DataStoreIdentity_Singleton" CHECK ("DataStoreIdentitySingletonId" = 1);
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS "dms"."Descriptor"
 (
     "DocumentId" bigint NOT NULL,
+    "ResourceKeyId" smallint NOT NULL,
     "Namespace" varchar(255) NOT NULL,
     "CodeValue" varchar(50) NOT NULL,
     "ShortDescription" varchar(75) NOT NULL,
@@ -116,10 +275,9 @@ CREATE TABLE IF NOT EXISTS "dms"."Document"
     "DocumentId" bigint GENERATED ALWAYS AS IDENTITY NOT NULL,
     "DocumentUuid" uuid NOT NULL,
     "ResourceKeyId" smallint NOT NULL,
+    "CreatedByOwnershipTokenId" smallint NULL,
     "ContentVersion" bigint NOT NULL DEFAULT nextval('"dms"."ChangeVersionSequence"'),
-    "IdentityVersion" bigint NOT NULL DEFAULT nextval('"dms"."ChangeVersionSequence"'),
     "ContentLastModifiedAt" timestamp with time zone NOT NULL DEFAULT now(),
-    "IdentityLastModifiedAt" timestamp with time zone NOT NULL DEFAULT now(),
     "CreatedAt" timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT "PK_Document" PRIMARY KEY ("DocumentId")
 );
@@ -144,26 +302,13 @@ CREATE TABLE IF NOT EXISTS "dms"."DocumentCache"
     "ProjectName" varchar(256) NOT NULL,
     "ResourceName" varchar(256) NOT NULL,
     "ResourceVersion" varchar(32) NOT NULL,
-    "Etag" varchar(64) NOT NULL,
     "ContentVersion" bigint NOT NULL,
+    "StreamEtag" varchar(64) NOT NULL,
     "LastModifiedAt" timestamp with time zone NOT NULL,
     "DocumentJson" jsonb NOT NULL,
     "ComputedAt" timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT "PK_DocumentCache" PRIMARY KEY ("DocumentId")
 );
-
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'UX_DocumentCache_DocumentUuid'
-        AND conrelid = to_regclass('"dms"."DocumentCache"')
-    )
-    THEN
-        ALTER TABLE "dms"."DocumentCache"
-        ADD CONSTRAINT "UX_DocumentCache_DocumentUuid" UNIQUE ("DocumentUuid");
-    END IF;
-END $$;
 
 DO $$
 BEGIN
@@ -177,6 +322,49 @@ BEGIN
         ADD CONSTRAINT "CK_DocumentCache_JsonObject" CHECK (jsonb_typeof("DocumentJson") = 'object');
     END IF;
 END $$;
+
+CREATE TABLE IF NOT EXISTS "dms"."DocumentCacheState"
+(
+    "StateId" smallint NOT NULL,
+    "ProjectionLifecycleState" varchar(16) NOT NULL,
+    "CacheAheadRecoveryRequired" boolean NOT NULL,
+    CONSTRAINT "PK_DocumentCacheState" PRIMARY KEY ("StateId")
+);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'CK_DocumentCacheState_Singleton'
+        AND conrelid = to_regclass('"dms"."DocumentCacheState"')
+    )
+    THEN
+        ALTER TABLE "dms"."DocumentCacheState"
+        ADD CONSTRAINT "CK_DocumentCacheState_Singleton" CHECK ("StateId" = 1);
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'CK_DocumentCacheState_Lifecycle'
+        AND conrelid = to_regclass('"dms"."DocumentCacheState"')
+    )
+    THEN
+        ALTER TABLE "dms"."DocumentCacheState"
+        ADD CONSTRAINT "CK_DocumentCacheState_Lifecycle" CHECK ("ProjectionLifecycleState" IN ('Disabled', 'Resetting', 'Rebuilding', 'Tracking'));
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS "dms"."DocumentProjectionWork"
+(
+    "DocumentId" bigint NOT NULL,
+    "RequiredContentVersion" bigint NOT NULL,
+    "FirstEnqueuedAt" timestamp with time zone NOT NULL,
+    "LastEnqueuedAt" timestamp with time zone NOT NULL,
+    CONSTRAINT "PK_DocumentProjectionWork" PRIMARY KEY ("DocumentId")
+);
 
 CREATE TABLE IF NOT EXISTS "dms"."EffectiveSchema"
 (
@@ -250,6 +438,90 @@ CREATE TABLE IF NOT EXISTS "dms"."ReferentialIdentity"
     CONSTRAINT "UX_ReferentialIdentity_DocumentId_ResourceKeyId" UNIQUE ("DocumentId", "ResourceKeyId")
 );
 
+CREATE TABLE IF NOT EXISTS "dms"."RepresentationRestampOperation"
+(
+    "OperationId" uuid NOT NULL,
+    "ContractVersion" integer NOT NULL,
+    "TenantKey" varchar(256) NOT NULL,
+    "DataStoreId" bigint NOT NULL,
+    "PhysicalSourceFingerprint" varchar(71) NOT NULL,
+    "ScopeJson" jsonb NOT NULL,
+    "Reason" varchar(1024) NOT NULL,
+    "Mode" varchar(8) NOT NULL,
+    "PreRestampBoundary" bigint NOT NULL,
+    "PreviewDocumentCount" bigint NOT NULL,
+    "CommittedDocumentCount" bigint NOT NULL,
+    "State" varchar(10) NOT NULL,
+    "CreatedAt" timestamp with time zone NOT NULL DEFAULT now(),
+    "UpdatedAt" timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT "PK_RepresentationRestampOperation" PRIMARY KEY ("OperationId")
+);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'CK_RepresentationRestampOperation_ContractVersion'
+        AND conrelid = to_regclass('"dms"."RepresentationRestampOperation"')
+    )
+    THEN
+        ALTER TABLE "dms"."RepresentationRestampOperation"
+        ADD CONSTRAINT "CK_RepresentationRestampOperation_ContractVersion" CHECK ("ContractVersion" = 1);
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'CK_RepresentationRestampOperation_Mode'
+        AND conrelid = to_regclass('"dms"."RepresentationRestampOperation"')
+    )
+    THEN
+        ALTER TABLE "dms"."RepresentationRestampOperation"
+        ADD CONSTRAINT "CK_RepresentationRestampOperation_Mode" CHECK ("Mode" IN ('Tracking', 'Disabled'));
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'CK_RepresentationRestampOperation_State'
+        AND conrelid = to_regclass('"dms"."RepresentationRestampOperation"')
+    )
+    THEN
+        ALTER TABLE "dms"."RepresentationRestampOperation"
+        ADD CONSTRAINT "CK_RepresentationRestampOperation_State" CHECK ("State" IN ('Draft', 'Incomplete', 'Completed'));
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'CK_RepresentationRestampOperation_NonNegativeCounts'
+        AND conrelid = to_regclass('"dms"."RepresentationRestampOperation"')
+    )
+    THEN
+        ALTER TABLE "dms"."RepresentationRestampOperation"
+        ADD CONSTRAINT "CK_RepresentationRestampOperation_NonNegativeCounts" CHECK ("PreRestampBoundary" >= 0 AND "PreviewDocumentCount" >= 0 AND "CommittedDocumentCount" >= 0);
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'CK_RepresentationRestampOperation_CommittedCount'
+        AND conrelid = to_regclass('"dms"."RepresentationRestampOperation"')
+    )
+    THEN
+        ALTER TABLE "dms"."RepresentationRestampOperation"
+        ADD CONSTRAINT "CK_RepresentationRestampOperation_CommittedCount" CHECK ("CommittedDocumentCount" <= "PreviewDocumentCount");
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS "dms"."ResourceKey"
 (
     "ResourceKeyId" smallint NOT NULL,
@@ -307,6 +579,23 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
+        WHERE conname = 'FK_Descriptor_ResourceKey'
+        AND conrelid = to_regclass('"dms"."Descriptor"')
+    )
+    THEN
+        ALTER TABLE "dms"."Descriptor"
+        ADD CONSTRAINT "FK_Descriptor_ResourceKey"
+        FOREIGN KEY ("ResourceKeyId")
+        REFERENCES "dms"."ResourceKey" ("ResourceKeyId")
+        ON DELETE NO ACTION
+        ON UPDATE NO ACTION;
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
         WHERE conname = 'FK_Document_ResourceKey'
         AND conrelid = to_regclass('"dms"."Document"')
     )
@@ -330,6 +619,23 @@ BEGIN
     THEN
         ALTER TABLE "dms"."DocumentCache"
         ADD CONSTRAINT "FK_DocumentCache_Document"
+        FOREIGN KEY ("DocumentId")
+        REFERENCES "dms"."Document" ("DocumentId")
+        ON DELETE CASCADE
+        ON UPDATE NO ACTION;
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'FK_DocumentProjectionWork_Document'
+        AND conrelid = to_regclass('"dms"."DocumentProjectionWork"')
+    )
+    THEN
+        ALTER TABLE "dms"."DocumentProjectionWork"
+        ADD CONSTRAINT "FK_DocumentProjectionWork_Document"
         FOREIGN KEY ("DocumentId")
         REFERENCES "dms"."Document" ("DocumentId")
         ON DELETE CASCADE
@@ -392,13 +698,11 @@ END $$;
 -- Phase 7: Indexes
 -- ==========================================================
 
-CREATE INDEX IF NOT EXISTS "IX_Descriptor_Uri_Discriminator" ON "dms"."Descriptor" ("Uri", "Discriminator");
+CREATE INDEX IF NOT EXISTS "IX_Descriptor_ResourceKeyId_DocumentId" ON "dms"."Descriptor" ("ResourceKeyId", "DocumentId");
 
-CREATE INDEX IF NOT EXISTS "IX_Document_ResourceKeyId_DocumentId" ON "dms"."Document" ("ResourceKeyId", "DocumentId");
+CREATE INDEX IF NOT EXISTS "IX_Document_CreatedByOwnershipTokenId" ON "dms"."Document" ("CreatedByOwnershipTokenId");
 
-CREATE INDEX IF NOT EXISTS "IX_DocumentCache_ProjectName_ResourceName_LastModifiedAt" ON "dms"."DocumentCache" ("ProjectName", "ResourceName", "LastModifiedAt", "DocumentId");
-
-CREATE INDEX IF NOT EXISTS "IX_ReferentialIdentity_DocumentId" ON "dms"."ReferentialIdentity" ("DocumentId");
+CREATE INDEX IF NOT EXISTS "IX_DocumentProjectionWork_FirstEnqueuedAt_DocumentId" ON "dms"."DocumentProjectionWork" ("FirstEnqueuedAt", "DocumentId");
 
 -- ==========================================================
 -- Phase 8: Triggers
@@ -407,6 +711,16 @@ CREATE INDEX IF NOT EXISTS "IX_ReferentialIdentity_DocumentId" ON "dms"."Referen
 CREATE OR REPLACE FUNCTION "dms"."TF_Descriptor_Stamp_Document"()
 RETURNS TRIGGER AS $func$
 BEGIN
+    IF TG_OP IN ('INSERT', 'UPDATE') THEN
+        IF NOT EXISTS (
+            SELECT 1
+            FROM "dms"."Document"
+            WHERE "DocumentId" = NEW."DocumentId"
+                AND "ResourceKeyId" = NEW."ResourceKeyId"
+        ) THEN
+            RAISE EXCEPTION 'dms.Descriptor.ResourceKeyId % diverges from the owning dms.Document row for DocumentId %', NEW."ResourceKeyId", NEW."DocumentId";
+        END IF;
+    END IF;
     IF TG_OP = 'UPDATE' THEN
         IF NOT (OLD."Namespace" IS DISTINCT FROM NEW."Namespace" OR OLD."CodeValue" IS DISTINCT FROM NEW."CodeValue" OR OLD."ShortDescription" IS DISTINCT FROM NEW."ShortDescription" OR OLD."Description" IS DISTINCT FROM NEW."Description" OR OLD."EffectiveBeginDate" IS DISTINCT FROM NEW."EffectiveBeginDate" OR OLD."EffectiveEndDate" IS DISTINCT FROM NEW."EffectiveEndDate" OR OLD."Discriminator" IS DISTINCT FROM NEW."Discriminator" OR OLD."Uri" IS DISTINCT FROM NEW."Uri") THEN
             RETURN NEW;
@@ -448,6 +762,281 @@ CREATE TRIGGER "TR_Descriptor_Stamp_Document"
     AFTER INSERT OR UPDATE OR DELETE ON "dms"."Descriptor"
     FOR EACH ROW
     EXECUTE FUNCTION "dms"."TF_Descriptor_Stamp_Document"();
+
+DO $$
+DECLARE
+    _owner_role oid := pg_catalog.to_regrole('edfi_dms_enqueue_owner');
+    _session_role oid;
+BEGIN
+    SELECT oid INTO _session_role
+    FROM pg_catalog.pg_roles
+    WHERE rolname = SESSION_USER;
+
+    IF _owner_role IS NOT NULL AND EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members membership
+        WHERE membership.roleid = _owner_role
+        AND membership.member = _session_role
+        AND NOT membership.admin_option
+        AND NOT membership.inherit_option
+        AND membership.set_option
+    ) THEN
+        EXECUTE 'GRANT USAGE ON SCHEMA "dms" TO "edfi_dms_enqueue_owner"';
+        EXECUTE 'GRANT CREATE ON SCHEMA "dms" TO "edfi_dms_enqueue_owner"';
+        EXECUTE 'SET ROLE "edfi_dms_enqueue_owner"';
+    END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION "dms"."TF_Document_EnqueueProjectionInsert"()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $func$
+DECLARE
+    _lifecycle_state text;
+    _enqueued_at timestamp with time zone;
+BEGIN
+    SELECT "ProjectionLifecycleState" INTO _lifecycle_state
+    FROM "dms"."DocumentCacheState"
+    WHERE "StateId" = 1;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'dms.DocumentCacheState singleton row is missing or unreadable for projection enqueue.';
+    END IF;
+
+    IF _lifecycle_state NOT IN ('Disabled', 'Resetting', 'Rebuilding', 'Tracking') THEN
+        RAISE EXCEPTION 'dms.DocumentCacheState.ProjectionLifecycleState has unsupported value % for projection enqueue.', _lifecycle_state;
+    END IF;
+
+    IF _lifecycle_state = 'Disabled' THEN
+        RETURN NULL;
+    END IF;
+
+    _enqueued_at := statement_timestamp();
+
+    INSERT INTO "dms"."DocumentProjectionWork" AS work (
+        "DocumentId",
+        "RequiredContentVersion",
+        "FirstEnqueuedAt",
+        "LastEnqueuedAt"
+    )
+    SELECT "DocumentId", "ContentVersion", _enqueued_at, _enqueued_at
+    FROM new_rows
+    ON CONFLICT ("DocumentId") DO UPDATE
+    SET "RequiredContentVersion" = EXCLUDED."RequiredContentVersion",
+        "LastEnqueuedAt" = EXCLUDED."LastEnqueuedAt"
+    WHERE work."RequiredContentVersion" < EXCLUDED."RequiredContentVersion";
+
+    RETURN NULL;
+END;
+$func$;
+REVOKE EXECUTE ON FUNCTION "dms"."TF_Document_EnqueueProjectionInsert"() FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION "dms"."TF_Document_EnqueueProjectionUpdate"()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $func$
+DECLARE
+    _lifecycle_state text;
+    _enqueued_at timestamp with time zone;
+BEGIN
+    SELECT "ProjectionLifecycleState" INTO _lifecycle_state
+    FROM "dms"."DocumentCacheState"
+    WHERE "StateId" = 1;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'dms.DocumentCacheState singleton row is missing or unreadable for projection enqueue.';
+    END IF;
+
+    IF _lifecycle_state NOT IN ('Disabled', 'Resetting', 'Rebuilding', 'Tracking') THEN
+        RAISE EXCEPTION 'dms.DocumentCacheState.ProjectionLifecycleState has unsupported value % for projection enqueue.', _lifecycle_state;
+    END IF;
+
+    IF _lifecycle_state = 'Disabled' THEN
+        RETURN NULL;
+    END IF;
+
+    _enqueued_at := statement_timestamp();
+
+    INSERT INTO "dms"."DocumentProjectionWork" AS work (
+        "DocumentId",
+        "RequiredContentVersion",
+        "FirstEnqueuedAt",
+        "LastEnqueuedAt"
+    )
+    SELECT n."DocumentId", n."ContentVersion", _enqueued_at, _enqueued_at
+    FROM new_rows n
+    INNER JOIN old_rows o ON o."DocumentId" = n."DocumentId"
+    WHERE n."ContentVersion" <> o."ContentVersion"
+    ON CONFLICT ("DocumentId") DO UPDATE
+    SET "RequiredContentVersion" = EXCLUDED."RequiredContentVersion",
+        "LastEnqueuedAt" = EXCLUDED."LastEnqueuedAt"
+    WHERE work."RequiredContentVersion" < EXCLUDED."RequiredContentVersion";
+
+    RETURN NULL;
+END;
+$func$;
+REVOKE EXECUTE ON FUNCTION "dms"."TF_Document_EnqueueProjectionUpdate"() FROM PUBLIC;
+
+GRANT EXECUTE ON FUNCTION "dms"."TF_Document_EnqueueProjectionInsert"() TO SESSION_USER;
+GRANT EXECUTE ON FUNCTION "dms"."TF_Document_EnqueueProjectionUpdate"() TO SESSION_USER;
+RESET ROLE;
+
+DO $$
+BEGIN
+    IF pg_catalog.to_regrole('edfi_dms_enqueue_owner') IS NOT NULL THEN
+        EXECUTE 'REVOKE CREATE ON SCHEMA "dms" FROM "edfi_dms_enqueue_owner"';
+    END IF;
+END $$;
+
+DROP TRIGGER IF EXISTS "TR_Document_EnqueueProjectionInsert" ON "dms"."Document";
+CREATE TRIGGER "TR_Document_EnqueueProjectionInsert"
+    AFTER INSERT ON "dms"."Document"
+    REFERENCING NEW TABLE AS new_rows
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION "dms"."TF_Document_EnqueueProjectionInsert"();
+
+DROP TRIGGER IF EXISTS "TR_Document_EnqueueProjectionUpdate" ON "dms"."Document";
+CREATE TRIGGER "TR_Document_EnqueueProjectionUpdate"
+    AFTER UPDATE ON "dms"."Document"
+    REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION "dms"."TF_Document_EnqueueProjectionUpdate"();
+
+CREATE OR REPLACE FUNCTION "dms"."TF_DocumentCache_ValidateDocumentUuid"()
+RETURNS TRIGGER AS $func$
+DECLARE
+    _canonical_document_uuid uuid;
+BEGIN
+    SELECT "DocumentUuid" INTO _canonical_document_uuid
+    FROM "dms"."Document"
+    WHERE "DocumentId" = NEW."DocumentId";
+
+    IF _canonical_document_uuid IS NOT NULL AND NEW."DocumentUuid" <> _canonical_document_uuid THEN
+        RAISE EXCEPTION 'dms.DocumentCache.DocumentUuid diverges from the owning dms.Document row for DocumentId %', NEW."DocumentId";
+    END IF;
+
+    RETURN NEW;
+END;
+$func$ LANGUAGE plpgsql SECURITY INVOKER;
+
+DROP TRIGGER IF EXISTS "TR_DocumentCache_ValidateDocumentUuid" ON "dms"."DocumentCache";
+CREATE TRIGGER "TR_DocumentCache_ValidateDocumentUuid"
+    BEFORE INSERT OR UPDATE ON "dms"."DocumentCache"
+    FOR EACH ROW
+    EXECUTE FUNCTION "dms"."TF_DocumentCache_ValidateDocumentUuid"();
+
+-- ==========================================================
+-- Phase 9: Security and Grants
+-- ==========================================================
+
+DO $$
+DECLARE
+    _owner_role oid := pg_catalog.to_regrole('edfi_dms_enqueue_owner');
+    _session_role oid;
+    _session_is_superuser boolean;
+    _session_can_create_role boolean;
+    _created_owner_role boolean := false;
+BEGIN
+    SELECT oid, rolsuper, rolcreaterole
+    INTO _session_role, _session_is_superuser, _session_can_create_role
+    FROM pg_catalog.pg_roles
+    WHERE rolname = SESSION_USER;
+
+    IF _owner_role IS NULL THEN
+        IF NOT COALESCE(_session_is_superuser OR _session_can_create_role, false) THEN
+            RAISE EXCEPTION 'PostgreSQL provisioning principal must be SUPERUSER or CREATEROLE to create edfi_dms_enqueue_owner before provisioning.';
+        END IF;
+        BEGIN
+            CREATE ROLE "edfi_dms_enqueue_owner" WITH NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+            _owner_role := pg_catalog.to_regrole('edfi_dms_enqueue_owner');
+            _created_owner_role := true;
+        EXCEPTION
+            WHEN duplicate_object OR unique_violation THEN
+                _owner_role := pg_catalog.to_regrole('edfi_dms_enqueue_owner');
+                _created_owner_role := true;
+        END;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles owner_role WHERE owner_role.oid = _owner_role
+    AND (owner_role.rolcanlogin OR owner_role.rolinherit OR owner_role.rolsuper OR owner_role.rolcreatedb OR owner_role.rolcreaterole OR owner_role.rolreplication OR owner_role.rolbypassrls)) THEN
+        RAISE EXCEPTION 'PostgreSQL role edfi_dms_enqueue_owner exists but is not locked down as NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS. Drop or repair the role before provisioning.';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members membership
+        WHERE membership.member = _owner_role
+        AND (membership.admin_option OR membership.inherit_option OR membership.set_option)
+    ) THEN
+        RAISE EXCEPTION 'PostgreSQL role edfi_dms_enqueue_owner must not hold outgoing privilege-bearing memberships.';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members membership
+        WHERE membership.roleid = _owner_role
+        AND membership.member = _session_role
+        AND NOT (membership.admin_option AND NOT membership.inherit_option AND NOT membership.set_option AND COALESCE(_session_can_create_role, false))
+        AND (membership.admin_option OR membership.inherit_option OR NOT membership.set_option)
+    ) THEN
+        RAISE EXCEPTION 'PostgreSQL provisioning principal has an unsafe direct membership in edfi_dms_enqueue_owner; required options are SET TRUE, INHERIT FALSE, ADMIN FALSE.';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members membership
+        WHERE membership.roleid = _owner_role
+        AND membership.member = _session_role
+        AND NOT membership.admin_option
+        AND NOT membership.inherit_option
+        AND membership.set_option
+    ) THEN
+        IF NOT COALESCE(_session_is_superuser OR (_created_owner_role AND _session_can_create_role), false) THEN
+            RAISE EXCEPTION 'PostgreSQL provisioning principal must have direct SET TRUE, INHERIT FALSE, ADMIN FALSE membership in existing edfi_dms_enqueue_owner before provisioning.';
+        END IF;
+        GRANT "edfi_dms_enqueue_owner" TO SESSION_USER WITH SET TRUE, INHERIT FALSE, ADMIN FALSE;
+    END IF;
+END $$;
+
+DO $$
+DECLARE
+    _owner_role oid := pg_catalog.to_regrole('edfi_dms_enqueue_owner');
+BEGIN
+    IF _owner_role IS NOT NULL AND EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_proc p
+        INNER JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'dms'
+        AND p.proname IN ('TF_Document_EnqueueProjectionInsert', 'TF_Document_EnqueueProjectionUpdate')
+        AND p.proowner <> _owner_role
+    ) THEN
+        EXECUTE 'GRANT CREATE ON SCHEMA "dms" TO "edfi_dms_enqueue_owner"';
+        BEGIN
+            EXECUTE 'ALTER FUNCTION "dms"."TF_Document_EnqueueProjectionInsert"() OWNER TO "edfi_dms_enqueue_owner"';
+            EXECUTE 'ALTER FUNCTION "dms"."TF_Document_EnqueueProjectionUpdate"() OWNER TO "edfi_dms_enqueue_owner"';
+        EXCEPTION WHEN OTHERS THEN
+            EXECUTE 'REVOKE CREATE ON SCHEMA "dms" FROM "edfi_dms_enqueue_owner"';
+            RAISE;
+        END;
+        EXECUTE 'REVOKE CREATE ON SCHEMA "dms" FROM "edfi_dms_enqueue_owner"';
+    END IF;
+END $$;
+
+GRANT USAGE ON SCHEMA "dms" TO "edfi_dms_enqueue_owner";
+SET ROLE "edfi_dms_enqueue_owner";
+REVOKE EXECUTE ON FUNCTION "dms"."TF_Document_EnqueueProjectionInsert"() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION "dms"."TF_Document_EnqueueProjectionUpdate"() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION "dms"."TF_Document_EnqueueProjectionInsert"() FROM SESSION_USER;
+REVOKE EXECUTE ON FUNCTION "dms"."TF_Document_EnqueueProjectionUpdate"() FROM SESSION_USER;
+RESET ROLE;
+REVOKE INSERT, UPDATE, DELETE ON TABLE "dms"."DocumentProjectionWork" FROM PUBLIC;
+
+GRANT SELECT ON TABLE "dms"."DocumentCacheState" TO "edfi_dms_enqueue_owner";
+GRANT SELECT, INSERT, UPDATE ON TABLE "dms"."DocumentProjectionWork" TO "edfi_dms_enqueue_owner";
 
 CREATE SCHEMA IF NOT EXISTS "edfi";
 CREATE SCHEMA IF NOT EXISTS "auth";
@@ -613,6 +1202,7 @@ CREATE TABLE IF NOT EXISTS "tracked_changes_edfi"."DateTimeKeyResource"
     "NewEventTimestamp" timestamp with time zone NULL,
     "Id" uuid NOT NULL,
     "ChangeVersion" bigint NOT NULL,
+    "DocumentId" bigint NOT NULL,
     "CreatedAt" timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT "PK_tracked_changes_edfi_DateTimeKeyResource" PRIMARY KEY ("ChangeVersion")
 );
@@ -623,6 +1213,7 @@ CREATE TABLE IF NOT EXISTS "tracked_changes_edfi"."DecimalKeyResource"
     "NewDecimalKey" numeric(9,2) NULL,
     "Id" uuid NOT NULL,
     "ChangeVersion" bigint NOT NULL,
+    "DocumentId" bigint NOT NULL,
     "CreatedAt" timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT "PK_tracked_changes_edfi_DecimalKeyResource" PRIMARY KEY ("ChangeVersion")
 );
@@ -635,6 +1226,7 @@ CREATE TABLE IF NOT EXISTS "tracked_changes_edfi"."DecimalRefResource"
     "NewDecimalKeyReference_DecimalKey" numeric(9,2) NULL,
     "Id" uuid NOT NULL,
     "ChangeVersion" bigint NOT NULL,
+    "DocumentId" bigint NOT NULL,
     "CreatedAt" timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT "PK_tracked_changes_edfi_DecimalRefResource" PRIMARY KEY ("ChangeVersion")
 );
@@ -649,6 +1241,7 @@ CREATE TABLE IF NOT EXISTS "tracked_changes_edfi"."EdOrgDependentChildResource"
     "NewEdOrgDependentResourceReference_EducationOrganizationId" integer NULL,
     "Id" uuid NOT NULL,
     "ChangeVersion" bigint NOT NULL,
+    "DocumentId" bigint NOT NULL,
     "CreatedAt" timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT "PK_tracked_changes_edfi_EdOrgDependentChildResource" PRIMARY KEY ("ChangeVersion")
 );
@@ -661,6 +1254,7 @@ CREATE TABLE IF NOT EXISTS "tracked_changes_edfi"."EdOrgDependentResource"
     "NewEducationOrganization_EducationOrganizationId" integer NULL,
     "Id" uuid NOT NULL,
     "ChangeVersion" bigint NOT NULL,
+    "DocumentId" bigint NOT NULL,
     "CreatedAt" timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT "PK_tracked_changes_edfi_EdOrgDependentResource" PRIMARY KEY ("ChangeVersion")
 );
@@ -677,6 +1271,7 @@ CREATE TABLE IF NOT EXISTS "tracked_changes_edfi"."KeyUnifiedResource"
     "NewResourceBReference_ResourceBId" varchar(64) NULL,
     "Id" uuid NOT NULL,
     "ChangeVersion" bigint NOT NULL,
+    "DocumentId" bigint NOT NULL,
     "CreatedAt" timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT "PK_tracked_changes_edfi_KeyUnifiedResource" PRIMARY KEY ("ChangeVersion")
 );
@@ -689,6 +1284,7 @@ CREATE TABLE IF NOT EXISTS "tracked_changes_edfi"."ResourceA"
     "NewStudentReference_StudentUniqueId" varchar(32) NULL,
     "Id" uuid NOT NULL,
     "ChangeVersion" bigint NOT NULL,
+    "DocumentId" bigint NOT NULL,
     "CreatedAt" timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT "PK_tracked_changes_edfi_ResourceA" PRIMARY KEY ("ChangeVersion")
 );
@@ -701,6 +1297,7 @@ CREATE TABLE IF NOT EXISTS "tracked_changes_edfi"."ResourceB"
     "NewStudentReference_StudentUniqueId" varchar(32) NULL,
     "Id" uuid NOT NULL,
     "ChangeVersion" bigint NOT NULL,
+    "DocumentId" bigint NOT NULL,
     "CreatedAt" timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT "PK_tracked_changes_edfi_ResourceB" PRIMARY KEY ("ChangeVersion")
 );
@@ -711,6 +1308,7 @@ CREATE TABLE IF NOT EXISTS "tracked_changes_edfi"."School"
     "NewSchoolId" integer NULL,
     "Id" uuid NOT NULL,
     "ChangeVersion" bigint NOT NULL,
+    "DocumentId" bigint NOT NULL,
     "CreatedAt" timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT "PK_tracked_changes_edfi_School" PRIMARY KEY ("ChangeVersion")
 );
@@ -721,6 +1319,7 @@ CREATE TABLE IF NOT EXISTS "tracked_changes_edfi"."Student"
     "NewStudentUniqueId" varchar(32) NULL,
     "Id" uuid NOT NULL,
     "ChangeVersion" bigint NOT NULL,
+    "DocumentId" bigint NOT NULL,
     "CreatedAt" timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT "PK_tracked_changes_edfi_Student" PRIMARY KEY ("ChangeVersion")
 );
@@ -733,6 +1332,7 @@ CREATE TABLE IF NOT EXISTS "tracked_changes_edfi"."StudentSchoolAssociation"
     "NewSchoolReference_SchoolId" integer NULL,
     "Id" uuid NOT NULL,
     "ChangeVersion" bigint NOT NULL,
+    "DocumentId" bigint NOT NULL,
     "CreatedAt" timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT "PK_tracked_changes_edfi_StudentSchoolAssociation" PRIMARY KEY ("ChangeVersion")
 );
@@ -1164,12 +1764,14 @@ BEGIN
         INSERT INTO "tracked_changes_edfi"."DateTimeKeyResource" (
             "OldEventTimestamp",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."EventTimestamp",
             doc."DocumentUuid",
-            doc."ContentVersion"
+            doc."ContentVersion",
+            OLD."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = OLD."DocumentId";
         RETURN OLD;
@@ -1193,20 +1795,19 @@ BEGIN
         NEW."ContentLastModifiedAt" := _stampedContentLastModifiedAt;
     END IF;
     IF TG_OP = 'UPDATE' AND (OLD."EventTimestamp" IS DISTINCT FROM NEW."EventTimestamp") THEN
-        UPDATE "dms"."Document"
-        SET "IdentityVersion" = nextval('"dms"."ChangeVersionSequence"'), "IdentityLastModifiedAt" = now()
-        WHERE "DocumentId" = NEW."DocumentId";
         INSERT INTO "tracked_changes_edfi"."DateTimeKeyResource" (
             "OldEventTimestamp",
             "NewEventTimestamp",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."EventTimestamp",
             NEW."EventTimestamp",
             doc."DocumentUuid",
-            _stampedContentVersion
+            _stampedContentVersion,
+            NEW."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = NEW."DocumentId";
     END IF;
@@ -1252,12 +1853,14 @@ BEGIN
         INSERT INTO "tracked_changes_edfi"."DecimalKeyResource" (
             "OldDecimalKey",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."DecimalKey",
             doc."DocumentUuid",
-            doc."ContentVersion"
+            doc."ContentVersion",
+            OLD."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = OLD."DocumentId";
         RETURN OLD;
@@ -1281,20 +1884,19 @@ BEGIN
         NEW."ContentLastModifiedAt" := _stampedContentLastModifiedAt;
     END IF;
     IF TG_OP = 'UPDATE' AND (OLD."DecimalKey" IS DISTINCT FROM NEW."DecimalKey") THEN
-        UPDATE "dms"."Document"
-        SET "IdentityVersion" = nextval('"dms"."ChangeVersionSequence"'), "IdentityLastModifiedAt" = now()
-        WHERE "DocumentId" = NEW."DocumentId";
         INSERT INTO "tracked_changes_edfi"."DecimalKeyResource" (
             "OldDecimalKey",
             "NewDecimalKey",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."DecimalKey",
             NEW."DecimalKey",
             doc."DocumentUuid",
-            _stampedContentVersion
+            _stampedContentVersion,
+            NEW."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = NEW."DocumentId";
     END IF;
@@ -1341,13 +1943,15 @@ BEGIN
             "OldRefResourceId",
             "OldDecimalKeyReference_DecimalKey",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."RefResourceId",
             OLD."DecimalKeyReference_DecimalKey",
             doc."DocumentUuid",
-            doc."ContentVersion"
+            doc."ContentVersion",
+            OLD."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = OLD."DocumentId";
         RETURN OLD;
@@ -1371,16 +1975,14 @@ BEGIN
         NEW."ContentLastModifiedAt" := _stampedContentLastModifiedAt;
     END IF;
     IF TG_OP = 'UPDATE' AND (OLD."RefResourceId" IS DISTINCT FROM NEW."RefResourceId" OR OLD."DecimalKeyReference_DecimalKey" IS DISTINCT FROM NEW."DecimalKeyReference_DecimalKey") THEN
-        UPDATE "dms"."Document"
-        SET "IdentityVersion" = nextval('"dms"."ChangeVersionSequence"'), "IdentityLastModifiedAt" = now()
-        WHERE "DocumentId" = NEW."DocumentId";
         INSERT INTO "tracked_changes_edfi"."DecimalRefResource" (
             "OldRefResourceId",
             "OldDecimalKeyReference_DecimalKey",
             "NewRefResourceId",
             "NewDecimalKeyReference_DecimalKey",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."RefResourceId",
@@ -1388,7 +1990,8 @@ BEGIN
             NEW."RefResourceId",
             NEW."DecimalKeyReference_DecimalKey",
             doc."DocumentUuid",
-            _stampedContentVersion
+            _stampedContentVersion,
+            NEW."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = NEW."DocumentId";
     END IF;
@@ -1436,14 +2039,16 @@ BEGIN
             "OldEdOrgDependentResourceReference_EdOrgDependentResourceId",
             "OldEdOrgDependentResourceReference_EducationOrganizationId",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."EdOrgDependentChildResourceId",
             OLD."EdOrgDependentResourceReference_EdOrgDependentResourceId",
             OLD."EdOrgDependentResourceReference_EducationOrganizationId",
             doc."DocumentUuid",
-            doc."ContentVersion"
+            doc."ContentVersion",
+            OLD."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = OLD."DocumentId";
         RETURN OLD;
@@ -1467,9 +2072,6 @@ BEGIN
         NEW."ContentLastModifiedAt" := _stampedContentLastModifiedAt;
     END IF;
     IF TG_OP = 'UPDATE' AND (OLD."EdOrgDependentChildResourceId" IS DISTINCT FROM NEW."EdOrgDependentChildResourceId" OR OLD."EdOrgDependentResourceReference_EdOrgDependentResourceId" IS DISTINCT FROM NEW."EdOrgDependentResourceReference_EdOrgDependentResourceId" OR OLD."EdOrgDependentResourceReference_EducationOrganizationId" IS DISTINCT FROM NEW."EdOrgDependentResourceReference_EducationOrganizationId") THEN
-        UPDATE "dms"."Document"
-        SET "IdentityVersion" = nextval('"dms"."ChangeVersionSequence"'), "IdentityLastModifiedAt" = now()
-        WHERE "DocumentId" = NEW."DocumentId";
         INSERT INTO "tracked_changes_edfi"."EdOrgDependentChildResource" (
             "OldEdOrgDependentChildResourceId",
             "OldEdOrgDependentResourceReference_EdOrgDependentResourceId",
@@ -1478,7 +2080,8 @@ BEGIN
             "NewEdOrgDependentResourceReference_EdOrgDependentResourceId",
             "NewEdOrgDependentResourceReference_EducationOrganizationId",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."EdOrgDependentChildResourceId",
@@ -1488,7 +2091,8 @@ BEGIN
             NEW."EdOrgDependentResourceReference_EdOrgDependentResourceId",
             NEW."EdOrgDependentResourceReference_EducationOrganizationId",
             doc."DocumentUuid",
-            _stampedContentVersion
+            _stampedContentVersion,
+            NEW."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = NEW."DocumentId";
     END IF;
@@ -1535,13 +2139,15 @@ BEGIN
             "OldEdOrgDependentResourceId",
             "OldEducationOrganization_EducationOrganizationId",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."EdOrgDependentResourceId",
             OLD."EducationOrganization_EducationOrganizationId",
             doc."DocumentUuid",
-            doc."ContentVersion"
+            doc."ContentVersion",
+            OLD."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = OLD."DocumentId";
         RETURN OLD;
@@ -1565,16 +2171,14 @@ BEGIN
         NEW."ContentLastModifiedAt" := _stampedContentLastModifiedAt;
     END IF;
     IF TG_OP = 'UPDATE' AND (OLD."EdOrgDependentResourceId" IS DISTINCT FROM NEW."EdOrgDependentResourceId" OR OLD."EducationOrganization_EducationOrganizationId" IS DISTINCT FROM NEW."EducationOrganization_EducationOrganizationId") THEN
-        UPDATE "dms"."Document"
-        SET "IdentityVersion" = nextval('"dms"."ChangeVersionSequence"'), "IdentityLastModifiedAt" = now()
-        WHERE "DocumentId" = NEW."DocumentId";
         INSERT INTO "tracked_changes_edfi"."EdOrgDependentResource" (
             "OldEdOrgDependentResourceId",
             "OldEducationOrganization_EducationOrganizationId",
             "NewEdOrgDependentResourceId",
             "NewEducationOrganization_EducationOrganizationId",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."EdOrgDependentResourceId",
@@ -1582,7 +2186,8 @@ BEGIN
             NEW."EdOrgDependentResourceId",
             NEW."EducationOrganization_EducationOrganizationId",
             doc."DocumentUuid",
-            _stampedContentVersion
+            _stampedContentVersion,
+            NEW."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = NEW."DocumentId";
     END IF;
@@ -1631,7 +2236,8 @@ BEGIN
             "OldStudentUniqueId_Unified",
             "OldResourceBReference_ResourceBId",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."KeyUnifiedResourceId",
@@ -1639,7 +2245,8 @@ BEGIN
             OLD."StudentUniqueId_Unified",
             OLD."ResourceBReference_ResourceBId",
             doc."DocumentUuid",
-            doc."ContentVersion"
+            doc."ContentVersion",
+            OLD."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = OLD."DocumentId";
         RETURN OLD;
@@ -1663,9 +2270,6 @@ BEGIN
         NEW."ContentLastModifiedAt" := _stampedContentLastModifiedAt;
     END IF;
     IF TG_OP = 'UPDATE' AND (OLD."KeyUnifiedResourceId" IS DISTINCT FROM NEW."KeyUnifiedResourceId" OR OLD."ResourceAReference_ResourceAId" IS DISTINCT FROM NEW."ResourceAReference_ResourceAId" OR OLD."StudentUniqueId_Unified" IS DISTINCT FROM NEW."StudentUniqueId_Unified" OR OLD."ResourceBReference_ResourceBId" IS DISTINCT FROM NEW."ResourceBReference_ResourceBId") THEN
-        UPDATE "dms"."Document"
-        SET "IdentityVersion" = nextval('"dms"."ChangeVersionSequence"'), "IdentityLastModifiedAt" = now()
-        WHERE "DocumentId" = NEW."DocumentId";
         INSERT INTO "tracked_changes_edfi"."KeyUnifiedResource" (
             "OldKeyUnifiedResourceId",
             "OldResourceAReference_ResourceAId",
@@ -1676,7 +2280,8 @@ BEGIN
             "NewStudentUniqueId_Unified",
             "NewResourceBReference_ResourceBId",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."KeyUnifiedResourceId",
@@ -1688,7 +2293,8 @@ BEGIN
             NEW."StudentUniqueId_Unified",
             NEW."ResourceBReference_ResourceBId",
             doc."DocumentUuid",
-            _stampedContentVersion
+            _stampedContentVersion,
+            NEW."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = NEW."DocumentId";
     END IF;
@@ -1735,13 +2341,15 @@ BEGIN
             "OldResourceAId",
             "OldStudentReference_StudentUniqueId",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."ResourceAId",
             OLD."StudentReference_StudentUniqueId",
             doc."DocumentUuid",
-            doc."ContentVersion"
+            doc."ContentVersion",
+            OLD."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = OLD."DocumentId";
         RETURN OLD;
@@ -1765,16 +2373,14 @@ BEGIN
         NEW."ContentLastModifiedAt" := _stampedContentLastModifiedAt;
     END IF;
     IF TG_OP = 'UPDATE' AND (OLD."ResourceAId" IS DISTINCT FROM NEW."ResourceAId" OR OLD."StudentReference_StudentUniqueId" IS DISTINCT FROM NEW."StudentReference_StudentUniqueId") THEN
-        UPDATE "dms"."Document"
-        SET "IdentityVersion" = nextval('"dms"."ChangeVersionSequence"'), "IdentityLastModifiedAt" = now()
-        WHERE "DocumentId" = NEW."DocumentId";
         INSERT INTO "tracked_changes_edfi"."ResourceA" (
             "OldResourceAId",
             "OldStudentReference_StudentUniqueId",
             "NewResourceAId",
             "NewStudentReference_StudentUniqueId",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."ResourceAId",
@@ -1782,7 +2388,8 @@ BEGIN
             NEW."ResourceAId",
             NEW."StudentReference_StudentUniqueId",
             doc."DocumentUuid",
-            _stampedContentVersion
+            _stampedContentVersion,
+            NEW."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = NEW."DocumentId";
     END IF;
@@ -1829,13 +2436,15 @@ BEGIN
             "OldResourceBId",
             "OldStudentReference_StudentUniqueId",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."ResourceBId",
             OLD."StudentReference_StudentUniqueId",
             doc."DocumentUuid",
-            doc."ContentVersion"
+            doc."ContentVersion",
+            OLD."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = OLD."DocumentId";
         RETURN OLD;
@@ -1859,16 +2468,14 @@ BEGIN
         NEW."ContentLastModifiedAt" := _stampedContentLastModifiedAt;
     END IF;
     IF TG_OP = 'UPDATE' AND (OLD."ResourceBId" IS DISTINCT FROM NEW."ResourceBId" OR OLD."StudentReference_StudentUniqueId" IS DISTINCT FROM NEW."StudentReference_StudentUniqueId") THEN
-        UPDATE "dms"."Document"
-        SET "IdentityVersion" = nextval('"dms"."ChangeVersionSequence"'), "IdentityLastModifiedAt" = now()
-        WHERE "DocumentId" = NEW."DocumentId";
         INSERT INTO "tracked_changes_edfi"."ResourceB" (
             "OldResourceBId",
             "OldStudentReference_StudentUniqueId",
             "NewResourceBId",
             "NewStudentReference_StudentUniqueId",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."ResourceBId",
@@ -1876,7 +2483,8 @@ BEGIN
             NEW."ResourceBId",
             NEW."StudentReference_StudentUniqueId",
             doc."DocumentUuid",
-            _stampedContentVersion
+            _stampedContentVersion,
+            NEW."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = NEW."DocumentId";
     END IF;
@@ -1975,12 +2583,14 @@ BEGIN
         INSERT INTO "tracked_changes_edfi"."School" (
             "OldSchoolId",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."SchoolId",
             doc."DocumentUuid",
-            doc."ContentVersion"
+            doc."ContentVersion",
+            OLD."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = OLD."DocumentId";
         RETURN OLD;
@@ -2002,11 +2612,6 @@ BEGIN
         RETURNING "ContentVersion", "ContentLastModifiedAt" INTO STRICT _stampedContentVersion, _stampedContentLastModifiedAt;
         NEW."ContentVersion" := _stampedContentVersion;
         NEW."ContentLastModifiedAt" := _stampedContentLastModifiedAt;
-    END IF;
-    IF TG_OP = 'UPDATE' AND (OLD."SchoolId" IS DISTINCT FROM NEW."SchoolId") THEN
-        UPDATE "dms"."Document"
-        SET "IdentityVersion" = nextval('"dms"."ChangeVersionSequence"'), "IdentityLastModifiedAt" = now()
-        WHERE "DocumentId" = NEW."DocumentId";
     END IF;
     RETURN NEW;
 END;
@@ -2050,12 +2655,14 @@ BEGIN
         INSERT INTO "tracked_changes_edfi"."Student" (
             "OldStudentUniqueId",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."StudentUniqueId",
             doc."DocumentUuid",
-            doc."ContentVersion"
+            doc."ContentVersion",
+            OLD."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = OLD."DocumentId";
         RETURN OLD;
@@ -2079,20 +2686,19 @@ BEGIN
         NEW."ContentLastModifiedAt" := _stampedContentLastModifiedAt;
     END IF;
     IF TG_OP = 'UPDATE' AND (OLD."StudentUniqueId" IS DISTINCT FROM NEW."StudentUniqueId") THEN
-        UPDATE "dms"."Document"
-        SET "IdentityVersion" = nextval('"dms"."ChangeVersionSequence"'), "IdentityLastModifiedAt" = now()
-        WHERE "DocumentId" = NEW."DocumentId";
         INSERT INTO "tracked_changes_edfi"."Student" (
             "OldStudentUniqueId",
             "NewStudentUniqueId",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."StudentUniqueId",
             NEW."StudentUniqueId",
             doc."DocumentUuid",
-            _stampedContentVersion
+            _stampedContentVersion,
+            NEW."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = NEW."DocumentId";
     END IF;
@@ -2139,13 +2745,15 @@ BEGIN
             "OldStudentUniqueId",
             "OldSchoolReference_SchoolId",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."StudentUniqueId",
             OLD."SchoolReference_SchoolId",
             doc."DocumentUuid",
-            doc."ContentVersion"
+            doc."ContentVersion",
+            OLD."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = OLD."DocumentId";
         RETURN OLD;
@@ -2169,16 +2777,14 @@ BEGIN
         NEW."ContentLastModifiedAt" := _stampedContentLastModifiedAt;
     END IF;
     IF TG_OP = 'UPDATE' AND (OLD."StudentUniqueId" IS DISTINCT FROM NEW."StudentUniqueId" OR OLD."SchoolReference_SchoolId" IS DISTINCT FROM NEW."SchoolReference_SchoolId") THEN
-        UPDATE "dms"."Document"
-        SET "IdentityVersion" = nextval('"dms"."ChangeVersionSequence"'), "IdentityLastModifiedAt" = now()
-        WHERE "DocumentId" = NEW."DocumentId";
         INSERT INTO "tracked_changes_edfi"."StudentSchoolAssociation" (
             "OldStudentUniqueId",
             "OldSchoolReference_SchoolId",
             "NewStudentUniqueId",
             "NewSchoolReference_SchoolId",
             "Id",
-            "ChangeVersion"
+            "ChangeVersion",
+            "DocumentId"
         )
         SELECT
             OLD."StudentUniqueId",
@@ -2186,7 +2792,8 @@ BEGIN
             NEW."StudentUniqueId",
             NEW."SchoolReference_SchoolId",
             doc."DocumentUuid",
-            _stampedContentVersion
+            _stampedContentVersion,
+            NEW."DocumentId"
         FROM "dms"."Document" doc
         WHERE doc."DocumentId" = NEW."DocumentId";
     END IF;
@@ -2201,8 +2808,18 @@ FOR EACH ROW
 EXECUTE FUNCTION "edfi"."TF_TR_StudentSchoolAssociation_Stamp"();
 
 -- ==========================================================
--- Phase 7: Seed Data (insert-if-missing + validation)
+-- Phase 10: Seed Data (insert-if-missing + validation)
 -- ==========================================================
+
+-- DataStoreIdentity singleton insert-if-missing
+INSERT INTO "dms"."DataStoreIdentity" ("DataStoreIdentitySingletonId", "SourceIdentity")
+VALUES (1, gen_random_uuid())
+ON CONFLICT ("DataStoreIdentitySingletonId") DO NOTHING;
+
+-- DocumentCacheState singleton insert-if-missing
+INSERT INTO "dms"."DocumentCacheState" ("StateId", "ProjectionLifecycleState", "CacheAheadRecoveryRequired")
+VALUES (1, 'Disabled', false)
+ON CONFLICT ("StateId") DO NOTHING;
 
 -- ResourceKey seed inserts (insert-if-missing)
 INSERT INTO "dms"."ResourceKey" ("ResourceKeyId", "ProjectName", "ResourceName", "ResourceVersion")
@@ -2310,7 +2927,7 @@ END $$;
 
 -- EffectiveSchema singleton insert-if-missing
 INSERT INTO "dms"."EffectiveSchema" ("EffectiveSchemaSingletonId", "ApiSchemaFormatVersion", "EffectiveSchemaHash", "ResourceKeyCount", "ResourceKeySeedHash")
-VALUES (1, '1.0.0', '136957ea965b4c23f513963a407ed08e9203a723da63135a3543a74e48e58136', 12, '\xCF22BDA16C6555C3F9F4F106F8BA65C2461E58FC300892B4FBB958648BA026D1'::bytea)
+VALUES (1, '1.0.0', 'b9a983e51f4474731372243dbedb4d3a6cc272abef943da010ed924f17938e7d', 12, '\xCF22BDA16C6555C3F9F4F106F8BA65C2461E58FC300892B4FBB958648BA026D1'::bytea)
 ON CONFLICT ("EffectiveSchemaSingletonId") DO NOTHING;
 
 -- EffectiveSchema validation (ApiSchemaFormatVersion + ResourceKeyCount + ResourceKeySeedHash)
@@ -2338,7 +2955,7 @@ END $$;
 
 -- SchemaComponent seed inserts (insert-if-missing)
 INSERT INTO "dms"."SchemaComponent" ("EffectiveSchemaHash", "ProjectEndpointName", "ProjectName", "ProjectVersion", "IsExtensionProject")
-VALUES ('136957ea965b4c23f513963a407ed08e9203a723da63135a3543a74e48e58136', 'ed-fi', 'Ed-Fi', '5.0.0', false)
+VALUES ('b9a983e51f4474731372243dbedb4d3a6cc272abef943da010ed924f17938e7d', 'ed-fi', 'Ed-Fi', '5.0.0', false)
 ON CONFLICT ("EffectiveSchemaHash", "ProjectEndpointName") DO NOTHING;
 
 -- SchemaComponent exact-match validation (count + content)
@@ -2348,14 +2965,14 @@ DECLARE
     _mismatched_count integer;
     _mismatched_names text;
 BEGIN
-    SELECT COUNT(*) INTO _actual_count FROM "dms"."SchemaComponent" WHERE "EffectiveSchemaHash" = '136957ea965b4c23f513963a407ed08e9203a723da63135a3543a74e48e58136';
+    SELECT COUNT(*) INTO _actual_count FROM "dms"."SchemaComponent" WHERE "EffectiveSchemaHash" = 'b9a983e51f4474731372243dbedb4d3a6cc272abef943da010ed924f17938e7d';
     IF _actual_count <> 1 THEN
         RAISE EXCEPTION 'dms.SchemaComponent count mismatch: expected 1, found %', _actual_count;
     END IF;
 
     SELECT COUNT(*) INTO _mismatched_count
     FROM "dms"."SchemaComponent" sc
-    WHERE sc."EffectiveSchemaHash" = '136957ea965b4c23f513963a407ed08e9203a723da63135a3543a74e48e58136'
+    WHERE sc."EffectiveSchemaHash" = 'b9a983e51f4474731372243dbedb4d3a6cc272abef943da010ed924f17938e7d'
     AND NOT EXISTS (
         SELECT 1 FROM (VALUES
             ('ed-fi', 'Ed-Fi', '5.0.0', false)
@@ -2370,7 +2987,7 @@ BEGIN
         FROM (
             SELECT sc."ProjectEndpointName" AS name
             FROM "dms"."SchemaComponent" sc
-            WHERE sc."EffectiveSchemaHash" = '136957ea965b4c23f513963a407ed08e9203a723da63135a3543a74e48e58136'
+            WHERE sc."EffectiveSchemaHash" = 'b9a983e51f4474731372243dbedb4d3a6cc272abef943da010ed924f17938e7d'
             AND NOT EXISTS (
                 SELECT 1 FROM (VALUES
                     ('ed-fi', 'Ed-Fi', '5.0.0', false)

@@ -3,8 +3,11 @@
 // The Ed-Fi Alliance licenses this file to you under the Apache License, Version 2.0.
 // See the LICENSE and NOTICES files in the project root for more information.
 
+using System.Globalization;
 using System.Net;
+using System.Text.Json;
 using System.Threading.RateLimiting;
+using EdFi.Api.Plugins.Hosting;
 using EdFi.DataManagementService.Backend;
 using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Backend.Mssql;
@@ -12,23 +15,37 @@ using EdFi.DataManagementService.Backend.Plans;
 using EdFi.DataManagementService.Backend.Postgresql;
 using EdFi.DataManagementService.Core;
 using EdFi.DataManagementService.Core.Configuration;
-using EdFi.DataManagementService.Core.External.Backend;
 using EdFi.DataManagementService.Core.OAuth;
+using EdFi.DataManagementService.Core.Response;
 using EdFi.DataManagementService.Core.Security;
 using EdFi.DataManagementService.Core.Startup;
 using EdFi.DataManagementService.Frontend.AspNetCore.Configuration;
 using EdFi.DataManagementService.Frontend.AspNetCore.Content;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using Serilog;
 using CoreAppSettings = EdFi.DataManagementService.Core.Configuration.AppSettings;
+using CoreAppSettingsValidator = EdFi.DataManagementService.Core.Configuration.AppSettingsValidator;
 
 namespace EdFi.DataManagementService.Frontend.AspNetCore.Infrastructure;
 
 public static class WebApplicationBuilderExtensions
 {
-    public static void AddServices(this WebApplicationBuilder webAppBuilder)
+    /// <summary>
+    /// Registers everything the host owns, then invokes the plugin service-contribution phase over
+    /// <paramref name="loadedPlugins"/>.
+    /// </summary>
+    /// <param name="webAppBuilder">The builder being configured.</param>
+    /// <param name="loadedPlugins">
+    /// What the plugin loader returned for this process. Required rather than defaulted, so that a
+    /// caller cannot silently compose against no plugins on a deployment that allowlisted some; a test
+    /// with nothing to contribute passes <see cref="LoadedPlugins.Empty"/> explicitly.
+    /// </param>
+    public static void AddServices(this WebApplicationBuilder webAppBuilder, LoadedPlugins loadedPlugins)
     {
+        ArgumentNullException.ThrowIfNull(loadedPlugins);
+
         var logger = ConfigureLogging();
 
         // Debug logging
@@ -54,9 +71,14 @@ public static class WebApplicationBuilderExtensions
             .Configure<Frontend.AspNetCore.Configuration.AppSettings>(
                 webAppBuilder.Configuration.GetSection("AppSettings")
             )
-            .Configure<CoreAppSettings>(webAppBuilder.Configuration.GetSection("AppSettings"))
-            .Configure<ReverseProxySettings>(
+            .AddOptions<CoreAppSettings>()
+            .Bind(webAppBuilder.Configuration.GetSection("AppSettings"))
+            .ValidateOnStart()
+            .Services.Configure<ReverseProxySettings>(
                 webAppBuilder.Configuration.GetSection("AppSettings:ReverseProxy")
+            )
+            .Configure<ManagementEndpointsOptions>(
+                webAppBuilder.Configuration.GetSection(ManagementEndpointsOptions.SectionName)
             )
             .Configure<ConfigurationServiceSettings>(
                 webAppBuilder.Configuration.GetSection("ConfigurationServiceSettings")
@@ -64,13 +86,15 @@ public static class WebApplicationBuilderExtensions
             .Configure<ResourceLinksOptions>(
                 webAppBuilder.Configuration.GetSection("DataManagement:ResourceLinks")
             )
+            .AddDmsDocumentCacheOptions(webAppBuilder.Configuration)
             .AddSingleton<IStartupStatusSignal, FileStartupStatusSignal>()
             .AddSingleton<IStartupProcessExit, EnvironmentStartupProcessExit>()
             .AddSingleton<StartupPhaseExecutor>()
             .AddSingleton<
                 IValidateOptions<Frontend.AspNetCore.Configuration.AppSettings>,
-                AppSettingsValidator
+                Frontend.AspNetCore.Configuration.AppSettingsValidator
             >()
+            .AddSingleton<IValidateOptions<CoreAppSettings>, CoreAppSettingsValidator>()
             .AddSingleton<
                 IValidateOptions<ConfigurationServiceSettings>,
                 ConfigurationServiceSettingsValidator
@@ -105,64 +129,18 @@ public static class WebApplicationBuilderExtensions
 
         Serilog.ILogger ConfigureLogging()
         {
-            var configureLogging = new LoggerConfiguration()
-                .ReadFrom.Configuration(webAppBuilder.Configuration)
-                .Enrich.FromLogContext()
-                .CreateLogger();
+            var configureLogging = LoggingConfigurator.ConfigureLogging(webAppBuilder.Configuration);
             webAppBuilder.Logging.ClearProviders();
-            webAppBuilder.Logging.AddSerilog(configureLogging);
+            // dispose: true so host shutdown disposes the logger and flushes the OTLP sink's
+            // pending batch; without it, buffered events are dropped on exit.
+            webAppBuilder.Logging.AddSerilog(configureLogging, dispose: true);
 
             return configureLogging;
         }
 
-        ConfigurationManager config = webAppBuilder.Configuration;
-
-        // MemoryCache backs claim-set caching; HybridCache backs token, application-context, and profile caches.
+        // MemoryCache backs claim-set caching. HybridCache is registered by the shared CMS data-store provider.
         webAppBuilder.Services.AddMemoryCache();
-        webAppBuilder.Services.AddHybridCache();
-
-        // Access Configuration service
-        var configServiceSettings = config
-            .GetSection("ConfigurationServiceSettings")
-            .Get<ConfigurationServiceSettings>();
-        if (configServiceSettings == null)
-        {
-            logger.Error("Error reading ConfigurationServiceSettings");
-            throw new InvalidOperationException(
-                "Unable to read ConfigurationServiceSettings from appsettings"
-            );
-        }
-
-        webAppBuilder.Services.AddTransient<ConfigurationServiceResponseHandler>();
-        webAppBuilder
-            .Services.AddHttpClient<ConfigurationServiceApiClient>(
-                (serviceProvider, client) =>
-                {
-                    client.BaseAddress = new Uri($"{configServiceSettings.BaseUrl.Trim('/')}/");
-                    client.DefaultRequestHeaders.Add("Accept", "application/json");
-                    client.DefaultRequestHeaders.Add("Accept", "application/x-www-form-urlencoded");
-                }
-            )
-            .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler())
-            .AddHttpMessageHandler<ConfigurationServiceResponseHandler>();
-
-        webAppBuilder.Services.AddSingleton(
-            new ConfigurationServiceContext(
-                configServiceSettings.ClientId,
-                configServiceSettings.ClientSecret,
-                configServiceSettings.Scope
-            )
-        );
-
-        // Bind CacheSettings from configuration
-        var cacheSettings = new CacheSettings();
-        webAppBuilder.Configuration.GetSection("CacheSettings").Bind(cacheSettings);
-        webAppBuilder.Services.AddSingleton(cacheSettings);
-
-        webAppBuilder.Services.AddTransient<
-            IConfigurationServiceTokenHandler,
-            ConfigurationServiceTokenHandler
-        >();
+        webAppBuilder.Services.AddDmsConfigurationServiceDataStoreProvider(webAppBuilder.Configuration);
 
         // Register ConfigurationServiceClaimSetProvider as its interface
         webAppBuilder.Services.AddSingleton<
@@ -176,15 +154,24 @@ public static class WebApplicationBuilderExtensions
             serviceProvider.GetRequiredService<CachedClaimSetProvider>()
         );
 
-        // Register data store services
-        webAppBuilder.Services.AddSingleton<IConnectionStringDecryptionService>(
-            new ConnectionStringDecryptionService(configServiceSettings.EncryptionKey)
+        webAppBuilder.Services.Replace(
+            ServiceDescriptor.Singleton<IDataStoreProvider, DocumentCacheRefreshNotifyingDataStoreProvider>()
         );
-        webAppBuilder.Services.AddSingleton<IDataStoreProvider, ConfigurationServiceDataStoreProvider>();
-        webAppBuilder.Services.AddSingleton<IConnectionStringProvider, DmsConnectionStringProvider>();
+        webAppBuilder.Services.AddDmsDocumentCacheTargetRegistry(webAppBuilder.Configuration);
+        webAppBuilder.Services.AddDocumentCacheProjectionSupervisor(registerHostedService: true);
 
         // Add JWT authentication services from Core
         webAppBuilder.Services.AddJwtAuthentication(webAppBuilder.Configuration);
+
+        // Register the startup guard that audits ICustomResourceValidator registrations
+        webAppBuilder.Services.AddCustomValidationGuard();
+
+        // Last, and unconditionally. Plugin hooks contribute to a collection this method has finished
+        // populating, and the audit input has to be registered after them for the host's to be the
+        // last registration of that type. With no plugin loaded the contribution phase is a no-op and
+        // the checks run and find nothing, which is what keeps a plugin-free deployment on the same
+        // path as any other.
+        webAppBuilder.Services.AddPluginServiceContributions(webAppBuilder.Configuration, loadedPlugins);
     }
 
     private static void ConfigureDatastore(WebApplicationBuilder webAppBuilder, Serilog.ILogger logger)
@@ -200,39 +187,21 @@ public static class WebApplicationBuilderExtensions
             logger.Information(
                 "Injecting PostgreSQL as the primary backend datastore with per-request connection strings"
             );
-            webAppBuilder.Services.AddPostgresqlDatastore(webAppBuilder.Configuration);
             logger.Information("Injecting PostgreSQL relational write runtime services");
-            webAppBuilder.Services.AddPostgresqlReferenceResolver();
-            webAppBuilder.Services.AddPostgresqlRelationalTokenInfoEducationOrganizationLookup();
-            webAppBuilder.Services.AddSingleton<
-                IDatabaseFingerprintReader,
-                Backend.Postgresql.PostgresqlDatabaseFingerprintReader
-            >();
-            webAppBuilder.Services.AddSingleton<
-                IResourceKeyRowReader,
-                Backend.Postgresql.PostgresqlResourceKeyRowReader
-            >();
+            webAppBuilder.Services.AddPostgresqlDocumentCacheRuntimeServices(webAppBuilder.Configuration);
         }
         else
         {
             logger.Information("Injecting MSSQL as the primary backend datastore");
 
             logger.Information("Injecting MSSQL relational write runtime services");
-            AddMssqlRelationalRuntimeServices(webAppBuilder.Services, webAppBuilder.Configuration);
-            webAppBuilder.Services.AddMssqlRelationalTokenInfoEducationOrganizationLookup();
-            webAppBuilder.Services.AddSingleton<
-                IDatabaseFingerprintReader,
-                Backend.Mssql.MssqlDatabaseFingerprintReader
-            >();
-            webAppBuilder.Services.AddSingleton<
-                IResourceKeyRowReader,
-                Backend.Mssql.MssqlResourceKeyRowReader
-            >();
+            webAppBuilder.Services.AddMssqlDocumentCacheRuntimeServices(webAppBuilder.Configuration);
         }
 
         logger.Information("Injecting relational document store repository surface");
         webAppBuilder.Services.AddScoped<IDocumentStoreRepository, RelationalDocumentStoreRepository>();
         webAppBuilder.Services.AddScoped<IQueryHandler, RelationalDocumentStoreRepository>();
+        webAppBuilder.Services.AddScoped<IPartitionQueryHandler, RelationalDocumentStoreRepository>();
         webAppBuilder.Services.Replace(
             ServiceDescriptor.Singleton<IBackendMappingInitializer, RelationalBackendMappingInitializer>()
         );
@@ -249,6 +218,7 @@ public static class WebApplicationBuilderExtensions
         webAppBuilder.Services.AddRateLimiter(limiterOptions =>
         {
             limiterOptions.RejectionStatusCode = (int)HttpStatusCode.TooManyRequests;
+            limiterOptions.OnRejected = WriteRateLimitRejectionAsync;
             limiterOptions.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
                 RateLimitPartition.GetFixedWindowLimiter(
                     partitionKey: httpContext.Request.Headers.Host.ToString(),
@@ -263,13 +233,41 @@ public static class WebApplicationBuilderExtensions
         });
     }
 
-    private static void AddMssqlRelationalRuntimeServices(
-        IServiceCollection services,
-        IConfiguration configuration
+    /// <summary>
+    /// Serves the rejection produced by the rate limiter middleware, which applies
+    /// RejectionStatusCode before invoking this callback. Rejected requests never reach the DMS
+    /// core pipeline, so the Retry-After header and the problem-details body are written at this
+    /// boundary. The Retry-After value is the limiter's recommended retry delay rounded up to
+    /// whole seconds so a client never retries sooner than recommended, and the body stays
+    /// constant whether or not the limiter supplies retry-after metadata.
+    /// </summary>
+    internal static async ValueTask WriteRateLimitRejectionAsync(
+        OnRejectedContext context,
+        CancellationToken cancellationToken
     )
     {
-        services.AddRelationalMappingSetServices(configuration, SqlDialect.Mssql, new MssqlDialectRules());
-        services.AddMssqlReferenceResolver();
+        HttpContext httpContext = context.HttpContext;
+
+        if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out TimeSpan retryAfter))
+        {
+            httpContext.Response.Headers.RetryAfter = ((int)Math.Ceiling(retryAfter.TotalSeconds)).ToString(
+                CultureInfo.InvariantCulture
+            );
+        }
+
+        var appSettings = httpContext.RequestServices.GetRequiredService<
+            IOptions<Frontend.AspNetCore.Configuration.AppSettings>
+        >();
+        var traceId = AspNetCoreFrontend.ExtractTraceIdFrom(httpContext.Request, appSettings);
+
+        httpContext.Response.ContentType = "application/problem+json; charset=utf-8";
+        await httpContext.Response.WriteAsync(
+            JsonSerializer.Serialize(
+                FailureResponse.ForTooManyRequests(traceId),
+                AspNetCoreFrontend.SharedSerializerOptions
+            ),
+            cancellationToken
+        );
     }
 }
 

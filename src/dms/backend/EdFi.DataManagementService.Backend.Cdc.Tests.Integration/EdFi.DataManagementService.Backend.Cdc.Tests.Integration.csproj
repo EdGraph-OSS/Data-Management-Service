@@ -1,0 +1,85 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <IsPackable>false</IsPackable>
+        <IsTestProject>true</IsTestProject>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    </PropertyGroup>
+    <ItemGroup>
+        <PackageReference Include="FluentAssertions" />
+        <PackageReference Include="FakeItEasy" />
+        <PackageReference Include="Microsoft.Data.SqlClient" />
+        <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+        <PackageReference Include="Microsoft.NET.Test.Sdk" />
+        <PackageReference Include="Npgsql" />
+        <PackageReference Include="coverlet.collector">
+            <PrivateAssets>all</PrivateAssets>
+            <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+        </PackageReference>
+        <PackageReference Include="NUnit" />
+        <PackageReference Include="NUnit.Analyzers" />
+        <PackageReference Include="NUnit3TestAdapter" />
+    </ItemGroup>
+    <ItemGroup>
+        <Using Include="NUnit.Framework" />
+    </ItemGroup>
+    <ItemGroup>
+        <ProjectReference Include="..\EdFi.DataManagementService.Backend.Cdc\EdFi.DataManagementService.Backend.Cdc.csproj" />
+        <ProjectReference Include="..\EdFi.DataManagementService.Backend\EdFi.DataManagementService.Backend.csproj" />
+        <ProjectReference Include="..\EdFi.DataManagementService.Backend.Mssql\EdFi.DataManagementService.Backend.Mssql.csproj" />
+        <ProjectReference Include="..\EdFi.DataManagementService.Backend.Postgresql\EdFi.DataManagementService.Backend.Postgresql.csproj" />
+        <ProjectReference Include="..\EdFi.DataManagementService.Backend.Tests.Common\EdFi.DataManagementService.Backend.Tests.Common.csproj" />
+        <ProjectReference Include="..\EdFi.DataManagementService.Backend.Tests.Integration.Common\EdFi.DataManagementService.Backend.Tests.Integration.Common.csproj" />
+        <ProjectReference Include="..\..\clis\EdFi.DataManagementService.DocumentCacheAdmin\EdFi.DataManagementService.DocumentCacheAdmin.csproj" />
+    </ItemGroup>
+    <ItemGroup>
+        <Compile Include="..\..\clis\EdFi.DataManagementService.DocumentCacheAdmin.Tests.Integration\DocumentCacheAdminCliIntegrationHarness.cs" Link="DocumentCacheAdminCliIntegrationHarness.cs" />
+    </ItemGroup>
+    <ItemGroup>
+        <Compile
+            Include="..\EdFi.DataManagementService.Backend.Cdc.Tests.Unit\CdcDeploymentRequestTestData.cs"
+            Link="Shared\CdcDeploymentRequestTestData.cs"
+        />
+        <Compile
+            Include="..\EdFi.DataManagementService.Backend.Cdc.Tests.Unit\CdcConnectorTemplateTestData.cs"
+            Link="Shared\CdcConnectorTemplateTestData.cs"
+        />
+    </ItemGroup>
+    <!-- The governed cleanup qualification invokes the production CLI through the wrapper's native tool boundary. -->
+    <ItemGroup>
+        <ProjectReference Include="../../clis/EdFi.DataManagementService.SchemaTools/EdFi.DataManagementService.SchemaTools.csproj" ReferenceOutputAssembly="false" />
+    </ItemGroup>
+    <!-- Compile the production provisioning owners into this test assembly; no CLI executable dependency. -->
+    <ItemGroup>
+        <Compile
+            Include="../../clis/EdFi.DataManagementService.SchemaTools/Provisioning/IDatabaseProvisioner.cs"
+            Link="Shared/IDatabaseProvisioner.cs"
+        />
+        <Compile
+            Include="../../clis/EdFi.DataManagementService.SchemaTools/Provisioning/DatabaseProvisionerBase.cs"
+            Link="Shared/DatabaseProvisionerBase.cs"
+        />
+        <Compile
+            Include="../../clis/EdFi.DataManagementService.SchemaTools/Provisioning/MssqlDatabaseProvisioner.cs"
+            Link="Shared/MssqlDatabaseProvisioner.cs"
+        />
+        <Compile
+            Include="../../clis/EdFi.DataManagementService.SchemaTools/Provisioning/ManagedDatabaseProvisioner.cs"
+            Link="Shared/ManagedDatabaseProvisioner.cs"
+        />
+        <Compile
+            Include="../../clis/EdFi.DataManagementService.SchemaTools/Provisioning/SeedValidator.cs"
+            Link="Shared/SeedValidator.cs"
+        />
+    </ItemGroup>
+    <ItemGroup>
+        <None Include="../Fixtures/document-cache/materialized-documents/descriptor-school-type/expected-cache-row.json" Link="Fixtures/record-size-cache-row.json" CopyToOutputDirectory="PreserveNewest" />
+        <None
+            Include="../../clis/EdFi.DataManagementService.SchemaTools.Tests.Integration/Fixtures/minimal-api-schema.json"
+            Link="Fixtures/minimal-api-schema.json"
+            CopyToOutputDirectory="PreserveNewest"
+        />
+    </ItemGroup>
+</Project>

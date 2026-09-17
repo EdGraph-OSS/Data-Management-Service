@@ -9,9 +9,10 @@ using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Backend.External.Plans;
 using EdFi.DataManagementService.Backend.Plans;
 using EdFi.DataManagementService.Core.Configuration;
-using Microsoft.Data.SqlClient;
+using EdFi.DataManagementService.Core.DocumentCache.Cdc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 
 namespace EdFi.DataManagementService.Backend.Mssql;
 
@@ -21,23 +22,96 @@ public static class MssqlReferenceResolverServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
 
+        // Registered here as well as in AddMssqlDatastore because this method is also used on its own.
+        // The seams below take the boundary by constructor injection, so it has to be present wherever
+        // they are registered, or they would resolve nothing and the single acquisition identity would
+        // not be single at all.
+        services.AddMssqlConnectionAcquisition();
+
         services.TryAdd(
-            ServiceDescriptor.Scoped<
+            ServiceDescriptor.Singleton<
                 IRelationalWriteExceptionClassifier,
                 MssqlRelationalWriteExceptionClassifier
             >()
         );
         services.TryAdd(
+            ServiceDescriptor.Singleton<
+                IDocumentCacheProviderCommandTimeoutClassifier,
+                MssqlDocumentCacheProviderCommandTimeoutClassifier
+            >()
+        );
+        services.TryAdd(
             ServiceDescriptor.Scoped<IRelationalParameterConfigurator, MssqlRelationalParameterConfigurator>()
         );
-
-        return services.AddReferenceResolver<
+        services.TryAdd(
+            ServiceDescriptor.Scoped<
+                IDocumentCacheMaterializationDataStore,
+                MssqlDocumentCacheMaterializationDataStore
+            >()
+        );
+        services.TryAdd(ServiceDescriptor.Scoped<MssqlDocumentCacheWriter, MssqlDocumentCacheWriter>());
+        services.TryAdd(
+            ServiceDescriptor.Scoped<IDocumentCacheWriter>(serviceProvider =>
+                serviceProvider.GetRequiredService<MssqlDocumentCacheWriter>()
+            )
+        );
+        services.TryAdd(
+            ServiceDescriptor.Scoped<IDocumentCacheSessionBoundWriter>(serviceProvider =>
+                serviceProvider.GetRequiredService<MssqlDocumentCacheWriter>()
+            )
+        );
+        services.TryAdd(
+            ServiceDescriptor.Singleton<IDocumentProjectionWorkPager, MssqlDocumentProjectionWorkPager>()
+        );
+        services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<
+                IDocumentCacheStatusCurrentSourceObserver,
+                MssqlDocumentCacheStatusCurrentSourceObserver
+            >()
+        );
+        services.TryAdd(
+            ServiceDescriptor.Singleton<
+                IDocumentCacheAdministrativeMutex,
+                MssqlDocumentCacheAdministrativeMutex
+            >()
+        );
+        services.TryAdd(
+            ServiceDescriptor.Singleton<IDocumentCacheAdministrativePrimitives>(serviceProvider =>
+                DocumentCacheAdministrativePrimitives.ForSqlServer(
+                    serviceProvider.GetRequiredService<IDocumentCacheProviderCommandTimeoutClassifier>()
+                )
+            )
+        );
+        services.AddReferenceResolver<
             MssqlReferenceResolverAdapterFactory,
             MssqlRelationalCommandExecutor,
             MssqlRelationalWriteSessionFactory,
             MssqlDocumentHydrator,
             MssqlSessionDocumentHydrator
         >();
+        services.Replace(
+            ServiceDescriptor.Scoped<IDocumentCacheReadLookupAdapter, MssqlDocumentCacheReadLookupAdapter>()
+        );
+        services.AddDocumentCacheReadAccelerationCoordinator();
+        return services;
+    }
+
+    public static IServiceCollection AddMssqlDmsCdcControlPlane(this IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
+        services.AddDmsCdcControlPlane();
+        services.TryAdd(
+            ServiceDescriptor.Singleton<
+                IDocumentCacheProviderCommandTimeoutClassifier,
+                MssqlDocumentCacheProviderCommandTimeoutClassifier
+            >()
+        );
+        services.TryAdd(
+            ServiceDescriptor.Singleton<ICdcProviderSourcePositionAdapter, MssqlCdcSourcePositionAdapter>()
+        );
+
+        return services;
     }
 
     public static IServiceCollection AddMssqlRelationalTokenInfoEducationOrganizationLookup(
@@ -68,46 +142,43 @@ internal sealed class MssqlReferenceResolverAdapterFactory(IRelationalCommandExe
         return new MssqlReferenceResolverAdapter(_commandExecutor);
     }
 
-    public IReferenceResolverAdapter CreateSessionAdapter(DbConnection connection, DbTransaction transaction)
+    public IReferenceResolverAdapter CreateSessionAdapter(IRelationalCommandExecutor commandExecutor)
     {
-        return new MssqlReferenceResolverAdapter(
-            new SessionRelationalCommandExecutor(connection, transaction)
-        );
+        ArgumentNullException.ThrowIfNull(commandExecutor);
+
+        return new MssqlReferenceResolverAdapter(commandExecutor);
+    }
+
+    public RelationalCommand? TryBuildSessionLookupCommand(ReferenceLookupRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        // The bulk strategy binds a table-valued parameter, which cannot be renamed into a composite
+        // command's allocator-owned parameter set; those requests fall back to the standalone adapter.
+        return MssqlReferenceLookupSmallListStrategy.CanResolve(request.ReferentialIds)
+            ? MssqlReferenceLookupSmallListStrategy.BuildCommand(request)
+            : null;
     }
 }
 
 internal sealed class MssqlDocumentHydrator : IDocumentHydrator
 {
-    private readonly Func<CancellationToken, Task<DbConnection>> _openConnectionAsync;
+    private readonly Func<CancellationToken, Task<MssqlLeasedConnection>> _openConnectionAsync;
 
-    public MssqlDocumentHydrator(IDataStoreSelection dataStoreSelection)
-        : this(dataStoreSelection, connectionString => new SqlConnection(connectionString)) { }
-
-    internal MssqlDocumentHydrator(
+    public MssqlDocumentHydrator(
         IDataStoreSelection dataStoreSelection,
-        Func<string, DbConnection> createConnection
+        IMssqlConnectionAcquisition acquisition,
+        ILogger<MssqlDocumentHydrator> logger
     )
     {
         ArgumentNullException.ThrowIfNull(dataStoreSelection);
-        ArgumentNullException.ThrowIfNull(createConnection);
+        ArgumentNullException.ThrowIfNull(acquisition);
+        ArgumentNullException.ThrowIfNull(logger);
 
-        _openConnectionAsync = async cancellationToken =>
-        {
-            var selectedInstance = dataStoreSelection.GetSelectedDataStore();
-            var connectionString = selectedInstance.ConnectionString;
-
-            if (string.IsNullOrWhiteSpace(connectionString))
-            {
-                throw new InvalidOperationException(
-                    $"Selected data store '{selectedInstance.Id}' does not have a valid connection string."
-                );
-            }
-
-            var connection = createConnection(connectionString);
-            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-
-            return connection;
-        };
+        // Hydration can be the first acquisition of a request whose earlier reads were all served from
+        // cached verdicts, so this seam carries the same guard as the command executor's.
+        _openConnectionAsync = cancellationToken =>
+            MssqlSeamConnection.OpenAsync(dataStoreSelection, acquisition, logger, cancellationToken);
     }
 
     public async Task<HydratedPage> HydrateAsync(
@@ -117,7 +188,8 @@ internal sealed class MssqlDocumentHydrator : IDocumentHydrator
         CancellationToken ct
     )
     {
-        await using var connection = await _openConnectionAsync(ct).ConfigureAwait(false);
+        await using var leased = await _openConnectionAsync(ct).ConfigureAwait(false);
+        DbConnection connection = leased.Connection;
 
         return await HydrationExecutor.ExecuteAsync(
             connection,
@@ -134,20 +206,22 @@ internal sealed class MssqlDocumentHydrator : IDocumentHydrator
 internal sealed class MssqlSessionDocumentHydrator : ISessionDocumentHydrator
 {
     public Task<HydratedPage> HydrateAsync(
-        DbConnection connection,
-        DbTransaction transaction,
+        IRelationalWriteSession writeSession,
         ResourceReadPlan plan,
         PageKeysetSpec keyset,
         HydrationExecutionOptions executionOptions,
         CancellationToken cancellationToken = default
-    ) =>
-        HydrationExecutor.ExecuteAsync(
-            connection,
+    )
+    {
+        ArgumentNullException.ThrowIfNull(writeSession);
+
+        return HydrationExecutor.ExecuteAsync(
+            batchSql => writeSession.CreateCommand(new RelationalCommand(batchSql)),
             plan,
             keyset,
             SqlDialect.Mssql,
-            transaction,
             executionOptions,
             cancellationToken
         );
+    }
 }

@@ -3,6 +3,7 @@
 // The Ed-Fi Alliance licenses this file to you under the Apache License, Version 2.0.
 // See the LICENSE and NOTICES files in the project root for more information.
 
+using System.Data;
 using System.Diagnostics;
 using System.Globalization;
 using System.Reflection;
@@ -37,9 +38,12 @@ internal sealed record MssqlProvisioningTimingContext(
 public sealed partial class MssqlGeneratedDdlTestDatabase : IAsyncDisposable
 {
     private const int DefaultCommandTimeoutSeconds = 300;
+    private const int UtcClockAdvanceMaxPollAttempts = 500;
     private const string ProvisionMaxConcurrencyVariable = "MSSQL_GENERATED_DDL_PROVISION_MAX_CONCURRENCY";
     private static readonly (string Schema, string Table)[] _generatedDdlBaselineTables =
     [
+        ("dms", "DataStoreIdentity"),
+        ("dms", "DocumentCacheState"),
         ("dms", "EffectiveSchema"),
         ("dms", "ResourceKey"),
         ("dms", "SchemaComponent"),
@@ -50,6 +54,7 @@ public sealed partial class MssqlGeneratedDdlTestDatabase : IAsyncDisposable
     private static readonly Lazy<SemaphoreSlim?> _generatedDdlProvisionSemaphore = new(
         CreateGeneratedDdlProvisionSemaphore
     );
+    private int _ownsDatabase = 1;
 
     private MssqlGeneratedDdlTestDatabase(
         string databaseName,
@@ -79,6 +84,11 @@ public sealed partial class MssqlGeneratedDdlTestDatabase : IAsyncDisposable
     private string LeaseStrategy { get; }
 
     internal MssqlDatabaseResetPlan ResetPlan { get; private set; }
+
+    internal void RelinquishDatabaseOwnership()
+    {
+        Interlocked.Exchange(ref _ownsDatabase, 0);
+    }
 
     public static Task<MssqlGeneratedDdlTestDatabase> CreateEmptyAsync(
         string fixtureSignature = "",
@@ -128,7 +138,7 @@ public sealed partial class MssqlGeneratedDdlTestDatabase : IAsyncDisposable
         );
     }
 
-    private static Task<MssqlGeneratedDdlTestDatabase> CreateEmptyAsync(
+    private static async Task<MssqlGeneratedDdlTestDatabase> CreateEmptyAsync(
         MssqlProvisioningTimingContext context
     )
     {
@@ -148,30 +158,37 @@ public sealed partial class MssqlGeneratedDdlTestDatabase : IAsyncDisposable
             databaseName = MssqlTestDatabaseHelper.GenerateUniqueDatabaseName();
             var connectionString = MssqlTestDatabaseHelper.BuildConnectionString(databaseName);
 
-            MssqlTestDatabaseHelper.CreateGeneratedDdlDatabase(
+            await MssqlTestDatabaseHelper.CreateGeneratedDdlDatabaseAsync(
                 databaseName,
                 useExplicitFileSizing: IsDirectLeaseStrategy(context.LeaseStrategy)
             );
 
-            return Task.FromResult(
-                new MssqlGeneratedDdlTestDatabase(
-                    databaseName,
-                    connectionString,
-                    context.FixtureSignature,
-                    context.GeneratedDdlHash,
-                    context.LeaseStrategy
-                )
+            return new MssqlGeneratedDdlTestDatabase(
+                databaseName,
+                connectionString,
+                context.FixtureSignature,
+                context.GeneratedDdlHash,
+                context.LeaseStrategy
             );
         }
-        catch
+        catch (Exception primaryException)
         {
             outcome = "Failed";
+            List<Exception> cleanupExceptions = [];
             if (!string.IsNullOrWhiteSpace(databaseName))
             {
-                MssqlTestDatabaseHelper.DropDatabaseIfExists(databaseName);
+                try
+                {
+                    await MssqlTestDatabaseHelper.DropDatabaseUnderLifecycleGateAsync(databaseName);
+                }
+                catch (Exception cleanupException)
+                {
+                    cleanupExceptions.Add(cleanupException);
+                }
             }
 
-            throw;
+            MssqlLifecycleExceptionAggregator.Throw(primaryException, cleanupExceptions);
+            throw new UnreachableException();
         }
         finally
         {
@@ -242,15 +259,24 @@ public sealed partial class MssqlGeneratedDdlTestDatabase : IAsyncDisposable
             await database.ApplyGeneratedDdlAsync(generatedDdl, commandTimeoutSeconds, context);
             return database;
         }
-        catch
+        catch (Exception primaryException)
         {
             outcome = "Failed";
+            List<Exception> cleanupExceptions = [];
             if (database is not null)
             {
-                await database.DisposeAsync();
+                try
+                {
+                    await database.DisposeAsync();
+                }
+                catch (Exception cleanupException)
+                {
+                    cleanupExceptions.Add(cleanupException);
+                }
             }
 
-            throw;
+            MssqlLifecycleExceptionAggregator.Throw(primaryException, cleanupExceptions);
+            throw new UnreachableException();
         }
         finally
         {
@@ -336,10 +362,19 @@ public sealed partial class MssqlGeneratedDdlTestDatabase : IAsyncDisposable
 
                 await transaction.CommitAsync();
             }
-            catch
+            catch (Exception primaryException)
             {
-                await transaction.RollbackAsync();
-                throw;
+                List<Exception> cleanupExceptions = [];
+                try
+                {
+                    await transaction.RollbackAsync();
+                }
+                catch (Exception cleanupException)
+                {
+                    cleanupExceptions.Add(cleanupException);
+                }
+
+                MssqlLifecycleExceptionAggregator.Throw(primaryException, cleanupExceptions);
             }
 
             await RefreshResetPlanAsync(commandTimeoutSeconds);
@@ -593,6 +628,40 @@ public sealed partial class MssqlGeneratedDdlTestDatabase : IAsyncDisposable
         return await command.ExecuteNonQueryAsync();
     }
 
+    public async Task WaitForUtcClockToAdvanceAsync()
+    {
+        var timestamp = await ExecuteScalarAsync<DateTime>("SELECT SYSUTCDATETIME();");
+        await WaitForUtcClockToAdvancePastAsync(
+            new DateTimeOffset(DateTime.SpecifyKind(timestamp, DateTimeKind.Utc))
+        );
+    }
+
+    public async Task WaitForUtcClockToAdvancePastAsync(DateTimeOffset timestamp)
+    {
+        SqlParameter timestampParameter = new("@timestamp", SqlDbType.DateTime2)
+        {
+            Scale = 7,
+            Value = timestamp.UtcDateTime,
+        };
+
+        await ExecuteNonQueryAsync(
+            """
+            DECLARE @attempt int = 0;
+
+            WHILE SYSUTCDATETIME() <= @timestamp AND @attempt < @maxAttempts
+            BEGIN
+                WAITFOR DELAY '00:00:00.010';
+                SET @attempt += 1;
+            END;
+
+            IF SYSUTCDATETIME() <= @timestamp
+                THROW 51000, 'SQL Server UTC clock did not advance past the required timestamp.', 1;
+            """,
+            timestampParameter,
+            new SqlParameter("@maxAttempts", UtcClockAdvanceMaxPollAttempts)
+        );
+    }
+
     public async Task<T> ExecuteScalarAsync<T>(string sql, params SqlParameter[] parameters)
     {
         var result = await ExecuteScalarOrDefaultAsync<T>(sql, parameters);
@@ -629,14 +698,19 @@ public sealed partial class MssqlGeneratedDdlTestDatabase : IAsyncDisposable
         return (T?)Convert.ChangeType(result, typeof(T), CultureInfo.InvariantCulture);
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
+        if (Volatile.Read(ref _ownsDatabase) == 0)
+        {
+            return;
+        }
+
         var stopwatch = Stopwatch.StartNew();
         var outcome = "Succeeded";
 
         try
         {
-            MssqlTestDatabaseHelper.DropDatabaseIfExists(DatabaseName);
+            await MssqlTestDatabaseHelper.DropDatabaseUnderLifecycleGateAsync(DatabaseName);
         }
         catch
         {
@@ -660,8 +734,6 @@ public sealed partial class MssqlGeneratedDdlTestDatabase : IAsyncDisposable
                 0
             );
         }
-
-        return ValueTask.CompletedTask;
     }
 
     private static IEnumerable<string> SplitOnGoBatchSeparator(string sql) =>

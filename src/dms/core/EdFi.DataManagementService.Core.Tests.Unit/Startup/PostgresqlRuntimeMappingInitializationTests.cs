@@ -168,6 +168,7 @@ public class PostgresqlRuntimeMappingInitializationTests
         );
         services.AddSingleton<EffectiveSchemaSetBuilder>();
         services.AddSingleton<IEffectiveSchemaSetProvider, EffectiveSchemaSetProvider>();
+        services.AddSingleton<IEffectiveSchemaBootstrapper, EffectiveSchemaBootstrapper>();
         services.AddSingleton<DmsStartupOrchestrator>();
         services.AddSingleton<IDmsStartupTask, LoadAndBuildEffectiveSchemaTask>();
         services.AddSingleton<IDmsStartupTask, BackendMappingInitializationTask>();
@@ -1059,6 +1060,10 @@ public class PostgresqlRuntimeMappingInitializationTests
                 .NotContain(descriptor => descriptor.ServiceType == typeof(IDocumentStoreRepository));
 
             _services.Should().NotContain(descriptor => descriptor.ServiceType == typeof(IQueryHandler));
+
+            _services
+                .Should()
+                .NotContain(descriptor => descriptor.ServiceType == typeof(IPartitionQueryHandler));
         }
     }
 }

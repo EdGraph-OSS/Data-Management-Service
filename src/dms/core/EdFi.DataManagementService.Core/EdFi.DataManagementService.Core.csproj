@@ -39,14 +39,18 @@
     <ItemGroup>
         <ProjectReference Include="..\..\backend\EdFi.DataManagementService.Backend.External\EdFi.DataManagementService.Backend.External.csproj" />
         <ProjectReference Include="..\EdFi.DataManagementService.Core.External\EdFi.DataManagementService.Core.External.csproj" />
+        <ProjectReference Include="..\EdFi.DataManagementService.CustomValidation\EdFi.DataManagementService.CustomValidation.csproj" />
     </ItemGroup>
     <ItemGroup>
         <InternalsVisibleTo Include="EdFi.DataManagementService.Core.Tests.Unit" />
+        <InternalsVisibleTo Include="EdFi.DataManagementService.Backend.Cdc" />
         <InternalsVisibleTo Include="EdFi.DataManagementService.Frontend.AspNetCore.Tests.Unit" />
         <InternalsVisibleTo Include="EdFi.DataManagementService.Backend.Postgresql.Tests.Integration" />
         <InternalsVisibleTo Include="EdFi.DataManagementService.Backend.Mssql.Tests.Integration" />
         <InternalsVisibleTo Include="EdFi.DataManagementService.Backend.Tests.Common" />
         <InternalsVisibleTo Include="EdFi.DataManagementService.Tests.Integration" />
+        <InternalsVisibleTo Include="EdFi.DataManagementService.Performance.Harness" />
+        <InternalsVisibleTo Include="EdFi.DataManagementService.DocumentCacheAdmin.Tests.Unit" />
         <!-- For FakeItEasy unit test proxies-->
         <InternalsVisibleTo Include="DynamicProxyGenAssembly2" />
     </ItemGroup>

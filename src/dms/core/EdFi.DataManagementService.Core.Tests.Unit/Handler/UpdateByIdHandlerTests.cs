@@ -9,6 +9,7 @@ using EdFi.DataManagementService.Core.ApiSchema;
 using EdFi.DataManagementService.Core.Backend;
 using EdFi.DataManagementService.Core.External.Backend;
 using EdFi.DataManagementService.Core.External.Model;
+using EdFi.DataManagementService.Core.External.Security;
 using EdFi.DataManagementService.Core.Handler;
 using EdFi.DataManagementService.Core.Pipeline;
 using EdFi.DataManagementService.Core.Profile;
@@ -18,6 +19,7 @@ using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
 using NUnit.Framework;
 using Polly;
+using Polly.Retry;
 using static EdFi.DataManagementService.Core.External.Backend.UpdateResult;
 using static EdFi.DataManagementService.Core.Tests.Unit.TestHelper;
 
@@ -29,13 +31,18 @@ public class UpdateByIdHandlerTests
 {
     internal static (IPipelineStep handler, IServiceProvider serviceProvider) Handler(
         IDocumentStoreRepository documentStoreRepository
+    ) => Handler(documentStoreRepository, ResiliencePipeline.Empty);
+
+    internal static (IPipelineStep handler, IServiceProvider serviceProvider) Handler(
+        IDocumentStoreRepository documentStoreRepository,
+        ResiliencePipeline resiliencePipeline
     )
     {
         var serviceProvider = A.Fake<IServiceProvider>();
         A.CallTo(() => serviceProvider.GetService(typeof(IDocumentStoreRepository)))
             .Returns(documentStoreRepository);
 
-        var handler = new UpdateByIdHandler(NullLogger.Instance, ResiliencePipeline.Empty);
+        var handler = new UpdateByIdHandler(NullLogger.Instance, resiliencePipeline);
 
         return (handler, serviceProvider);
     }
@@ -85,6 +92,71 @@ public class UpdateByIdHandlerTests
             ],
             ClaimEducationOrganizationIds: [new EducationOrganizationId(255901)]
         );
+
+    [TestFixture]
+    [Parallelizable]
+    public class Given_A_Repository_With_An_Already_Cancelled_Request_Token : UpdateByIdHandlerTests
+    {
+        internal class Repository : NotImplementedDocumentStoreRepository
+        {
+            public bool WasCalled { get; private set; }
+
+            public override Task<UpdateResult> UpdateDocumentById(IUpdateRequest updateRequest)
+            {
+                WasCalled = true;
+                return Task.FromResult<UpdateResult>(
+                    new UpdateSuccess(updateRequest.DocumentUuid, "\"test-etag\"")
+                );
+            }
+        }
+
+        private readonly RequestInfo _requestInfo = RequestInfoWithRelationalMappingSet();
+        private readonly Repository _repository = new();
+
+        [SetUp]
+        public async Task Setup()
+        {
+            using var cancellationTokenSource = new CancellationTokenSource();
+            await cancellationTokenSource.CancelAsync();
+            _requestInfo.RequestCancellationToken = cancellationTokenSource.Token;
+
+            // A resilience pipeline that actually performs retry work (rather than
+            // ResiliencePipeline.Empty) is required here: Polly only honors a resilience
+            // context's cancellation token when a real strategy is present, so this is what
+            // makes the test capable of catching a regression back to seeding the context from
+            // requestInfo.RequestCancellationToken.
+            var resiliencePipeline = new ResiliencePipelineBuilder()
+                .AddRetry(
+                    new RetryStrategyOptions
+                    {
+                        MaxRetryAttempts = 1,
+                        Delay = TimeSpan.Zero,
+                        ShouldHandle = new PredicateBuilder().HandleResult(Utility.IsRetryableResult),
+                    }
+                )
+                .Build();
+            var (updateByIdHandler, serviceProvider) = Handler(_repository, resiliencePipeline);
+            _requestInfo.ScopedServiceProvider = serviceProvider;
+
+            await updateByIdHandler.Execute(_requestInfo, NullNext);
+        }
+
+        /// <summary>
+        /// A client disconnect must not abandon a non-idempotent write that would otherwise have
+        /// been retried and applied, so the write's resilience context is seeded with
+        /// CancellationToken.None rather than the request's own cancellation token. Proven here by
+        /// an already-cancelled request token: if the resilience context were seeded from it
+        /// instead, Polly would throw OperationCanceledException before the operation ever ran.
+        /// This mirrors the identical guard on UpsertHandler; both write handlers opt out, so both
+        /// are pinned.
+        /// </summary>
+        [Test]
+        public void It_still_runs_the_write_operation_to_completion()
+        {
+            _repository.WasCalled.Should().BeTrue();
+            _requestInfo.FrontendResponse.StatusCode.Should().Be(204);
+        }
+    }
 
     [TestFixture]
     [Parallelizable]
@@ -414,6 +486,23 @@ public class UpdateByIdHandlerTests
             _requestInfo.ProfileContext = CreateWriteProfileContext(_readContentType);
             _requestInfo.BackendProfileWriteContext = CreateBackendProfileWriteContext(_writableRequestBody);
             _requestInfo.ParsedBody = JsonNode.Parse("""{"studentUniqueId":"1000","firstName":"Lincoln"}""")!;
+            _requestInfo.ClientAuthorizations = new ClientAuthorizations(
+                TokenId: "token-id",
+                ClientId: "client-id",
+                ClaimSetName: "claim-set",
+                EducationOrganizationIds: [new EducationOrganizationId(255902), new(255901)],
+                NamespacePrefixes: [new NamespacePrefix("uri://sample.org")],
+                DataStoreIds: []
+            );
+            _requestInfo.ApplicationContext = new(
+                Id: 1,
+                ApplicationId: 2,
+                ClientId: "client-id",
+                ClientUuid: Guid.Parse("44444444-4444-4444-4444-444444444444"),
+                DataStoreIds: [],
+                CreatorOwnershipTokenId: 303,
+                OwnershipTokenIds: [202, 404]
+            );
 
             var (updateByIdHandler, serviceProvider) = Handler(_repository);
             _requestInfo.ScopedServiceProvider = serviceProvider;
@@ -429,6 +518,19 @@ public class UpdateByIdHandlerTests
             _repository
                 .CapturedRequest.BackendProfileWriteContext!.Request.WritableRequestBody.Should()
                 .BeSameAs(_writableRequestBody);
+        }
+
+        [Test]
+        public void It_carries_JWT_and_ownership_authorization_inputs()
+        {
+            _repository
+                .CapturedRequest.AuthorizationContext.ClaimEducationOrganizationIds.Should()
+                .Equal(255901L, 255902L);
+            _repository
+                .CapturedRequest.AuthorizationContext.NamespacePrefixes.Should()
+                .Equal("uri://sample.org");
+            _repository.CapturedRequest.AuthorizationContext.CreatorOwnershipTokenId.Should().Be(303);
+            _repository.CapturedRequest.AuthorizationContext.OwnershipTokenIds.Should().Equal(202, 404);
         }
     }
 
@@ -800,6 +902,16 @@ public class UpdateByIdHandlerTests
             requestInfo.FrontendResponse.StatusCode.Should().Be(500);
             requestInfo.FrontendResponse.Body.Should().NotBeNull();
         }
+
+        /// <summary>
+        /// The body is problem details, so the content type has to say so; serving it as plain
+        /// application/json leaves a client content-negotiating on the wrong media type.
+        /// </summary>
+        [Test]
+        public void It_serves_the_problem_details_content_type()
+        {
+            requestInfo.FrontendResponse.ContentType.Should().Be("application/problem+json");
+        }
     }
 
     [TestFixture]
@@ -902,6 +1014,127 @@ public class UpdateByIdHandlerTests
             Repository
                 .Response.RelationshipFailure.ValueSource.Should()
                 .Be(RelationshipAuthorizationFailureValueSource.Stored);
+        }
+    }
+
+    [TestFixture]
+    [Parallelizable]
+    public class Given_A_Repository_That_Returns_Custom_View_Not_Authorized : UpdateByIdHandlerTests
+    {
+        internal static readonly CustomViewAuthorizationFailure CustomViewFailure = new(
+            CustomViewAuthorizationFailureKind.NoMatchingRow,
+            CustomViewAuthorizationFailureValueSource.Stored,
+            EmittedAuth1Index: 0,
+            StrategyName: "StudentWithCTECourseEnrollments",
+            ReadableSecurableElements: ["StudentUniqueId"],
+            Hint: "You may need a Student with CTE Course Enrollments."
+        );
+
+        internal class Repository : NotImplementedDocumentStoreRepository
+        {
+            public override Task<UpdateResult> UpdateDocumentById(IUpdateRequest updateRequest)
+            {
+                return Task.FromResult<UpdateResult>(
+                    new UpdateFailureCustomViewNotAuthorized(CustomViewFailure)
+                );
+            }
+        }
+
+        private static readonly string _customViewTraceId = "custom-view-put-403";
+        private readonly RequestInfo _customViewRequestInfo = RequestInfoWithRelationalMappingSet(
+            _customViewTraceId
+        );
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var (updateHandler, serviceProvider) = Handler(new Repository());
+            _customViewRequestInfo.ScopedServiceProvider = serviceProvider;
+
+            await updateHandler.Execute(_customViewRequestInfo, NullNext);
+        }
+
+        [Test]
+        public void It_maps_the_custom_view_denial_to_the_canonical_problem_details_403()
+        {
+            _customViewRequestInfo.FrontendResponse.StatusCode.Should().Be(403);
+            _customViewRequestInfo.FrontendResponse.ContentType.Should().Be("application/problem+json");
+
+            var expected = CustomViewAuthorizationFailureResponse.ForFailure(
+                CustomViewFailure,
+                new TraceId(_customViewTraceId)
+            );
+
+            _customViewRequestInfo.FrontendResponse.Body.Should().NotBeNull();
+            JsonNode
+                .DeepEquals(_customViewRequestInfo.FrontendResponse.Body, expected)
+                .Should()
+                .BeTrue(
+                    $"""
+                    expected: {expected}
+
+                    actual: {_customViewRequestInfo.FrontendResponse.Body}
+                    """
+                );
+        }
+    }
+
+    [TestFixture]
+    [Parallelizable]
+    public class Given_A_Repository_That_Returns_Ownership_Not_Authorized : UpdateByIdHandlerTests
+    {
+        internal static readonly OwnershipAuthorizationFailure OwnershipFailure = new(
+            OwnershipAuthorizationFailureKind.StoredOwnershipTokenUninitialized,
+            ConfiguredStrategyIndex: 3,
+            StrategyName: AuthorizationStrategyNameConstants.OwnershipBased
+        );
+
+        internal class Repository : NotImplementedDocumentStoreRepository
+        {
+            public override Task<UpdateResult> UpdateDocumentById(IUpdateRequest updateRequest)
+            {
+                return Task.FromResult<UpdateResult>(
+                    new UpdateFailureOwnershipNotAuthorized(OwnershipFailure)
+                );
+            }
+        }
+
+        private static readonly string _ownershipTraceId = "ownership-put-403";
+        private readonly RequestInfo _ownershipRequestInfo = RequestInfoWithRelationalMappingSet(
+            _ownershipTraceId
+        );
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var (updateHandler, serviceProvider) = Handler(new Repository());
+            _ownershipRequestInfo.ScopedServiceProvider = serviceProvider;
+
+            await updateHandler.Execute(_ownershipRequestInfo, NullNext);
+        }
+
+        [Test]
+        public void It_maps_the_ownership_denial_to_the_canonical_problem_details_403()
+        {
+            _ownershipRequestInfo.FrontendResponse.StatusCode.Should().Be(403);
+            _ownershipRequestInfo.FrontendResponse.ContentType.Should().Be("application/problem+json");
+
+            var expected = OwnershipAuthorizationFailureResponse.ForFailure(
+                OwnershipFailure,
+                new TraceId(_ownershipTraceId)
+            );
+
+            _ownershipRequestInfo.FrontendResponse.Body.Should().NotBeNull();
+            JsonNode
+                .DeepEquals(_ownershipRequestInfo.FrontendResponse.Body, expected)
+                .Should()
+                .BeTrue(
+                    $"""
+                    expected: {expected}
+
+                    actual: {_ownershipRequestInfo.FrontendResponse.Body}
+                    """
+                );
         }
     }
 
@@ -1133,8 +1366,13 @@ public class UpdateByIdHandlerTests
 
             var expected = $$"""
 {
-  "error": "FailureMessage",
-  "correlationId": "{{_traceId}}"
+  "detail": "An unexpected problem has occurred.",
+  "type": "urn:ed-fi:api:system",
+  "title": "System Error",
+  "status": 500,
+  "correlationId": "{{_traceId}}",
+  "validationErrors": {},
+  "errors": []
 }
 """;
 

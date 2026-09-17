@@ -17,6 +17,7 @@ using EdFi.DataManagementService.Core.Pipeline;
 using EdFi.DataManagementService.Core.Profile;
 using FakeItEasy;
 using FluentAssertions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using NUnit.Framework;
 using Polly;
@@ -81,9 +82,6 @@ public class Given_Relational_Write_Seam
                     ((RelationalWriteTargetRequest.Post)request.TargetRequest).CandidateDocumentUuid
                 )
             );
-        request
-            .TargetContext.Should()
-            .BeEquivalentTo(new RelationalWriteTargetContext.CreateNew(createdDocumentUuid));
         request.ExistingDocumentReadPlan.Should().NotBeNull();
         request
             .ReferenceResolutionRequest.RequestResource.Should()
@@ -128,11 +126,6 @@ public class Given_Relational_Write_Seam
         request
             .TargetRequest.Should()
             .BeEquivalentTo(new RelationalWriteTargetRequest.Put(existingDocumentUuid));
-        request
-            .TargetContext.Should()
-            .BeEquivalentTo(
-                new RelationalWriteTargetContext.ExistingDocument(345L, existingDocumentUuid, 44L)
-            );
         request.ExistingDocumentReadPlan.Should().NotBeNull();
         request.ReferenceResolutionRequest.DocumentReferences.Should().HaveCount(3);
         request.ReferenceResolutionRequest.DescriptorReferences.Should().ContainSingle();
@@ -161,10 +154,8 @@ public class Given_Relational_Write_Seam
         );
 
         requestInfo.FrontendResponse.StatusCode.Should().Be(500);
-        requestInfo.FrontendResponse.Body!["error"]!
-            .GetValue<string>()
-            .Should()
-            .Be(ProfilePersistPendingMessage);
+        requestInfo.FrontendResponse.Body!["type"]!.GetValue<string>().Should().Be("urn:ed-fi:api:system");
+        harness.Logger.JoinedMessages().Should().Contain(ProfilePersistPendingMessage);
         harness.WriteExecutor.Requests.Should().ContainSingle();
     }
 
@@ -220,21 +211,18 @@ public class Given_Relational_Write_Seam
         );
 
         requestInfo.FrontendResponse.StatusCode.Should().Be(500);
-        requestInfo.FrontendResponse.Body!["error"]!
-            .GetValue<string>()
-            .Should()
-            .Be(ProfilePersistPendingMessage);
+        requestInfo.FrontendResponse.Body!["type"]!.GetValue<string>().Should().Be("urn:ed-fi:api:system");
+        harness.Logger.JoinedMessages().Should().Contain(ProfilePersistPendingMessage);
         harness.WriteExecutor.Requests.Should().ContainSingle();
     }
 
     [TestCase(SqlDialect.Pgsql)]
     [TestCase(SqlDialect.Mssql)]
-    public async Task It_short_circuits_missing_put_targets_to_not_found_for_both_dialects(SqlDialect dialect)
+    public async Task It_maps_missing_put_targets_to_not_found_for_both_dialects(SqlDialect dialect)
     {
         var requestedDocumentUuid = new DocumentUuid(Guid.Parse("cccccccc-1111-2222-3333-dddddddddddd"));
         var harness = RelationalWriteSeamHarness.Create(
             resourceInfo: _fixture.ResourceInfo,
-            targetLookupResultFactory: _ => new RelationalWriteTargetLookupResult.NotFound(),
             writeResultFactory: _ => new RelationalWriteExecutorResult.Update(
                 new UpdateResult.UpdateFailureNotExists()
             )
@@ -252,7 +240,7 @@ public class Given_Relational_Write_Seam
             .GetValue<string>()
             .Should()
             .Be("Resource to update was not found");
-        harness.WriteExecutor.Requests.Should().BeEmpty();
+        harness.WriteExecutor.Requests.Should().ContainSingle();
     }
 
     [TestCase(SqlDialect.Pgsql)]
@@ -463,7 +451,9 @@ public class Given_Relational_Write_Seam
 
     [TestCase(SqlDialect.Pgsql)]
     [TestCase(SqlDialect.Mssql)]
-    public async Task It_preserves_unknown_failure_payloads_for_executor_owned_failures(SqlDialect dialect)
+    public async Task It_logs_rather_than_serves_unknown_failure_payloads_for_executor_owned_failures(
+        SqlDialect dialect
+    )
     {
         var harness = RelationalWriteSeamHarness.Create(
             resourceInfo: _fixture.ResourceInfo,
@@ -492,8 +482,13 @@ public class Given_Relational_Write_Seam
 
         var expected = """
 {
-  "error": "Unexpected write-executor test fallback.",
-  "correlationId": "relational-write-seam"
+  "detail": "An unexpected problem has occurred.",
+  "type": "urn:ed-fi:api:system",
+  "title": "System Error",
+  "status": 500,
+  "correlationId": "relational-write-seam",
+  "validationErrors": {},
+  "errors": []
 }
 """;
 
@@ -507,6 +502,8 @@ expected: {expected}
 actual: {requestInfo.FrontendResponse.Body}
 """
             );
+
+        harness.Logger.JoinedMessages().Should().Contain("Unexpected write-executor test fallback.");
         harness.WriteExecutor.Requests.Should().ContainSingle();
     }
 
@@ -622,10 +619,13 @@ actual: {requestInfo.FrontendResponse.Body}
         );
 
         requestInfo.FrontendResponse.StatusCode.Should().Be(500);
-        requestInfo.FrontendResponse.Body!["error"]!
-            .GetValue<string>()
+        requestInfo.FrontendResponse.Body!["type"]!.GetValue<string>().Should().Be("urn:ed-fi:api:system");
+        // Unquoted: the guard-rail message is exception-derived, so the handler logs it through the
+        // sanitizer, whose whitelist drops the quotes the message itself puts around the name.
+        harness
+            .Logger.JoinedMessages()
             .Should()
-            .Contain("Write plan lookup failed for resource 'Ed-Fi.Student'");
+            .Contain("Write plan lookup failed for resource Ed-Fi.Student");
         harness.WriteExecutor.Requests.Should().BeEmpty();
     }
 
@@ -679,11 +679,40 @@ actual: {requestInfo.FrontendResponse.Body}
             _resourceInfo = resourceInfo;
             WriteExecutor = writeExecutor;
             _serviceProvider = new RepositoryServiceProvider(repository);
-            _upsertHandler = new UpsertHandler(NullLogger.Instance, ResiliencePipeline.Empty);
-            _updateHandler = new UpdateByIdHandler(NullLogger.Instance, ResiliencePipeline.Empty);
+            _upsertHandler = new UpsertHandler(Logger, ResiliencePipeline.Empty);
+            _updateHandler = new UpdateByIdHandler(Logger, ResiliencePipeline.Empty);
         }
 
         public CapturingWriteExecutor WriteExecutor { get; }
+
+        /// <summary>
+        /// An unknown backend failure is logged rather than served, so the diagnostic text the seam
+        /// produces is asserted here instead of in the response body.
+        /// </summary>
+        public CapturingSeamLogger Logger { get; } = new();
+
+        public sealed class CapturingSeamLogger : ILogger
+        {
+            private readonly List<string> _messages = [];
+
+            public IDisposable? BeginScope<TState>(TState state)
+                where TState : notnull => null;
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter
+            )
+            {
+                _messages.Add(formatter(state, exception));
+            }
+
+            public string JoinedMessages() => string.Join('\n', _messages);
+        }
 
         private sealed class ThrowingDescriptorWriteHandler : IDescriptorWriteHandler
         {
@@ -705,19 +734,13 @@ actual: {requestInfo.FrontendResponse.Body}
 
         public static RelationalWriteSeamHarness Create(
             ResourceInfo resourceInfo,
-            Func<RelationalWriteExecutorRequest, RelationalWriteExecutorResult> writeResultFactory,
-            Func<RelationalWriteTargetRequest, RelationalWriteTargetLookupResult>? targetLookupResultFactory =
-                null
+            Func<RelationalWriteExecutorInput, RelationalWriteExecutorResult> writeResultFactory
         )
         {
             var writeExecutor = new CapturingWriteExecutor(writeResultFactory);
-            var targetLookupService = new RecordingRelationalWriteTargetLookupService(
-                targetLookupResultFactory
-            );
             var repository = new RelationalDocumentStoreRepository(
                 NullLogger<RelationalDocumentStoreRepository>.Instance,
                 writeExecutor,
-                targetLookupService,
                 A.Fake<IRelationalDeleteEtagPreconditionChecker>(),
                 new ThrowingDescriptorWriteHandler(),
                 A.Fake<IDescriptorReadHandler>(),
@@ -733,7 +756,11 @@ actual: {requestInfo.FrontendResponse.Body}
                     new RelationalEdOrgAuthorizationElementResolutionCache()
                 ),
                 A.Fake<ISingleRecordRelationshipAuthorizationExecutor>(),
-                A.Fake<INamespaceAuthorizationExecutor>()
+                A.Fake<INamespaceAuthorizationExecutor>(),
+                A.Fake<ICustomViewAuthorizationExecutor>(),
+                A.Fake<IOwnershipAuthorizationExecutor>(),
+                A.Fake<IRelationalCommandExecutor>(),
+                A.Fake<IDocumentCacheReadAccelerationCoordinator>()
             );
 
             return new RelationalWriteSeamHarness(resourceInfo, repository, writeExecutor);
@@ -812,79 +839,27 @@ actual: {requestInfo.FrontendResponse.Body}
                 MappingSet = mappingSet,
                 BackendProfileWriteContext = backendProfileWriteContext,
                 PathComponents = new PathComponents(
-                    new ProjectEndpointName("ed-fi"),
-                    new EndpointName("students"),
-                    documentUuid
+                    ProjectEndpointName: new ProjectEndpointName("ed-fi"),
+                    EndpointName: new EndpointName("students"),
+                    Operation: new ResourcePathOperation.ById(documentUuid)
                 ),
             };
         }
     }
 
     private sealed class CapturingWriteExecutor(
-        Func<RelationalWriteExecutorRequest, RelationalWriteExecutorResult> resultFactory
+        Func<RelationalWriteExecutorInput, RelationalWriteExecutorResult> resultFactory
     ) : IRelationalWriteExecutor
     {
-        public List<RelationalWriteExecutorRequest> Requests { get; } = [];
+        public List<RelationalWriteExecutorInput> Requests { get; } = [];
 
         public Task<RelationalWriteExecutorResult> ExecuteAsync(
-            RelationalWriteExecutorRequest request,
+            RelationalWriteExecutorInput input,
             CancellationToken cancellationToken = default
         )
         {
-            Requests.Add(request);
-            return Task.FromResult(resultFactory(request));
-        }
-    }
-
-    private sealed class RecordingRelationalWriteTargetLookupService(
-        Func<RelationalWriteTargetRequest, RelationalWriteTargetLookupResult>? resultFactory
-    ) : IRelationalWriteTargetLookupService
-    {
-        public Task<RelationalWriteTargetLookupResult> ResolveForPostAsync(
-            MappingSet mappingSet,
-            QualifiedResourceName resource,
-            ReferentialId referentialId,
-            DocumentUuid candidateDocumentUuid,
-            CancellationToken cancellationToken = default
-        )
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            return Task.FromResult(
-                (resultFactory ?? DefaultResultFactory)(
-                    new RelationalWriteTargetRequest.Post(referentialId, candidateDocumentUuid)
-                )
-            );
-        }
-
-        public Task<RelationalWriteTargetLookupResult> ResolveForPutAsync(
-            MappingSet mappingSet,
-            QualifiedResourceName resource,
-            DocumentUuid documentUuid,
-            CancellationToken cancellationToken = default
-        )
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            return Task.FromResult(
-                (resultFactory ?? DefaultResultFactory)(new RelationalWriteTargetRequest.Put(documentUuid))
-            );
-        }
-
-        private static RelationalWriteTargetLookupResult DefaultResultFactory(
-            RelationalWriteTargetRequest request
-        )
-        {
-            return request switch
-            {
-                RelationalWriteTargetRequest.Post(_, var candidateDocumentUuid) =>
-                    new RelationalWriteTargetLookupResult.CreateNew(candidateDocumentUuid),
-                RelationalWriteTargetRequest.Put(var documentUuid) =>
-                    new RelationalWriteTargetLookupResult.ExistingDocument(345L, documentUuid, 44L),
-                _ => throw new InvalidOperationException(
-                    $"Unsupported target request type '{request.GetType().Name}'."
-                ),
-            };
+            Requests.Add(input);
+            return Task.FromResult(resultFactory(input));
         }
     }
 

@@ -6,6 +6,7 @@
 using System.Text.Json.Nodes;
 using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Core.ApiSchema;
+using EdFi.DataManagementService.Core.Configuration;
 using EdFi.DataManagementService.Core.External.Backend;
 using EdFi.DataManagementService.Core.External.Frontend;
 using EdFi.DataManagementService.Core.External.Model;
@@ -20,7 +21,8 @@ namespace EdFi.DataManagementService.Core.Pipeline;
 internal class RequestInfo(
     FrontendRequest _frontendRequest,
     RequestMethod _method,
-    IServiceProvider _scopedServiceProvider
+    IServiceProvider _scopedServiceProvider,
+    CancellationToken _requestCancellationToken = default
 )
 {
     /// <summary>
@@ -40,6 +42,22 @@ internal class RequestInfo(
         get => _method;
         set => _method = value;
     }
+
+    /// <summary>
+    /// The actual HTTP method name of a request whose method is not one of the supported
+    /// verbs, e.g. "PATCH". Set only when Method is RequestMethod.UNSUPPORTED.
+    /// Read it through <see cref="MethodName"/> rather than directly.
+    /// </summary>
+    public string? UnsupportedMethodName { get; set; }
+
+    /// <summary>
+    /// The HTTP verb to attribute this request to, for the 405 error message and for request
+    /// logging. An unsupported-method request carries its real verb on UnsupportedMethodName;
+    /// using Method there would surface the literal "UNSUPPORTED", so operators searching logs
+    /// for PATCH would find nothing and the 405 body would name the wrong method. Single
+    /// accessor so the two readers cannot disagree about whether the name can be absent.
+    /// </summary>
+    public string MethodName => UnsupportedMethodName ?? Method.ToString();
 
     /// <summary>
     /// The important parts of the request URL path in object form
@@ -94,9 +112,28 @@ internal class RequestInfo(
     public PaginationParameters PaginationParameters { get; set; } = No.PaginationParameters;
 
     /// <summary>
+    /// How a live collection query pages. Set by ValidateQueryMiddleware at a single assignment site,
+    /// and only once that middleware's validation succeeds, so a request it rejects never carries a
+    /// typed paging choice. <see cref="PaginationParameters"/> gives no such guarantee: it is assigned
+    /// as soon as it parses cleanly, ahead of the later validation steps that can still reject the
+    /// request. Change Query endpoints keep reading PaginationParameters directly and never page by
+    /// cursor.
+    /// </summary>
+    public CollectionPaging CollectionPaging { get; set; } = No.CollectionPaging;
+
+    /// <summary>
     /// Query elements for GET by query
     /// </summary>
     public QueryElement[] QueryElements { get; set; } = [];
+
+    /// <summary>
+    /// The desired partition count for a partitions request: the client's validated value, or the
+    /// configured default when the request omitted it. Set by ValidatePartitionQueryMiddleware at a
+    /// single assignment site, and only once every one of that middleware's checks succeeds, so a
+    /// request it rejects never carries a count a handler could act on. Null on every other pipeline,
+    /// which have no partition count to describe.
+    /// </summary>
+    public int? RequestedPartitionCount { get; set; }
 
     /// <summary>
     /// The parsed and validated change-version window from the minChangeVersion /
@@ -104,6 +141,30 @@ internal class RequestInfo(
     /// supplied. Set by ValidateQueryMiddleware before query-field matching.
     /// </summary>
     public ChangeVersionRange ChangeVersionRange { get; set; } = ChangeVersionRange.None;
+
+    /// <summary>
+    /// The page anchor: the ordering key a page's cursor bounds, a partition's boundaries, and the
+    /// continuation token this request's response emits are all expressed in. Resolved by
+    /// ValidateQueryMiddleware or ValidatePartitionQueryMiddleware from two inputs: this request's
+    /// <see cref="ChangeVersionRange"/> and its effective data-store target. It is set alongside the
+    /// window, so a request cannot carry one without the other; the target is read from the request
+    /// scope, having been recorded by an earlier step.
+    /// <para>
+    /// The window alone does not determine it. The same min-only window resolves DocumentId against
+    /// live data, where an update can move a row later within a still-open window, and ContentVersion
+    /// against a frozen snapshot, where nothing moves. A read replica is not frozen and keeps the
+    /// live rule. Both inputs are overridden by the UseLegacyDocumentIdOrderingForChangeQueries
+    /// switch, which resolves DocumentId for every window shape on every data store.
+    /// </para>
+    /// <para>
+    /// Only the live GET-many and /partitions pipelines act on it. The Change Query pipeline composes
+    /// the same validation step and so resolves a value here too — a /deletes request carrying
+    /// maxChangeVersion resolves ContentVersion like any other — but nothing on that pipeline reads it:
+    /// a tracked-change request travels on its own contract, which carries no anchor. Every remaining
+    /// pipeline leaves the PageOrderingMode.DocumentId default in place.
+    /// </para>
+    /// </summary>
+    public PageOrderingMode PageOrderingMode { get; set; } = PageOrderingMode.DocumentId;
 
     /// <summary>
     /// The parsed resource-scoped Change Query operation for /deletes or /keyChanges.
@@ -121,6 +182,12 @@ internal class RequestInfo(
     /// ResourceActionAuthStrategies for the request
     /// </summary>
     public IReadOnlyList<string> ResourceActionAuthStrategies { get; set; } = [];
+
+    /// <summary>
+    /// The application context resolved for a request that requires ownership configuration.
+    /// Null when the request has not required application context or resolution did not succeed.
+    /// </summary>
+    public ApplicationContext? ApplicationContext { get; set; }
 
     /// <summary>
     /// ApiDetails retrieved from the token, used for resource authorization.
@@ -172,5 +239,14 @@ internal class RequestInfo(
     {
         get => _scopedServiceProvider;
         set => _scopedServiceProvider = value;
+    }
+
+    /// <summary>
+    /// Cancellation token supplied by the frontend for aborting request-scoped work.
+    /// </summary>
+    public CancellationToken RequestCancellationToken
+    {
+        get => _requestCancellationToken;
+        set => _requestCancellationToken = value;
     }
 }

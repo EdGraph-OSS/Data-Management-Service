@@ -248,12 +248,12 @@ DMS. That explains the current `.env.example` pattern, for example:
 ```json
 [
   {
-    "version": "1.0.333",
+    "version": "1.0.335",
     "feedUrl": "https://pkgs.dev.azure.com/ed-fi-alliance/Ed-Fi-Alliance-OSS/_packaging/EdFi/nuget/v3/index.json",
     "name": "EdFi.DataStandard52.ApiSchema"
   },
   {
-    "version": "1.0.333",
+    "version": "1.0.335",
     "feedUrl": "https://pkgs.dev.azure.com/ed-fi-alliance/Ed-Fi-Alliance-OSS/_packaging/EdFi/nuget/v3/index.json",
     "name": "EdFi.DataStandard52.Sample.ApiSchema"
   }
@@ -529,10 +529,23 @@ prepare-dms-schema.ps1
 > `API_SCHEMA_PATH=/app/ApiSchema`, `DMS_API_SCHEMA_MOUNT_SOURCE=<abs .bootstrap/ApiSchema>`, and clears
 > `SCHEMA_PACKAGES` so `run.sh` performs no second download. `bootstrap-dms.yml` (re-introduced) mounts
 > `.bootstrap/ApiSchema` into the DMS container; staged claims are activated per manifest `claims.mode`.
-> In bootstrap mode, default Debezium connector registration is also skipped because the bootstrap relational
-> schema does not include the legacy CDC tables (`dms.document`, `dms.educationorganizationhierarchytermslookup`)
-> or the `to_debezium` publication that the default connector targets. Non-bootstrap local startup can still use
-> the existing `SCHEMA_PACKAGES` downloader path.
+> In bootstrap mode, Debezium connector registration is skipped unless a future explicit CDC opt-in (for example
+> `-EnableKafkaCdc`) is supplied. The relational connector follows
+> [Relational CDC and Document Projection](../cdc/cdc-streaming.md); it must not reuse the legacy connector that targeted `dms.document`,
+> `dms.educationorganizationhierarchytermslookup`, or the `to_debezium` publication. The future opt-in uses
+> deployment-owned binding state under a separate `.cdc-state` root (or an explicit persistent override), never
+> the root bootstrap manifest; DMS consumes only its explicit `DocumentCache:Targets` configuration and exposes
+> per-database projection operational-health and caught-up status. With CDC opt-in,
+> E19-S04 owns orchestration while canonical write admission is closed: provision the
+> current cache/work/lifecycle schema, reject a nonempty canonical/cache/work database,
+> atomically create or exact-match the immutable binding, and then invoke the guarded
+> new-empty `Disabled -> Tracking` transition before any seed/API write. It configures the
+> matching DMS target, starts queue processing, waits for durable work drain, crosses the
+> provider heartbeat barrier, and rechecks caught-up status. The CDC design owns fail-closed
+> binding/lifecycle retry classification. DMS startup itself never enables tracking.
+> Mutable lifecycle, queue, binding, connector, topic, and readiness state remains outside
+> the bootstrap manifest. Non-bootstrap local startup
+> can still use the existing `SCHEMA_PACKAGES` downloader path.
 
 This reuses the existing host-side pattern already present in `eng/preflight-dms-schema-compile.ps1`: the
 host materializes concrete schema files first, then downstream steps operate on those staged files rather
@@ -1114,7 +1127,7 @@ Example shape:
   "schema": {
     "selectionMode": "Standard",
     "selectedExtensions": [],
-    "selectedPackages": ["EdFi.DataStandard52.ApiSchema@1.0.333"],
+    "selectedPackages": ["EdFi.DataStandard52.ApiSchema@1.0.335"],
     "effectiveSchemaHash": "...",
     "workspaceFingerprint": "...",
     "apiSchemaManifestPath": "ApiSchema/bootstrap-api-schema-manifest.json"
@@ -2229,9 +2242,10 @@ Bundling these two concerns created several problems:
 The authoritative phase order in [`command-boundaries.md`](command-boundaries.md) includes a discrete
 DDL provisioning phase after instance configuration and before DMS becomes the active API host for the run.
 
-**v1 canonical mechanism: direct SchemaTools provisioning.** The committed Docker defaults leave
-`AppSettings__DeployDatabaseOnStartup=false`, and bootstrap keeps that setting in place. The existing Docker
-startup script also has a legacy pre-launch provisioning path controlled by `NEED_DATABASE_SETUP` that
+**v1 canonical mechanism: direct SchemaTools provisioning.** DMS exposes no startup-provisioning setting
+at all - `DeployDatabaseOnStartup` was removed by DMS-1239 - so schema provisioning is never a DMS startup
+side effect. The existing Docker startup script has a legacy pre-launch provisioning path controlled by
+`NEED_DATABASE_SETUP` that
 invokes `EdFi.DataManagementService.Backend.Installer.dll`; the DMS-916 flow must disable that path (for
 example by setting `NEED_DATABASE_SETUP=false`) or remove it from the story-aligned startup path entirely.
 `provision-dms-schema.ps1` uses the existing SchemaTools provisioning surface (`api-schema-tools ddl provision`)
@@ -2328,7 +2342,7 @@ API-based seed-delivery slice (see [Companion Implementation Stories](#13-compan
 ### 11.5 Selected ApiSchema.json Drives Exact Physical DDL Shape
 
 The DDL deployed to the database is derived from the selected staged `ApiSchema.json` set for the run (see
-[Section 8.2](#82-proposed--extensions-parameter) and [Section 11.3](#113-proposed-ddl-provisioning-hook)).
+[Section 8.2](#82-how-extensions-are-selected) and [Section 11.3](#113-proposed-ddl-provisioning-hook)).
 Under this strong DMS-916 reading, selecting different extension combinations changes the required physical
 table set, not just the expected hash or runtime API surface. The separation of concerns is:
 
@@ -2491,24 +2505,22 @@ creates admin-scoped clients.
 | `ConfigurationServiceSettings__ClientId` | `CMSReadOnlyAccess` | Local identity setup read-only OAuth client ID that DMS uses to authenticate against the Config Service during local development. |
 | `ConfigurationServiceSettings__ClientSecret` | `<local-cms-readonly-secret>` | Local-development secret for `CMSReadOnlyAccess`, taken from the identity setup output or IDE guidance. **DEV-ONLY**: This localhost credential must not be reused in shared, remote, or production environments. |
 | `ConfigurationServiceSettings__Scope` | `edfi_admin_api/readonly_access` | OAuth scope for Config Service read access. |
-| `ConfigurationServiceSettings__EncryptionKey` | `<dms-config-database-encryption-key>` | Key used to decrypt data-store connection strings returned by the Config Service. Must match the Docker-hosted Config Service's `DatabaseSettings__EncryptionKey`; both are sourced from `DMS_CONFIG_DATABASE_ENCRYPTION_KEY` in the docker-compose env file (`.env.example` default `DefaultEncryptionKey32CharactersX1`). **DEV-ONLY**: This localhost key must not be reused in shared, remote, or production environments. |
+| `ConfigurationServiceSettings__EncryptionKey` | `<dms-config-database-encryption-key>` | Key used to decrypt data-store connection strings returned by the Config Service. Must match the Docker-hosted Config Service's `DatabaseSettings__EncryptionKey`; both are sourced from `DMS_CONFIG_DATABASE_ENCRYPTION_KEY` in the docker-compose env file (`.env.example` default `secret!_32_chars_xxxxxxxxxxxxxxx`). **DEV-ONLY**: This localhost key must not be reused in shared, remote, or production environments. |
 | `AppSettings__AuthenticationService` | `http://localhost:8081/connect/token` (self-contained) or `http://localhost:8045/realms/edfi/protocol/openid-connect/token` (Keycloak) | Token endpoint must match the selected `-IdentityProvider`, using host-reachable URLs rather than Docker-internal addresses. |
 | `JwtAuthentication__Authority` | `http://localhost:8081` (self-contained) or `http://localhost:8045/realms/edfi` (Keycloak) | JWT authority for token validation, translated to host-local endpoints for IDE debugging. |
 | `JwtAuthentication__MetadataAddress` | `http://localhost:8081/.well-known/openid-configuration` (self-contained) or `http://localhost:8045/realms/edfi/.well-known/openid-configuration` (Keycloak) | OIDC discovery document URL for the selected identity provider. |
 | `JwtAuthentication__ClientRole` | `dms-client` | Required DMS client role issued by the Docker-managed local identity provider. Overrides the committed DMS default so IDE-hosted DMS uses the same role contract as Docker-hosted local DMS. |
-| `JwtAuthentication__RoleClaimType` | `http://schemas.microsoft.com/ws/2008/06/identity/claims/role` | Role claim type emitted by the Docker-managed local identity provider. Overrides the committed DMS default so local IDE token validation maps `dms-client` into role claims. |
+| `JwtAuthentication__RoleClaimType` | `http://schemas.microsoft.com/ws/2008/06/identity/claims/role` | Role claim type emitted by the Docker-managed local identity provider. Keeps local IDE token validation aligned with the committed DMS default and maps `dms-client` into role claims. |
 | `AppSettings__UseApiSchemaPath` | `true` | Required for IDE-hosted DMS so it reads the staged schema workspace instead of falling back to the default packaged schema input. |
 | `AppSettings__ApiSchemaPath` | `<repo-root>/eng/docker-compose/.bootstrap/ApiSchema` | Host path to the staged schema workspace created by bootstrap. This must point at the same staged files used for `api-schema-tools hash` and for Docker-hosted DMS runs. |
-| `AppSettings__UseRelationalBackend` | `true` | Required for this IDE workflow because DMS-916 provisions the relational schema before DMS starts and expects the IDE-hosted process to run against that relational backend. |
-| `AppSettings__DeployDatabaseOnStartup` | `false` | Keep the committed default at `false`. Bootstrap provisions schema directly before DMS starts and does not rely on DMS startup side effects in the IDE path. |
 | `Serilog__MinimumLevel__Default` | `Debug` | Log verbosity for local development. |
 
 For Kafka-based event streaming (if enabled), the Kafka bootstrap server must be configured to `localhost:9092` rather than the Docker-internal broker address.
 
 **Optional diagnostic setting:** If a developer intentionally runs SchemaTools manually outside the normal
 bootstrap path, they may also define an admin-capable connection string for that separate tooling step. It
-is not part of the normal IDE-hosted DMS runtime contract because this design keeps
-`AppSettings__DeployDatabaseOnStartup=false` and performs schema provisioning before DMS starts.
+is not part of the normal IDE-hosted DMS runtime contract because DMS never provisions schema at startup
+and bootstrap performs provisioning before DMS starts.
 
 These values can be placed in `src/dms/frontend/EdFi.DataManagementService.Frontend.AspNetCore/appsettings.Development.json` (git-ignored) so they are picked up automatically by the ASP.NET Core configuration system in the `Development` environment without modifying the committed `appsettings.json`. An illustrative guidance file - not generated by bootstrap and not read as a bootstrap input - is provided at `reference/design/backend-redesign/design-docs/bootstrap/appsettings.Development.json.example`:
 
@@ -2527,8 +2539,6 @@ These values can be placed in `src/dms/frontend/EdFi.DataManagementService.Front
   "AppSettings": {
     "UseApiSchemaPath": true,
     "ApiSchemaPath": "<repo-root>/eng/docker-compose/.bootstrap/ApiSchema",
-    "UseRelationalBackend": true,
-    "DeployDatabaseOnStartup": false,
     "AuthenticationService": "http://localhost:8081/connect/token"
   },
   "JwtAuthentication": {
@@ -2536,6 +2546,26 @@ These values can be placed in `src/dms/frontend/EdFi.DataManagementService.Front
     "MetadataAddress": "http://localhost:8081/.well-known/openid-configuration",
     "ClientRole": "dms-client",
     "RoleClaimType": "http://schemas.microsoft.com/ws/2008/06/identity/claims/role"
+  },
+  "DataManagement": {
+    "DocumentCache": {
+      "DesignReference": "reference/design/backend-redesign/epics/18-document-cache/01-documentcache-configuration-and-target-selection.md",
+      "Targets": [],
+      "ReadAcceleration": {
+        "Enabled": false,
+        "DirectFillTimeout": "00:00:00.250"
+      },
+      "Projector": {
+        "PollInterval": "00:00:05",
+        "PageSize": 100,
+        "MaxConcurrentTargets": 2,
+        "FailureBackoff": "00:00:30",
+        "BaselineHighWaterMark": 1000
+      },
+      "Administration": {
+        "WorkflowTimeout": "1.00:00:00"
+      }
+    }
   },
   "Serilog": {
     "MinimumLevel": {
@@ -2545,7 +2575,7 @@ These values can be placed in `src/dms/frontend/EdFi.DataManagementService.Front
 }
 ```
 
-This file is illustrative IDE guidance only. It shows the common single-instance workflow using the non-qualified self-contained token endpoint and is intentionally not a multi-year template. It also explicitly enables the relational backend because this IDE flow assumes bootstrap has already provisioned the relational schema. Bootstrap does not generate it and does not read it as a bootstrap input; the developer copies it to `appsettings.Development.json`, replaces `<local-cms-readonly-secret>` with the credential from local identity setup output or printed IDE guidance, replaces `<dms-config-database-encryption-key>` with the value of `DMS_CONFIG_DATABASE_ENCRYPTION_KEY` from the docker-compose env file (`.env.example` default `DefaultEncryptionKey32CharactersX1`), and replaces `<repo-root>` with the native absolute path for the host platform running the IDE, for example a Windows path, `/Users/...`, or `/home/...`.
+This file is illustrative IDE guidance only. It shows the common single-instance workflow using the non-qualified self-contained token endpoint and is intentionally not a multi-year template. Bootstrap does not generate it and does not read it as a bootstrap input; the developer copies it to `appsettings.Development.json`, replaces `<local-cms-readonly-secret>` with the credential from local identity setup output or printed IDE guidance, replaces `<dms-config-database-encryption-key>` with the value of `DMS_CONFIG_DATABASE_ENCRYPTION_KEY` from the docker-compose env file (`.env.example` default `secret!_32_chars_xxxxxxxxxxxxxxx`), and replaces `<repo-root>` with the native absolute path for the host platform running the IDE, for example a Windows path, `/Users/...`, or `/home/...`.
 
 When the existing `-SchoolYearRange` developer workflow is used with self-contained identity and the
 developer continues bootstrap against an IDE-hosted DMS process for one selected school year, update the
@@ -2756,7 +2786,7 @@ these rows, it is outside the intended scope of this design spike.
 |-----------------------------|---------------------------|---------------------|--------------------|---------------------------|
 | ApiSchema.json selection - how developers choose core, extensions, or custom path | Sections 3.3, 8.2, 8.4, 9.3; [`apischema-container.md`](apischema-container.md) | Designed. The selected schema set is staged as a normalized file-based ApiSchema asset container: schema JSON drives hash/DDL/API surface, while the ApiSchema asset manifest indexes optional static content for runtime metadata/XSD endpoints. Direct filesystem ApiSchema loading is the stable core contract; package-backed selection is the Story 06 input-materialization path. | Story 00 (filesystem staging), Story 04 (DMS-1154, runtime file-based content loading), and Story 06 (DMS-1156, package-backed standard mode) delivered. Story 05 (MetaEd asset-only packages) remains an external publishing prerequisite. | [`../../epics/16-bootstrap/00-schema-and-security-selection.md`](../../epics/16-bootstrap/00-schema-and-security-selection.md); [`../../epics/16-bootstrap/04-apischema-runtime-content-loading.md`](../../epics/16-bootstrap/04-apischema-runtime-content-loading.md); [`../../epics/16-bootstrap/05-metaed-apischema-asset-packaging.md`](../../epics/16-bootstrap/05-metaed-apischema-asset-packaging.md); [`../../epics/16-bootstrap/06-package-backed-standard-schema-selection.md`](../../epics/16-bootstrap/06-package-backed-standard-schema-selection.md) |
 | Security database configuration from ApiSchema.json | Sections 4.3-4.5, 9.3 (`-ClaimsDirectoryPath`) | Designed. DMS-916 derives base claims inputs from the staged schema and available claims artifacts in every schema-selection mode. Expert `-ApiSchemaPath` mode uses `-ClaimsDirectoryPath` for additional non-core security fragments, with structural validation only. | Designed, implementation pending. Story 00 owns claims staging and direct-filesystem inputs; Story 06 feeds the same root bootstrap manifest schema contract for package-backed standard mode. | [`../../epics/16-bootstrap/00-schema-and-security-selection.md`](../../epics/16-bootstrap/00-schema-and-security-selection.md); [`../../epics/16-bootstrap/06-package-backed-standard-schema-selection.md`](../../epics/16-bootstrap/06-package-backed-standard-schema-selection.md) |
-| Database schema provisioning - DDL hook separated from seed data loading, driven by selected ApiSchema.json | Sections 3.2, 11.3-11.5; [`command-boundaries.md` Section 3.5](command-boundaries.md#35-provision-dms-schemaps1--authoritative-schema-provisioning) | Designed under the strong interpretation above. Selected schema drives the DDL target/version/`EffectiveSchemaHash` validation path and the exact physical schema provisioned for that run. DMS startup provisioning is explicitly disabled, including both `AppSettings__DeployDatabaseOnStartup` and the legacy `NEED_DATABASE_SETUP` / `Backend.Installer` pre-launch path. | Designed, implementation pending. Bootstrap delegates to the SchemaTools / runtime-owned provisioning path; readiness is gated on that surface remaining stable. | [`../../epics/16-bootstrap/01-schema-deployment-safety.md`](../../epics/16-bootstrap/01-schema-deployment-safety.md); SchemaTools dependency in Section 14.3 |
+| Database schema provisioning - DDL hook separated from seed data loading, driven by selected ApiSchema.json | Sections 3.2, 11.3-11.5; [`command-boundaries.md` Section 3.5](command-boundaries.md#35-provision-dms-schemaps1--authoritative-schema-provisioning) | Designed under the strong interpretation above. Selected schema drives the DDL target/version/`EffectiveSchemaHash` validation path and the exact physical schema provisioned for that run. DMS startup never provisions schema: DMS exposes no `DeployDatabaseOnStartup` setting (removed by DMS-1239), and the legacy `NEED_DATABASE_SETUP` / `Backend.Installer` pre-launch path is disabled or removed. | Designed, implementation pending. Bootstrap delegates to the SchemaTools / runtime-owned provisioning path; readiness is gated on that surface remaining stable. | [`../../epics/16-bootstrap/01-schema-deployment-safety.md`](../../epics/16-bootstrap/01-schema-deployment-safety.md); SchemaTools dependency in Section 14.3 |
 | Sample data loading - API-based seed loading replacing direct SQL, with pinned Ed-Fi XML seed templates in Phase 1 and JSONL assets in Phase 2 paired with compatible schema/security inputs | Section 6 | Designed. All DMS-side design decisions are complete: BulkLoadClient consumption contract (Section 6.1), seed-source selection (`-SeedTemplate` / `-SeedDataPath`, Section 6.2), bootstrap manifest handoff (Section 6.2.5), seed workspace with collision detection (Section 6.3.1), per-year invocation for school-year paths (Section 10), and the bootstrap manifest compatibility boundary for `-SeedDataPath`, including explicit `-AdditionalNamespacePrefix` values for SeedLoader vendor authorization. DMS-1152 Phase 1 is API-based XML loading through the repo-pinned BulkLoadClient XML surface; Phase 2 remains the JSONL target. | Phase 1 implemented by Story 02 as XML interchange. Phase 2 migration remains blocked externally by BulkLoadClient JSONL support and DMS-owned JSONL asset work. | Story 02 XML implementation; ODS-6738 and future Phase 2 JSONL asset work |
 | Extension selection - how a developer adds extension artifacts to a bootstrap run | Sections 3.3, 8.2-8.4 | Designed | Published extensions are selected through the effective standard-mode `SCHEMA_PACKAGES` set. Expert `-ApiSchemaPath` (Story 00) stages unpublished/custom schema sets from filesystem `ApiSchema*.json` files. There is no named extension-selection parameter. Story 02 owns built-in extension seed lookup and loading from the bootstrap manifest. | [`../../epics/16-bootstrap/00-schema-and-security-selection.md`](../../epics/16-bootstrap/00-schema-and-security-selection.md); [`../../epics/16-bootstrap/02-api-seed-delivery.md`](../../epics/16-bootstrap/02-api-seed-delivery.md); [`../../epics/16-bootstrap/05-metaed-apischema-asset-packaging.md`](../../epics/16-bootstrap/05-metaed-apischema-asset-packaging.md); [`../../epics/16-bootstrap/06-package-backed-standard-schema-selection.md`](../../epics/16-bootstrap/06-package-backed-standard-schema-selection.md); see Section 14.2 |
 | Credential bootstrapping - enhancements for seed data loading support | Section 7 | Designed. Both credential flows are fully specified: CMS-only `EdFiSandbox` smoke-test credentials (Section 7.2.1) and the separate DMS-dependent `SeedLoader` credential flow (Section 7.2.2), including the complete `SeedLoader` permission table (resource claim URI patterns, authorization strategies, operations). Adding the `SeedLoader` top-level claim set to the embedded CMS `Claims.json` is the very first implementation task in Story 02 Task 3 — the design specifies exactly what to add. | Designed, implementation pending. Story 02 Task 3 owns adding the `SeedLoader` claim set to `src/config/backend/EdFi.DmsConfigurationService.Backend/Claims/Claims.json`; this is the first deliverable from that story and unblocks all DMS-side seed delivery. | [`../../epics/16-bootstrap/02-api-seed-delivery.md`](../../epics/16-bootstrap/02-api-seed-delivery.md) Task 3; see Section 14.2 |

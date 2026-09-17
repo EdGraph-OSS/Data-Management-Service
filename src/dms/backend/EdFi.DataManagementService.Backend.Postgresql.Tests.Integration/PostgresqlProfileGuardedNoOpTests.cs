@@ -29,71 +29,12 @@ using EdFi.DataManagementService.Core.External.Model;
 using EdFi.DataManagementService.Core.Profile;
 using FluentAssertions;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Npgsql;
 using NUnit.Framework;
 
 namespace EdFi.DataManagementService.Backend.Postgresql.Tests.Integration;
-
-/// <summary>
-/// Stale-compare freshness checker for the profiled guarded no-op suite. The first
-/// invocation bumps <c>ContentVersion</c> on the target document before delegating
-/// to the production checker, simulating a concurrent writer landing between the
-/// candidate detection and freshness recheck. Reused by Task 9 (stale-compare).
-/// </summary>
-file sealed class ProfileGuardedNoOpConcurrentContentVersionBumpFreshnessChecker(
-    NpgsqlDataSourceProvider dataSourceProvider
-) : IRelationalWriteFreshnessChecker
-{
-    private readonly NpgsqlDataSourceProvider _dataSourceProvider =
-        dataSourceProvider ?? throw new ArgumentNullException(nameof(dataSourceProvider));
-
-    private readonly RelationalWriteFreshnessChecker _innerChecker = new();
-    private bool _hasBumpedContentVersion;
-
-    public async Task<bool> IsCurrentAsync(
-        RelationalWriteExecutorRequest request,
-        RelationalWriteTargetContext.ExistingDocument targetContext,
-        IRelationalWriteSession writeSession,
-        CancellationToken cancellationToken = default
-    )
-    {
-        if (!_hasBumpedContentVersion)
-        {
-            _hasBumpedContentVersion = true;
-
-            await BumpContentVersionAsync(targetContext.DocumentId, cancellationToken);
-        }
-
-        return await _innerChecker.IsCurrentAsync(request, targetContext, writeSession, cancellationToken);
-    }
-
-    private async Task BumpContentVersionAsync(long documentId, CancellationToken cancellationToken)
-    {
-        await using var connection = await _dataSourceProvider.DataSource.OpenConnectionAsync(
-            cancellationToken
-        );
-
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            UPDATE "dms"."Document"
-            SET "ContentVersion" = "ContentVersion" + 1
-            WHERE "DocumentId" = @documentId;
-            """;
-        command.Parameters.Add(new NpgsqlParameter("documentId", documentId));
-
-        var rowsAffected = await command.ExecuteNonQueryAsync(cancellationToken);
-
-        if (rowsAffected != 1)
-        {
-            throw new InvalidOperationException(
-                $"Expected exactly one document content-version bump for document id '{documentId}', but affected {rowsAffected} rows."
-            );
-        }
-    }
-}
 
 internal static class ProfileGuardedNoOpIntegrationTestSupport
 {
@@ -107,7 +48,13 @@ internal static class ProfileGuardedNoOpIntegrationTestSupport
         > readRootRowByDocumentId
     ) =>
         await ProfileGuardedNoOpPersistedStateSupport
-            .ReadPersistedStateAsync(database, documentUuid, ReadDocumentRowsAsync, readRootRowByDocumentId)
+            .ReadPersistedStateAsync(
+                database,
+                documentUuid,
+                ReadDocumentRowsAsync,
+                readRootRowByDocumentId,
+                ReadMaxChangeVersionAsync
+            )
             .ConfigureAwait(false);
 
     private static async Task<IReadOnlyList<IReadOnlyDictionary<string, object?>>> ReadDocumentRowsAsync(
@@ -119,13 +66,26 @@ internal static class ProfileGuardedNoOpIntegrationTestSupport
                 """
                 SELECT "DocumentId", "DocumentUuid", "ResourceKeyId",
                        "ContentVersion", "ContentLastModifiedAt",
-                       "IdentityVersion", "IdentityLastModifiedAt"
+                       "CreatedAt"
                 FROM "dms"."Document"
                 WHERE "DocumentUuid" = @documentUuid;
                 """,
                 new NpgsqlParameter("documentUuid", documentUuid)
             )
             .ConfigureAwait(false);
+
+    private static async Task<long> ReadMaxChangeVersionAsync(PostgresqlGeneratedDdlTestDatabase database)
+    {
+        var rows = await database
+            .QueryRowsAsync(
+                """
+                SELECT "dms"."GetMaxChangeVersion"() AS "MaxChangeVersion";
+                """
+            )
+            .ConfigureAwait(false);
+
+        return Convert.ToInt64(rows[0]["MaxChangeVersion"], CultureInfo.InvariantCulture);
+    }
 }
 
 /// <summary>
@@ -245,29 +205,13 @@ internal abstract class ProfileGuardedNoOpGeneratedDdlFixtureTestBase
         services.Configure<DatabaseOptions>(options => options.IsolationLevel = IsolationLevel.ReadCommitted);
         services.AddTestReadableProfileProjector();
         services.AddScoped<RelationalDocumentStoreRepository>();
-        services.AddPostgresqlReferenceResolver();
+        services.AddPostgresqlBackendIntegrationTestServices();
         configureServices?.Invoke(services);
 
         return services.BuildServiceProvider(
             new ServiceProviderOptions { ValidateOnBuild = true, ValidateScopes = true }
         );
     }
-
-    /// <summary>
-    /// Service provider variant that swaps in
-    /// <see cref="ProfileGuardedNoOpConcurrentContentVersionBumpFreshnessChecker"/> for the
-    /// production freshness checker so the first revalidation observes a stale
-    /// <c>ContentVersion</c>. Reserved for the Task 9 stale-compare fixtures.
-    /// </summary>
-    protected static ServiceProvider CreateStaleCompareServiceProvider() =>
-        CreateDefaultServiceProvider(static services =>
-        {
-            services.RemoveAll<IRelationalWriteFreshnessChecker>();
-            services.AddScoped<
-                IRelationalWriteFreshnessChecker,
-                ProfileGuardedNoOpConcurrentContentVersionBumpFreshnessChecker
-            >();
-        });
 
     /// <summary>
     /// Counts rows in <c>dms.Document</c> matching the supplied
@@ -451,6 +395,8 @@ internal abstract class RootOnlyShapeProfileGuardedNoOpFixtureBase
             """
             SELECT
                 "DocumentId",
+                "ContentVersion",
+                "ContentLastModifiedAt",
                 "ProfileRootOnlyMergeItemId",
                 "DisplayName",
                 "ProfileScopeClearableText",
@@ -762,17 +708,18 @@ internal class Given_A_Postgresql_Relational_Profile_Guarded_No_Op_Put_With_Root
     }
 
     [Test]
-    public void It_does_not_change_identity_version()
+    public void It_does_not_change_created_at()
     {
-        _stateAfterUpdate.Document.IdentityVersion.Should().Be(_stateBeforeUpdate.Document.IdentityVersion);
+        _stateAfterUpdate.Document.CreatedAt.Should().Be(_stateBeforeUpdate.Document.CreatedAt);
     }
 
     [Test]
-    public void It_does_not_change_identity_last_modified_at()
+    public void It_does_not_advance_the_change_version()
     {
-        _stateAfterUpdate
-            .Document.IdentityLastModifiedAt.Should()
-            .Be(_stateBeforeUpdate.Document.IdentityLastModifiedAt);
+        _stateBeforeUpdate
+            .MaxChangeVersion.Should()
+            .BeGreaterThan(0, "the seeded write must have allocated change versions (non-vacuous)");
+        _stateAfterUpdate.MaxChangeVersion.Should().Be(_stateBeforeUpdate.MaxChangeVersion);
     }
 }
 
@@ -865,209 +812,18 @@ internal class Given_A_Postgresql_Relational_Profile_Guarded_No_Op_Post_As_Updat
     }
 
     [Test]
-    public void It_does_not_change_identity_version()
+    public void It_does_not_change_created_at()
     {
-        _stateAfterPostAsUpdate
-            .Document.IdentityVersion.Should()
-            .Be(_stateBeforePostAsUpdate.Document.IdentityVersion);
+        _stateAfterPostAsUpdate.Document.CreatedAt.Should().Be(_stateBeforePostAsUpdate.Document.CreatedAt);
     }
 
     [Test]
-    public void It_does_not_change_identity_last_modified_at()
+    public void It_does_not_advance_the_change_version()
     {
-        _stateAfterPostAsUpdate
-            .Document.IdentityLastModifiedAt.Should()
-            .Be(_stateBeforePostAsUpdate.Document.IdentityLastModifiedAt);
-    }
-}
-
-/// <summary>
-/// Profiled stale-compare retry on PUT. Seeds a
-/// non-profiled CREATE for the synthetic <c>ProfileRootOnlyMergeItem</c> target, then
-/// issues a profiled PUT carrying a byte-identical body so the post-merge effective
-/// rowset would otherwise match the stored rowset and the guarded no-op short-circuit
-/// would fire. The fixture wires a freshness checker that bumps the target document's
-/// <c>ContentVersion</c> on its first invocation only before delegating to the
-/// production checker, simulating a concurrent writer landing between the candidate
-/// detection and the freshness recheck on the executor's first attempt. The executor
-/// observes the stale row and emits a
-/// <see cref="RelationalWriteExecutorAttemptOutcome.StaleNoOpCompare"/> attempt
-/// outcome, which the repository's two-attempt loop swallows and retries within the
-/// same scope. On the second attempt the same scoped checker instance no longer bumps
-/// (its single-shot guard tripped), the merged rowset matches the now-bumped stored
-/// rowset, and the executor returns success — mirroring the no-profile stale-compare
-/// sibling. Asserting <see cref="UpdateResult.UpdateSuccess"/> here pins the
-/// repository-level retry contract for profiled writes; the bumped
-/// <c>ContentVersion</c> persists because the post-success no-op short-circuit
-/// preserves the concurrent writer's bump.
-/// </summary>
-[TestFixture]
-[Category("DatabaseIntegration")]
-[Category("PostgresqlIntegration")]
-internal class Given_A_Postgresql_Relational_Profile_Stale_Guarded_No_Op_Put
-    : RootOnlyShapeProfileGuardedNoOpFixtureBase
-{
-    private static readonly DocumentUuid DocumentUuid = new(
-        Guid.Parse("eeeeeeee-0000-0000-0000-000000000010")
-    );
-
-    private ProfileGuardedNoOpPersistedState _stateBeforeUpdate = null!;
-    private ProfileGuardedNoOpPersistedState _stateAfterUpdate = null!;
-    private UpdateResult _updateResult = null!;
-
-    protected override ServiceProvider CreateServiceProvider() => CreateStaleCompareServiceProvider();
-
-    protected override async Task SetUpTestAsync()
-    {
-        await ExecuteProfiledShapeCreateAsync(DocumentUuid);
-        _stateBeforeUpdate = await ProfileGuardedNoOpIntegrationTestSupport.ReadPersistedStateAsync(
-            _database,
-            DocumentUuid.Value,
-            ReadShapeRootRowByDocumentIdAsync
-        );
-
-        _updateResult = await ExecuteProfiledShapeIdenticalPutAsync(DocumentUuid);
-
-        _stateAfterUpdate = await ProfileGuardedNoOpIntegrationTestSupport.ReadPersistedStateAsync(
-            _database,
-            DocumentUuid.Value,
-            ReadShapeRootRowByDocumentIdAsync
-        );
-    }
-
-    [Test]
-    public void It_retries_and_returns_update_success_after_the_profiled_no_op_compare_goes_stale()
-    {
-        _updateResult.Should().BeOfType<UpdateResult.UpdateSuccess>();
-        _updateResult.As<UpdateResult.UpdateSuccess>().ExistingDocumentUuid.Should().Be(DocumentUuid);
-    }
-
-    [Test]
-    public void It_preserves_the_persisted_state_aside_from_the_concurrent_content_version_bump()
-    {
-        // The freshness-checker bumper raises the stored Document.ContentVersion by one
-        // as the simulated concurrent writer — not the executor's stale-retry no-op
-        // success path, which neither persists rowset content nor mutates Document
-        // metadata. We substitute the bumper's ContentVersion bump back to the
-        // before-state so the deep-equivalence assertion proves the no-op retry
-        // preserves every other field (ContentLastModifiedAt, IdentityVersion,
-        // IdentityLastModifiedAt, RootRow, ResourceKeyId, DocumentUuid, DocumentId).
-        var adjustedAfterState = _stateAfterUpdate with
-        {
-            Document = _stateAfterUpdate.Document with
-            {
-                ContentVersion = _stateBeforeUpdate.Document.ContentVersion,
-            },
-        };
-
-        adjustedAfterState.Should().BeEquivalentTo(_stateBeforeUpdate);
-    }
-
-    [Test]
-    public void It_bumps_the_content_version_by_exactly_one()
-    {
-        _stateAfterUpdate.Document.ContentVersion.Should().Be(_stateBeforeUpdate.Document.ContentVersion + 1);
-    }
-}
-
-/// <summary>
-/// Profiled stale-compare retry on POST-as-update.
-/// Seeds a non-profiled CREATE for the synthetic <c>ProfileRootOnlyMergeItem</c> target,
-/// then issues a profiled <c>POST</c> with the SAME natural-identity body but a
-/// DIFFERENT incoming <see cref="DocumentUuid"/>, which the executor classifies as
-/// POST-as-update by semantic identity. The body is byte-identical to the seed so the
-/// merged effective rowset would otherwise match the stored rowset and the guarded
-/// no-op short-circuit would fire. The fixture wires the same single-shot bumping
-/// freshness checker as the PUT fixture; the first executor attempt observes the
-/// bumped row, emits <see cref="RelationalWriteExecutorAttemptOutcome.StaleNoOpCompare"/>,
-/// and the repository retries within the same scope. On the second attempt the
-/// scoped checker no longer bumps and the no-op succeeds against the bumped stored
-/// rowset — yielding <see cref="UpsertResult.UpdateSuccess"/> with the EXISTING
-/// document's UUID (the incoming UUID must NOT be inserted) and the bumped
-/// <c>ContentVersion</c> preserved.
-/// </summary>
-[TestFixture]
-[Category("DatabaseIntegration")]
-[Category("PostgresqlIntegration")]
-internal class Given_A_Postgresql_Relational_Profile_Stale_Guarded_No_Op_Post_As_Update
-    : RootOnlyShapeProfileGuardedNoOpFixtureBase
-{
-    private static readonly DocumentUuid ExistingDocumentUuid = new(
-        Guid.Parse("eeeeeeee-0000-0000-0000-000000000011")
-    );
-    private static readonly DocumentUuid IncomingDocumentUuid = new(
-        Guid.Parse("eeeeeeee-0000-0000-0000-000000000012")
-    );
-
-    private ProfileGuardedNoOpPersistedState _stateBeforePostAsUpdate = null!;
-    private ProfileGuardedNoOpPersistedState _stateAfterPostAsUpdate = null!;
-    private UpsertResult _postAsUpdateResult = null!;
-    private long _incomingDocumentUuidRowCount;
-
-    protected override ServiceProvider CreateServiceProvider() => CreateStaleCompareServiceProvider();
-
-    protected override async Task SetUpTestAsync()
-    {
-        await ExecuteProfiledShapeCreateAsync(ExistingDocumentUuid);
-        _stateBeforePostAsUpdate = await ProfileGuardedNoOpIntegrationTestSupport.ReadPersistedStateAsync(
-            _database,
-            ExistingDocumentUuid.Value,
-            ReadShapeRootRowByDocumentIdAsync
-        );
-
-        _postAsUpdateResult = await ExecuteProfiledShapePostAsUpdateAsync(IncomingDocumentUuid);
-
-        _stateAfterPostAsUpdate = await ProfileGuardedNoOpIntegrationTestSupport.ReadPersistedStateAsync(
-            _database,
-            ExistingDocumentUuid.Value,
-            ReadShapeRootRowByDocumentIdAsync
-        );
-        _incomingDocumentUuidRowCount = await CountDocumentRowsByUuidAsync(IncomingDocumentUuid.Value);
-    }
-
-    [Test]
-    public void It_retries_and_returns_update_success_after_the_profiled_no_op_compare_goes_stale()
-    {
-        _postAsUpdateResult.Should().BeOfType<UpsertResult.UpdateSuccess>();
-        _postAsUpdateResult
-            .As<UpsertResult.UpdateSuccess>()
-            .ExistingDocumentUuid.Should()
-            .Be(ExistingDocumentUuid);
-    }
-
-    [Test]
-    public void It_does_not_insert_the_incoming_document_uuid()
-    {
-        _incomingDocumentUuidRowCount.Should().Be(0);
-    }
-
-    [Test]
-    public void It_preserves_the_persisted_state_aside_from_the_concurrent_content_version_bump()
-    {
-        // The freshness-checker bumper raises the stored Document.ContentVersion by one
-        // as the simulated concurrent writer — not the executor's stale-retry no-op
-        // success path, which neither persists rowset content nor mutates Document
-        // metadata. We substitute the bumper's ContentVersion bump back to the
-        // before-state so the deep-equivalence assertion proves the no-op retry
-        // preserves every other field (ContentLastModifiedAt, IdentityVersion,
-        // IdentityLastModifiedAt, RootRow, ResourceKeyId, DocumentUuid, DocumentId).
-        var adjustedAfterState = _stateAfterPostAsUpdate with
-        {
-            Document = _stateAfterPostAsUpdate.Document with
-            {
-                ContentVersion = _stateBeforePostAsUpdate.Document.ContentVersion,
-            },
-        };
-
-        adjustedAfterState.Should().BeEquivalentTo(_stateBeforePostAsUpdate);
-    }
-
-    [Test]
-    public void It_bumps_the_content_version_by_exactly_one()
-    {
-        _stateAfterPostAsUpdate
-            .Document.ContentVersion.Should()
-            .Be(_stateBeforePostAsUpdate.Document.ContentVersion + 1);
+        _stateBeforePostAsUpdate
+            .MaxChangeVersion.Should()
+            .BeGreaterThan(0, "the seeded write must have allocated change versions (non-vacuous)");
+        _stateAfterPostAsUpdate.MaxChangeVersion.Should().Be(_stateBeforePostAsUpdate.MaxChangeVersion);
     }
 }
 
@@ -1166,20 +922,6 @@ internal class Given_A_Postgresql_Relational_Profile_Guarded_No_Op_Put_With_Sepa
         _stateAfterUpdate
             .Document.ContentLastModifiedAt.Should()
             .Be(_stateBeforeUpdate.Document.ContentLastModifiedAt);
-    }
-
-    [Test]
-    public void It_does_not_change_identity_version()
-    {
-        _stateAfterUpdate.Document.IdentityVersion.Should().Be(_stateBeforeUpdate.Document.IdentityVersion);
-    }
-
-    [Test]
-    public void It_does_not_change_identity_last_modified_at()
-    {
-        _stateAfterUpdate
-            .Document.IdentityLastModifiedAt.Should()
-            .Be(_stateBeforeUpdate.Document.IdentityLastModifiedAt);
     }
 
     /// <summary>
@@ -1312,19 +1054,5 @@ internal class Given_A_Postgresql_Relational_Profile_Guarded_No_Op_Put_With_Top_
         _stateAfterUpdate
             .Document.ContentLastModifiedAt.Should()
             .Be(_stateBeforeUpdate.Document.ContentLastModifiedAt);
-    }
-
-    [Test]
-    public void It_does_not_change_identity_version()
-    {
-        _stateAfterUpdate.Document.IdentityVersion.Should().Be(_stateBeforeUpdate.Document.IdentityVersion);
-    }
-
-    [Test]
-    public void It_does_not_change_identity_last_modified_at()
-    {
-        _stateAfterUpdate
-            .Document.IdentityLastModifiedAt.Should()
-            .Be(_stateBeforeUpdate.Document.IdentityLastModifiedAt);
     }
 }

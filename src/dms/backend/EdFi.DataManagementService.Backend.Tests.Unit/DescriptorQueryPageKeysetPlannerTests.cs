@@ -22,23 +22,23 @@ public class Given_DescriptorQueryPageKeysetPlanner
     [Test]
     [TestCase(
         SqlDialect.Pgsql,
-        "\"dms\".\"Document\" r",
-        "\"dms\".\"Document\" doc",
+        "\"dms\".\"Descriptor\" r",
+        "INNER JOIN \"dms\".\"Document\" doc ON doc.\"DocumentId\" = r.\"DocumentId\"",
         "\"dms\".\"Descriptor\" d",
         "LIMIT @limit OFFSET @offset"
     )]
     [TestCase(
         SqlDialect.Mssql,
-        "[dms].[Document] r",
-        "[dms].[Document] doc",
+        "[dms].[Descriptor] r",
+        "INNER JOIN [dms].[Document] doc ON doc.[DocumentId] = r.[DocumentId]",
         "[dms].[Descriptor] d",
         "OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY"
     )]
     public void It_should_plan_typed_descriptor_page_and_total_count_sql_and_parameter_values(
         SqlDialect dialect,
-        string expectedDocumentFromFragment,
-        string unexpectedDocumentJoinFragment,
-        string expectedDescriptorJoinFragment,
+        string expectedDescriptorFromFragment,
+        string expectedDocumentJoinFragment,
+        string unexpectedDescriptorJoinFragment,
         string expectedPagingFragment
     )
     {
@@ -79,13 +79,14 @@ public class Given_DescriptorQueryPageKeysetPlanner
                     ),
                 ]
             ),
-            new PaginationParameters(Limit: null, Offset: null, TotalCount: true, MaximumPageSize: 500)
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: null, Offset: null, TotalCount: true, MaximumPageSize: 500)
+            )
         );
 
-        keyset.Plan.PageDocumentIdSql.Should().Contain($"FROM {expectedDocumentFromFragment}");
-        keyset.Plan.PageDocumentIdSql.Should().NotContain($"INNER JOIN {unexpectedDocumentJoinFragment}");
-        keyset.Plan.PageDocumentIdSql.Should().NotContain("doc.");
-        keyset.Plan.PageDocumentIdSql.Should().Contain($"INNER JOIN {expectedDescriptorJoinFragment} ON d.");
+        keyset.Plan.PageDocumentIdSql.Should().Contain($"FROM {expectedDescriptorFromFragment}");
+        keyset.Plan.PageDocumentIdSql.Should().Contain(expectedDocumentJoinFragment);
+        keyset.Plan.PageDocumentIdSql.Should().NotContain(unexpectedDescriptorJoinFragment);
         keyset.Plan.PageDocumentIdSql.Should().Contain("ResourceKeyId");
         keyset.Plan.PageDocumentIdSql.Should().Contain("DocumentUuid");
         keyset.Plan.PageDocumentIdSql.Should().Contain("Namespace");
@@ -93,10 +94,9 @@ public class Given_DescriptorQueryPageKeysetPlanner
         keyset.Plan.PageDocumentIdSql.Should().Contain(expectedPagingFragment);
 
         keyset.Plan.TotalCountSql.Should().NotBeNull();
-        keyset.Plan.TotalCountSql.Should().Contain($"FROM {expectedDocumentFromFragment}");
-        keyset.Plan.TotalCountSql.Should().NotContain($"INNER JOIN {unexpectedDocumentJoinFragment}");
-        keyset.Plan.TotalCountSql.Should().NotContain("doc.");
-        keyset.Plan.TotalCountSql.Should().Contain($"INNER JOIN {expectedDescriptorJoinFragment} ON d.");
+        keyset.Plan.TotalCountSql.Should().Contain($"FROM {expectedDescriptorFromFragment}");
+        keyset.Plan.TotalCountSql.Should().Contain(expectedDocumentJoinFragment);
+        keyset.Plan.TotalCountSql.Should().NotContain(unexpectedDescriptorJoinFragment);
         keyset.Plan.TotalCountSql.Should().Contain("ResourceKeyId");
         keyset.Plan.TotalCountSql.Should().Contain("DocumentUuid");
         keyset.Plan.TotalCountSql.Should().Contain("Namespace");
@@ -114,12 +114,12 @@ public class Given_DescriptorQueryPageKeysetPlanner
         keyset
             .Plan.PageParametersInOrder.Select(parameter => parameter.ParameterName)
             .Should()
-            .Equal("effectiveBeginDate", "namespace", "id", "resourceKeyId", "offset", "limit");
+            .Equal("id", "effectiveBeginDate", "namespace", "resourceKeyId", "offset", "limit");
         keyset.Plan.TotalCountParametersInOrder.Should().NotBeNull();
         keyset
             .Plan.TotalCountParametersInOrder!.Value.Select(parameter => parameter.ParameterName)
             .Should()
-            .Equal("effectiveBeginDate", "namespace", "id", "resourceKeyId");
+            .Equal("id", "effectiveBeginDate", "namespace", "resourceKeyId");
     }
 
     [Test]
@@ -160,7 +160,9 @@ public class Given_DescriptorQueryPageKeysetPlanner
                     ),
                 ]
             ),
-            new PaginationParameters(Limit: 25, Offset: 75, TotalCount: true, MaximumPageSize: 500)
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 75, TotalCount: true, MaximumPageSize: 500)
+            )
         );
         var second = planner.Plan(
             RelationalAccessTestData.CreateMappingSet(_requestResource),
@@ -196,7 +198,9 @@ public class Given_DescriptorQueryPageKeysetPlanner
                     ),
                 ]
             ),
-            new PaginationParameters(Limit: 25, Offset: 75, TotalCount: true, MaximumPageSize: 500)
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 75, TotalCount: true, MaximumPageSize: 500)
+            )
         );
 
         first.Plan.PageDocumentIdSql.Should().Be(second.Plan.PageDocumentIdSql);
@@ -291,7 +295,9 @@ public class Given_DescriptorQueryPageKeysetPlanner
                     ),
                 ]
             ),
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+            ),
             changeVersionRange: new ChangeVersionRange(100L, 200L)
         );
 
@@ -319,8 +325,8 @@ public class Given_DescriptorQueryPageKeysetPlanner
             .Be(Guid.Parse("cccccccc-1111-2222-3333-dddddddddddd"));
         keyset.Plan.PageDocumentIdSql.Should().Contain("r.\"ContentVersion\" >= @minChangeVersion");
         keyset.Plan.PageDocumentIdSql.Should().Contain("r.\"ContentVersion\" <= @maxChangeVersion");
-        keyset.Plan.PageDocumentIdSql.Should().Contain("d.\"Description\" = @minChangeVersion_2");
-        keyset.Plan.PageDocumentIdSql.Should().Contain("r.\"DocumentUuid\" = @maxChangeVersion_2");
+        keyset.Plan.PageDocumentIdSql.Should().Contain("r.\"Description\" = @minChangeVersion_2");
+        keyset.Plan.PageDocumentIdSql.Should().Contain("doc.\"DocumentUuid\" = @maxChangeVersion_2");
     }
 
     [Test]
@@ -343,7 +349,9 @@ public class Given_DescriptorQueryPageKeysetPlanner
                     ),
                 ]
             ),
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+            ),
             CreateNamespaceAuthorization(SqlDialect.Pgsql, ["uri://ed-fi.org/"])
         );
 
@@ -356,11 +364,11 @@ public class Given_DescriptorQueryPageKeysetPlanner
     }
 
     [Test]
-    [TestCase(SqlDialect.Pgsql, "\"dms\".\"Document\" r")]
-    [TestCase(SqlDialect.Mssql, "[dms].[Document] r")]
+    [TestCase(SqlDialect.Pgsql, "\"dms\".\"Descriptor\" r")]
+    [TestCase(SqlDialect.Mssql, "[dms].[Descriptor] r")]
     public void It_should_plan_descriptor_total_count_sql_without_optional_joins_when_only_resource_type_discrimination_is_required(
         SqlDialect dialect,
-        string expectedDocumentFromFragment
+        string expectedDescriptorFromFragment
     )
     {
         var planner = new DescriptorQueryPageKeysetPlanner(dialect);
@@ -368,17 +376,19 @@ public class Given_DescriptorQueryPageKeysetPlanner
             RelationalAccessTestData.CreateMappingSet(_requestResource),
             _descriptorResource,
             new DescriptorQueryPreprocessingResult(new RelationalQueryPreprocessingOutcome.Continue(), []),
-            new PaginationParameters(Limit: 25, Offset: 75, TotalCount: true, MaximumPageSize: 500)
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 75, TotalCount: true, MaximumPageSize: 500)
+            )
         );
 
-        keyset.Plan.PageDocumentIdSql.Should().Contain($"FROM {expectedDocumentFromFragment}");
-        keyset.Plan.PageDocumentIdSql.Should().NotContain("Descriptor");
+        keyset.Plan.PageDocumentIdSql.Should().Contain($"FROM {expectedDescriptorFromFragment}");
+        keyset.Plan.PageDocumentIdSql.Should().NotContain("INNER JOIN");
         keyset.Plan.PageDocumentIdSql.Should().NotContain("doc.");
 
         keyset.Plan.TotalCountSql.Should().NotBeNull();
-        keyset.Plan.TotalCountSql.Should().Contain($"FROM {expectedDocumentFromFragment}");
+        keyset.Plan.TotalCountSql.Should().Contain($"FROM {expectedDescriptorFromFragment}");
         keyset.Plan.TotalCountSql.Should().Contain("ResourceKeyId");
-        keyset.Plan.TotalCountSql.Should().NotContain("Descriptor");
+        keyset.Plan.TotalCountSql.Should().NotContain("INNER JOIN");
         keyset.Plan.TotalCountSql.Should().NotContain("doc.");
         keyset.Plan.TotalCountSql.Should().NotContain("@offset");
         keyset.Plan.TotalCountSql.Should().NotContain("@limit");
@@ -393,15 +403,23 @@ public class Given_DescriptorQueryPageKeysetPlanner
     [Test]
     [TestCase(
         SqlDialect.Pgsql,
-        "\"dms\".\"Document\" r",
-        "\"dms\".\"Document\" doc",
-        "r.\"DocumentUuid\" = @id"
+        "\"dms\".\"Descriptor\" r",
+        "INNER JOIN \"dms\".\"Document\" doc ON doc.\"DocumentId\" = r.\"DocumentId\"",
+        "\"dms\".\"Descriptor\" d",
+        "doc.\"DocumentUuid\" = @id"
     )]
-    [TestCase(SqlDialect.Mssql, "[dms].[Document] r", "[dms].[Document] doc", "r.[DocumentUuid] = @id")]
-    public void It_should_plan_descriptor_id_filters_without_redundant_self_join_or_descriptor_join(
+    [TestCase(
+        SqlDialect.Mssql,
+        "[dms].[Descriptor] r",
+        "INNER JOIN [dms].[Document] doc ON doc.[DocumentId] = r.[DocumentId]",
+        "[dms].[Descriptor] d",
+        "doc.[DocumentUuid] = @id"
+    )]
+    public void It_should_plan_descriptor_id_filters_through_the_shared_document_join(
         SqlDialect dialect,
-        string expectedDocumentFromFragment,
-        string unexpectedDocumentJoinFragment,
+        string expectedDescriptorFromFragment,
+        string expectedDocumentJoinFragment,
+        string unexpectedDescriptorJoinFragment,
         string expectedIdPredicateFragment
     )
     {
@@ -424,21 +442,21 @@ public class Given_DescriptorQueryPageKeysetPlanner
                     ),
                 ]
             ),
-            new PaginationParameters(Limit: 25, Offset: 75, TotalCount: true, MaximumPageSize: 500)
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 75, TotalCount: true, MaximumPageSize: 500)
+            )
         );
 
-        keyset.Plan.PageDocumentIdSql.Should().Contain($"FROM {expectedDocumentFromFragment}");
+        keyset.Plan.PageDocumentIdSql.Should().Contain($"FROM {expectedDescriptorFromFragment}");
+        keyset.Plan.PageDocumentIdSql.Should().Contain(expectedDocumentJoinFragment);
         keyset.Plan.PageDocumentIdSql.Should().Contain(expectedIdPredicateFragment);
-        keyset.Plan.PageDocumentIdSql.Should().NotContain($"INNER JOIN {unexpectedDocumentJoinFragment}");
-        keyset.Plan.PageDocumentIdSql.Should().NotContain("doc.");
-        keyset.Plan.PageDocumentIdSql.Should().NotContain("Descriptor");
+        keyset.Plan.PageDocumentIdSql.Should().NotContain(unexpectedDescriptorJoinFragment);
 
         keyset.Plan.TotalCountSql.Should().NotBeNull();
-        keyset.Plan.TotalCountSql.Should().Contain($"FROM {expectedDocumentFromFragment}");
+        keyset.Plan.TotalCountSql.Should().Contain($"FROM {expectedDescriptorFromFragment}");
+        keyset.Plan.TotalCountSql.Should().Contain(expectedDocumentJoinFragment);
         keyset.Plan.TotalCountSql.Should().Contain(expectedIdPredicateFragment);
-        keyset.Plan.TotalCountSql.Should().NotContain($"INNER JOIN {unexpectedDocumentJoinFragment}");
-        keyset.Plan.TotalCountSql.Should().NotContain("doc.");
-        keyset.Plan.TotalCountSql.Should().NotContain("Descriptor");
+        keyset.Plan.TotalCountSql.Should().NotContain(unexpectedDescriptorJoinFragment);
         keyset.Plan.TotalCountSql.Should().NotContain("@offset");
         keyset.Plan.TotalCountSql.Should().NotContain("@limit");
 
@@ -454,8 +472,8 @@ public class Given_DescriptorQueryPageKeysetPlanner
     }
 
     [Test]
-    [TestCase(SqlDialect.Pgsql, "d.\"CodeValue\" = @codeValue")]
-    [TestCase(SqlDialect.Mssql, "d.[CodeValue] COLLATE Latin1_General_100_BIN2 = @codeValue")]
+    [TestCase(SqlDialect.Pgsql, "r.\"CodeValue\" = @codeValue")]
+    [TestCase(SqlDialect.Mssql, "r.[CodeValue] COLLATE Latin1_General_100_BIN2 = @codeValue")]
     public void It_should_preserve_mixed_case_string_filter_values_and_reuse_them_in_total_count_sql(
         SqlDialect dialect,
         string expectedPredicateFragment
@@ -478,7 +496,9 @@ public class Given_DescriptorQueryPageKeysetPlanner
                     ),
                 ]
             ),
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: true, MaximumPageSize: 500)
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: true, MaximumPageSize: 500)
+            )
         );
 
         keyset.ParameterValues["codeValue"].Should().Be("MiXeDCaSeValue");
@@ -499,7 +519,35 @@ public class Given_DescriptorQueryPageKeysetPlanner
                     new RelationalQueryPreprocessingOutcome.EmptyPage("no matches"),
                     []
                 ),
-                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+                new CollectionPaging.Traditional(
+                    new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+                )
+            );
+
+        act.Should()
+            .Throw<ArgumentException>()
+            .WithParameterName("preprocessingResult")
+            .WithMessage(
+                "Descriptor query page planning requires preprocessing results in the continue state.*"
+            );
+    }
+
+    [Test]
+    public void It_should_reject_non_continue_preprocessing_outcomes_for_the_candidate_entry_point()
+    {
+        // The candidate entry point carries the same caller contract as the paged one: a consumer that
+        // reaches an empty preprocessing outcome must short-circuit the page itself rather than ask for a
+        // candidate relation. There is no Try overload to fall back on, so the contract is asserted here.
+        var planner = new DescriptorQueryPageKeysetPlanner(SqlDialect.Pgsql);
+
+        var act = () =>
+            planner.PlanCandidates(
+                RelationalAccessTestData.CreateMappingSet(_requestResource),
+                _descriptorResource,
+                new DescriptorQueryPreprocessingResult(
+                    new RelationalQueryPreprocessingOutcome.EmptyPage("no matches"),
+                    []
+                )
             );
 
         act.Should()
@@ -523,23 +571,22 @@ public class Given_DescriptorQueryPageKeysetPlanner
             RelationalAccessTestData.CreateMappingSet(_requestResource),
             _descriptorResource,
             new DescriptorQueryPreprocessingResult(new RelationalQueryPreprocessingOutcome.Continue(), []),
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: true, MaximumPageSize: 500),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: true, MaximumPageSize: 500)
+            ),
             authorization
         );
 
+        // The namespace check binds to the dms.Descriptor root itself: no self-join.
+        keyset.Plan.PageDocumentIdSql.Should().NotContain("INNER JOIN");
         keyset
             .Plan.PageDocumentIdSql.Should()
-            .Contain("INNER JOIN \"dms\".\"Descriptor\" d ON d.\"DocumentId\" = r.\"DocumentId\"");
-        keyset
-            .Plan.PageDocumentIdSql.Should()
-            .Contain("(d.\"Namespace\" IS NOT NULL AND d.\"Namespace\" LIKE ANY(@namespacePrefixes))");
+            .Contain("(r.\"Namespace\" IS NOT NULL AND r.\"Namespace\" LIKE ANY(@namespacePrefixes))");
         keyset.Plan.TotalCountSql.Should().NotBeNull();
-        keyset
-            .Plan.TotalCountSql!.Should()
-            .Contain("INNER JOIN \"dms\".\"Descriptor\" d ON d.\"DocumentId\" = r.\"DocumentId\"");
+        keyset.Plan.TotalCountSql!.Should().NotContain("INNER JOIN");
         keyset
             .Plan.TotalCountSql.Should()
-            .Contain("(d.\"Namespace\" IS NOT NULL AND d.\"Namespace\" LIKE ANY(@namespacePrefixes))");
+            .Contain("(r.\"Namespace\" IS NOT NULL AND r.\"Namespace\" LIKE ANY(@namespacePrefixes))");
     }
 
     [Test]
@@ -555,25 +602,26 @@ public class Given_DescriptorQueryPageKeysetPlanner
             RelationalAccessTestData.CreateMappingSet(_requestResource),
             _descriptorResource,
             new DescriptorQueryPreprocessingResult(new RelationalQueryPreprocessingOutcome.Continue(), []),
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: true, MaximumPageSize: 500),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: true, MaximumPageSize: 500)
+            ),
             authorization
         );
 
-        keyset
-            .Plan.PageDocumentIdSql.Should()
-            .Contain("INNER JOIN [dms].[Descriptor] d ON d.[DocumentId] = r.[DocumentId]");
+        // The namespace check binds to the dms.Descriptor root itself: no self-join.
+        keyset.Plan.PageDocumentIdSql.Should().NotContain("INNER JOIN");
         keyset
             .Plan.PageDocumentIdSql.Should()
             .Contain(
-                "(d.[Namespace] IS NOT NULL AND ("
-                    + "d.[Namespace] LIKE @namespacePrefixes_0 ESCAPE '\\' "
-                    + "OR d.[Namespace] LIKE @namespacePrefixes_1 ESCAPE '\\'"
+                "(r.[Namespace] IS NOT NULL AND ("
+                    + "r.[Namespace] LIKE @namespacePrefixes_0 ESCAPE '\\' "
+                    + "OR r.[Namespace] LIKE @namespacePrefixes_1 ESCAPE '\\'"
                     + "))"
             );
         keyset.Plan.TotalCountSql.Should().NotBeNull();
         keyset
             .Plan.TotalCountSql!.Should()
-            .Contain("(d.[Namespace] IS NOT NULL AND (d.[Namespace] LIKE @namespacePrefixes_0");
+            .Contain("(r.[Namespace] IS NOT NULL AND (r.[Namespace] LIKE @namespacePrefixes_0");
     }
 
     [Test]
@@ -589,7 +637,9 @@ public class Given_DescriptorQueryPageKeysetPlanner
             RelationalAccessTestData.CreateMappingSet(_requestResource),
             _descriptorResource,
             new DescriptorQueryPreprocessingResult(new RelationalQueryPreprocessingOutcome.Continue(), []),
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+            ),
             authorization
         );
 
@@ -615,7 +665,9 @@ public class Given_DescriptorQueryPageKeysetPlanner
             RelationalAccessTestData.CreateMappingSet(_requestResource),
             _descriptorResource,
             new DescriptorQueryPreprocessingResult(new RelationalQueryPreprocessingOutcome.Continue(), []),
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+            ),
             authorization
         );
 
@@ -645,14 +697,17 @@ public class Given_DescriptorQueryPageKeysetPlanner
                     ),
                 ]
             ),
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+            ),
             authorization
         );
 
-        keyset.Plan.PageDocumentIdSql.Should().Contain("d.\"CodeValue\" = @codeValue");
+        keyset.Plan.PageDocumentIdSql.Should().NotContain("INNER JOIN");
+        keyset.Plan.PageDocumentIdSql.Should().Contain("r.\"CodeValue\" = @codeValue");
         keyset
             .Plan.PageDocumentIdSql.Should()
-            .Contain("(d.\"Namespace\" IS NOT NULL AND d.\"Namespace\" LIKE ANY(@namespacePrefixes))");
+            .Contain("(r.\"Namespace\" IS NOT NULL AND r.\"Namespace\" LIKE ANY(@namespacePrefixes))");
     }
 
     [Test]
@@ -663,7 +718,9 @@ public class Given_DescriptorQueryPageKeysetPlanner
             RelationalAccessTestData.CreateMappingSet(_requestResource),
             _descriptorResource,
             new DescriptorQueryPreprocessingResult(new RelationalQueryPreprocessingOutcome.Continue(), []),
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+            )
         );
 
         keyset.Plan.PageDocumentIdSql.Should().NotContain("Namespace");
@@ -682,7 +739,7 @@ public class Given_DescriptorQueryPageKeysetPlanner
         "r.[ContentVersion] >= @minChangeVersion",
         "r.[ContentVersion] <= @maxChangeVersion"
     )]
-    public void It_should_filter_document_content_version_alongside_the_resource_key_predicate(
+    public void It_should_filter_the_content_version_mirror_alongside_the_resource_key_predicate(
         SqlDialect dialect,
         string expectedMinPredicateFragment,
         string expectedMaxPredicateFragment
@@ -694,7 +751,9 @@ public class Given_DescriptorQueryPageKeysetPlanner
             RelationalAccessTestData.CreateMappingSet(_requestResource),
             _descriptorResource,
             new DescriptorQueryPreprocessingResult(new RelationalQueryPreprocessingOutcome.Continue(), []),
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: true, MaximumPageSize: 500),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: true, MaximumPageSize: 500)
+            ),
             changeVersionRange: new ChangeVersionRange(100L, 200L)
         );
 
@@ -719,7 +778,9 @@ public class Given_DescriptorQueryPageKeysetPlanner
             RelationalAccessTestData.CreateMappingSet(_requestResource),
             _descriptorResource,
             new DescriptorQueryPreprocessingResult(new RelationalQueryPreprocessingOutcome.Continue(), []),
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+            ),
             changeVersionRange: new ChangeVersionRange(100L, null)
         );
 
@@ -738,7 +799,9 @@ public class Given_DescriptorQueryPageKeysetPlanner
             RelationalAccessTestData.CreateMappingSet(_requestResource),
             _descriptorResource,
             new DescriptorQueryPreprocessingResult(new RelationalQueryPreprocessingOutcome.Continue(), []),
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+            ),
             changeVersionRange: new ChangeVersionRange(null, 200L)
         );
 
@@ -752,11 +815,8 @@ public class Given_DescriptorQueryPageKeysetPlanner
     public void It_should_leave_descriptor_page_sql_unchanged_when_no_change_version_bounds_are_supplied()
     {
         var planner = new DescriptorQueryPageKeysetPlanner(SqlDialect.Pgsql);
-        var paginationParameters = new PaginationParameters(
-            Limit: 25,
-            Offset: 0,
-            TotalCount: true,
-            MaximumPageSize: 500
+        var paginationParameters = new CollectionPaging.Traditional(
+            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: true, MaximumPageSize: 500)
         );
         var withoutRange = planner.Plan(
             RelationalAccessTestData.CreateMappingSet(_requestResource),
@@ -782,6 +842,58 @@ public class Given_DescriptorQueryPageKeysetPlanner
     }
 
     [Test]
+    public void It_should_fold_the_change_version_window_into_a_content_version_cursor_pages_bounds()
+    {
+        // The descriptor page's composite index leads with ResourceKeyId and continues into the anchor,
+        // so a second range on the anchor is left residual on the seek the same way it is for a regular
+        // resource: the page reads from the window floor and discards everything below its own.
+        var planner = new DescriptorQueryPageKeysetPlanner(SqlDialect.Pgsql);
+
+        var keyset = planner.Plan(
+            RelationalAccessTestData.CreateMappingSet(_requestResource),
+            _descriptorResource,
+            new DescriptorQueryPreprocessingResult(new RelationalQueryPreprocessingOutcome.Continue(), []),
+            new CollectionPaging.Cursor(new CursorRange(150L, long.MaxValue), new PageSize(25)),
+            changeVersionRange: new ChangeVersionRange(100L, 200L),
+            orderingMode: PageOrderingMode.ContentVersion
+        );
+
+        keyset.ParameterValues["cursorMin"].Should().Be(150L);
+        keyset.ParameterValues["cursorMax"].Should().Be(200L);
+        keyset
+            .ParameterValues.Keys.Should()
+            .NotContain("minChangeVersion")
+            .And.NotContain("maxChangeVersion");
+
+        keyset.Plan.PageDocumentIdSql.Should().Contain("r.\"ContentVersion\" >= @cursorMin");
+        keyset.Plan.PageDocumentIdSql.Should().Contain("r.\"ContentVersion\" <= @cursorMax");
+        keyset.Plan.PageDocumentIdSql.Should().NotContain("@minChangeVersion");
+        keyset.Plan.PageDocumentIdSql.Should().NotContain("@maxChangeVersion");
+        keyset.Plan.PageDocumentIdSql.Should().Contain("ResourceKeyId");
+    }
+
+    [Test]
+    public void It_should_keep_both_ranges_for_a_document_id_anchored_descriptor_cursor_page()
+    {
+        var planner = new DescriptorQueryPageKeysetPlanner(SqlDialect.Pgsql);
+
+        var keyset = planner.Plan(
+            RelationalAccessTestData.CreateMappingSet(_requestResource),
+            _descriptorResource,
+            new DescriptorQueryPreprocessingResult(new RelationalQueryPreprocessingOutcome.Continue(), []),
+            new CollectionPaging.Cursor(new CursorRange(150L, 250L), new PageSize(25)),
+            changeVersionRange: new ChangeVersionRange(100L, 200L),
+            orderingMode: PageOrderingMode.DocumentId
+        );
+
+        keyset.ParameterValues["cursorMin"].Should().Be(150L);
+        keyset.ParameterValues["cursorMax"].Should().Be(250L);
+        keyset.ParameterValues["minChangeVersion"].Should().Be(100L);
+        keyset.ParameterValues["maxChangeVersion"].Should().Be(200L);
+        keyset.Plan.PageDocumentIdSql.Should().Contain("r.\"ContentVersion\" >= @minChangeVersion");
+    }
+
+    [Test]
     public void It_should_compose_the_change_version_window_with_namespace_authorization_for_descriptor_queries()
     {
         var planner = new DescriptorQueryPageKeysetPlanner(SqlDialect.Pgsql);
@@ -791,7 +903,9 @@ public class Given_DescriptorQueryPageKeysetPlanner
             RelationalAccessTestData.CreateMappingSet(_requestResource),
             _descriptorResource,
             new DescriptorQueryPreprocessingResult(new RelationalQueryPreprocessingOutcome.Continue(), []),
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+            ),
             authorization,
             new ChangeVersionRange(100L, 200L)
         );
@@ -800,7 +914,7 @@ public class Given_DescriptorQueryPageKeysetPlanner
         keyset.Plan.PageDocumentIdSql.Should().Contain("r.\"ContentVersion\" <= @maxChangeVersion");
         keyset
             .Plan.PageDocumentIdSql.Should()
-            .Contain("(d.\"Namespace\" IS NOT NULL AND d.\"Namespace\" LIKE ANY(@namespacePrefixes))");
+            .Contain("(r.\"Namespace\" IS NOT NULL AND r.\"Namespace\" LIKE ANY(@namespacePrefixes))");
         keyset.ParameterValues["minChangeVersion"].Should().Be(100L);
         keyset.ParameterValues["maxChangeVersion"].Should().Be(200L);
         keyset.ParameterValues.Should().ContainKey("namespacePrefixes");
@@ -821,10 +935,287 @@ public class Given_DescriptorQueryPageKeysetPlanner
                     new RelationalQueryPreprocessingOutcome.Continue(),
                     []
                 ),
-                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+                new CollectionPaging.Traditional(
+                    new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+                )
             );
 
         act.Should().Throw<KeyNotFoundException>().WithMessage("*Other-Project.SchoolTypeDescriptor*");
+    }
+
+    [Test]
+    public void It_should_give_every_candidate_mode_the_same_descriptor_root_filters_and_filter_values()
+    {
+        var planner = new DescriptorQueryPageKeysetPlanner(SqlDialect.Pgsql);
+        var authorization = CreateNamespaceAuthorization(SqlDialect.Pgsql, ["uri://ed-fi.org/"]);
+        var changeVersionRange = new ChangeVersionRange(100L, 200L);
+
+        var traditional = planner.Plan(
+            RelationalAccessTestData.CreateMappingSet(_requestResource),
+            _descriptorResource,
+            CreateParityPreprocessingResult(),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 75, TotalCount: false, MaximumPageSize: 500)
+            ),
+            authorization,
+            changeVersionRange
+        );
+        var cursor = planner.Plan(
+            RelationalAccessTestData.CreateMappingSet(_requestResource),
+            _descriptorResource,
+            CreateParityPreprocessingResult(),
+            new CollectionPaging.Cursor(new CursorRange(10L, 90L), new PageSize(25)),
+            authorization,
+            changeVersionRange
+        );
+        var unpaged = planner.PlanCandidates(
+            RelationalAccessTestData.CreateMappingSet(_requestResource),
+            _descriptorResource,
+            CreateParityPreprocessingResult(),
+            authorization,
+            changeVersionRange
+        );
+
+        string[] filterParameterNames =
+        [
+            "resourceKeyId",
+            "namespace",
+            "minChangeVersion",
+            "maxChangeVersion",
+        ];
+
+        foreach (var filterParameterName in filterParameterNames)
+        {
+            cursor
+                .ParameterValues[filterParameterName]
+                .Should()
+                .Be(traditional.ParameterValues[filterParameterName]);
+            unpaged
+                .ParameterValues[filterParameterName]
+                .Should()
+                .Be(traditional.ParameterValues[filterParameterName]);
+        }
+
+        // The descriptor root and its mandatory ResourceKeyId discriminator survive in every mode.
+        foreach (var plan in new[] { traditional.Plan, cursor.Plan, unpaged.Plan })
+        {
+            plan.PageDocumentIdSql.Should().Contain("FROM \"dms\".\"Descriptor\" r");
+            plan.PageDocumentIdSql.Should().Contain("r.\"ResourceKeyId\" = @resourceKeyId");
+            plan.PageDocumentIdSql.Should().Contain("r.\"Namespace\"");
+            plan.PageDocumentIdSql.Should().Contain("r.\"ContentVersion\" >= @minChangeVersion");
+            plan.PageDocumentIdSql.Should().NotContain("DISTINCT");
+        }
+    }
+
+    [Test]
+    public void It_should_bind_the_descriptor_cursor_range_and_page_size_as_int64_values()
+    {
+        var planner = new DescriptorQueryPageKeysetPlanner(SqlDialect.Mssql);
+
+        var cursor = planner.Plan(
+            RelationalAccessTestData.CreateMappingSet(_requestResource),
+            _descriptorResource,
+            CreateParityPreprocessingResult(),
+            new CollectionPaging.Cursor(new CursorRange(10L, long.MaxValue), new PageSize(1))
+        );
+
+        cursor.ParameterValues["cursorMin"].Should().Be(10L);
+        cursor.ParameterValues["cursorMax"].Should().Be(long.MaxValue);
+        cursor.ParameterValues["pageSize"].Should().Be(1L);
+        cursor.ParameterValues.Keys.Should().NotContain("offset").And.NotContain("limit");
+        cursor.Plan.PageDocumentIdSql.Should().StartWith("SELECT TOP (@pageSize) r.[DocumentId]");
+    }
+
+    [Test]
+    public void It_should_emit_no_ordering_for_the_unpaged_descriptor_candidate_relation()
+    {
+        var planner = new DescriptorQueryPageKeysetPlanner(SqlDialect.Mssql);
+
+        var unpaged = planner.PlanCandidates(
+            RelationalAccessTestData.CreateMappingSet(_requestResource),
+            _descriptorResource,
+            CreateParityPreprocessingResult()
+        );
+
+        unpaged.Plan.PageDocumentIdSql.Should().NotContain("ORDER BY");
+        unpaged.Plan.PageDocumentIdSql.Should().NotContain("OFFSET");
+        unpaged.Plan.PageDocumentIdSql.Should().NotContain("TOP (");
+    }
+
+    [TestCase(PageOrderingMode.DocumentId, "r.[DocumentId]")]
+    [TestCase(PageOrderingMode.ContentVersion, "r.[ContentVersion]")]
+    public void It_should_compile_the_unpaged_descriptor_candidate_relation_against_the_requested_anchor(
+        PageOrderingMode orderingMode,
+        string expectedProjection
+    )
+    {
+        // Descriptor partition boundaries are cut on whatever this relation projects, so the anchor the
+        // request resolved has to survive the trip through the planner. Discarding it here still
+        // compiles and still selects the right rows; it just cuts boundaries on a key no descriptor page
+        // of the same request seeks on, which a client cannot replay.
+        var planner = new DescriptorQueryPageKeysetPlanner(SqlDialect.Mssql);
+
+        var unpaged = planner.PlanCandidates(
+            RelationalAccessTestData.CreateMappingSet(_requestResource),
+            _descriptorResource,
+            CreateParityPreprocessingResult(),
+            changeVersionRange: new ChangeVersionRange(100L, 200L),
+            orderingMode: orderingMode
+        );
+
+        unpaged.Plan.PageDocumentIdSql.Should().StartWith($"SELECT {expectedProjection}");
+    }
+
+    [TestCase("pageSize")]
+    [TestCase("cursorMin")]
+    [TestCase("cursorMax")]
+    [TestCase("number")]
+    [TestCase("minimumPartitionSize")]
+    public void It_should_allocate_traditional_descriptor_filter_parameter_names_unsuffixed_for_names_no_traditional_page_emits(
+        string queryFieldName
+    )
+    {
+        // Traditional descriptor page selection emits only offset and limit, so a descriptor field whose
+        // sanitized name matches a cursor or partition parameter has nothing to collide with and must
+        // keep its plain name.
+        var planner = new DescriptorQueryPageKeysetPlanner(SqlDialect.Pgsql);
+
+        var traditional = planner.Plan(
+            RelationalAccessTestData.CreateMappingSet(_requestResource),
+            _descriptorResource,
+            CreateNamedFieldPreprocessingResult(queryFieldName),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+            )
+        );
+
+        traditional.ParameterValues.Should().ContainKey(queryFieldName);
+        traditional.Plan.PageDocumentIdSql.Should().Contain($"r.\"Namespace\" = @{queryFieldName}");
+    }
+
+    [TestCase("cursorMin")]
+    [TestCase("pageSize")]
+    public void It_should_disambiguate_descriptor_cursor_filter_parameter_names_that_actually_collide(
+        string queryFieldName
+    )
+    {
+        var planner = new DescriptorQueryPageKeysetPlanner(SqlDialect.Pgsql);
+
+        var cursor = planner.Plan(
+            RelationalAccessTestData.CreateMappingSet(_requestResource),
+            _descriptorResource,
+            CreateNamedFieldPreprocessingResult(queryFieldName),
+            new CollectionPaging.Cursor(new CursorRange(1L, 100L), new PageSize(25))
+        );
+
+        // The descriptor filter is renamed out of the way; the plain name stays with the cursor
+        // parameter that actually owns it in this mode.
+        var namespaceFilterName = NamespaceFilterParameterName(cursor.Plan);
+
+        namespaceFilterName.Should().NotBe(queryFieldName);
+        cursor.Plan.PageDocumentIdSql.Should().Contain($"r.\"Namespace\" = @{namespaceFilterName}");
+        cursor.ParameterValues.Should().ContainKeys("cursorMin", "cursorMax", "pageSize");
+    }
+
+    [Test]
+    public void It_should_keep_cross_mode_descriptor_filter_parity_semantic_when_a_filter_name_collides()
+    {
+        // Cross-mode parity is the same predicate over the same column bound to the same value, not the
+        // same parameter token. A descriptor filter sanitized to a name only cursor selection emits keeps
+        // its plain name in every mode that does not emit it.
+        var planner = new DescriptorQueryPageKeysetPlanner(SqlDialect.Pgsql);
+        var preprocessingResult = CreateNamedFieldPreprocessingResult("pageSize");
+
+        var traditional = planner.Plan(
+            RelationalAccessTestData.CreateMappingSet(_requestResource),
+            _descriptorResource,
+            preprocessingResult,
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 75, TotalCount: false, MaximumPageSize: 500)
+            )
+        );
+        var cursor = planner.Plan(
+            RelationalAccessTestData.CreateMappingSet(_requestResource),
+            _descriptorResource,
+            preprocessingResult,
+            new CollectionPaging.Cursor(new CursorRange(10L, 90L), new PageSize(25))
+        );
+        var unpaged = planner.PlanCandidates(
+            RelationalAccessTestData.CreateMappingSet(_requestResource),
+            _descriptorResource,
+            preprocessingResult
+        );
+
+        var traditionalFilterName = NamespaceFilterParameterName(traditional.Plan);
+        var cursorFilterName = NamespaceFilterParameterName(cursor.Plan);
+        var unpagedFilterName = NamespaceFilterParameterName(unpaged.Plan);
+
+        // Only cursor selection emits pageSize, so only cursor selection moves the filter off that name.
+        traditionalFilterName.Should().Be("pageSize");
+        unpagedFilterName.Should().Be("pageSize");
+        cursorFilterName.Should().NotBe("pageSize");
+        cursor.ParameterValues["pageSize"].Should().Be(25L);
+
+        // Same column, same operator, same bound value under whichever name each mode allocated.
+        var expectedFilterValue = traditional.ParameterValues[traditionalFilterName];
+
+        expectedFilterValue.Should().Be("uri://ed-fi.org/descriptor#Alternative");
+        cursor.ParameterValues[cursorFilterName].Should().Be(expectedFilterValue);
+        unpaged.ParameterValues[unpagedFilterName].Should().Be(expectedFilterValue);
+
+        traditional.Plan.PageDocumentIdSql.Should().Contain($"r.\"Namespace\" = @{traditionalFilterName}");
+        cursor.Plan.PageDocumentIdSql.Should().Contain($"r.\"Namespace\" = @{cursorFilterName}");
+        unpaged.Plan.PageDocumentIdSql.Should().Contain($"r.\"Namespace\" = @{unpagedFilterName}");
+    }
+
+    /// <summary>
+    /// Returns the name allocated to the descriptor field filter, which is every filter parameter other
+    /// than the mandatory <c>ResourceKeyId</c> discriminator the descriptor planner always emits.
+    /// </summary>
+    private static string NamespaceFilterParameterName(PageDocumentIdSqlPlan plan)
+    {
+        return plan
+            .PageParametersInOrder.Single(parameter =>
+                parameter.Role is QuerySqlParameterRole.Filter
+                && !string.Equals(parameter.ParameterName, "resourceKeyId", StringComparison.Ordinal)
+            )
+            .ParameterName;
+    }
+
+    private static DescriptorQueryPreprocessingResult CreateNamedFieldPreprocessingResult(
+        string queryFieldName
+    )
+    {
+        return new DescriptorQueryPreprocessingResult(
+            new RelationalQueryPreprocessingOutcome.Continue(),
+            [
+                CreateElement(
+                    queryFieldName,
+                    $"$.{queryFieldName}",
+                    "uri://ed-fi.org/descriptor#Alternative",
+                    "string",
+                    new DescriptorQueryFieldTarget.Namespace(new DbColumnName("Namespace")),
+                    new PreprocessedDescriptorQueryValue.Raw("uri://ed-fi.org/descriptor#Alternative")
+                ),
+            ]
+        );
+    }
+
+    private static DescriptorQueryPreprocessingResult CreateParityPreprocessingResult()
+    {
+        return new DescriptorQueryPreprocessingResult(
+            new RelationalQueryPreprocessingOutcome.Continue(),
+            [
+                CreateElement(
+                    "namespace",
+                    "$.namespace",
+                    "uri://ed-fi.org/descriptor#Alternative",
+                    "string",
+                    new DescriptorQueryFieldTarget.Namespace(new DbColumnName("Namespace")),
+                    new PreprocessedDescriptorQueryValue.Raw("uri://ed-fi.org/descriptor#Alternative")
+                ),
+            ]
+        );
     }
 
     private static PageDocumentIdAuthorizationSpec CreateNamespaceAuthorization(

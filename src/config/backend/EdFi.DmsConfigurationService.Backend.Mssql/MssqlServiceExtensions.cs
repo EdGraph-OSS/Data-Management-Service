@@ -21,6 +21,7 @@ public static class MssqlServiceExtensions
     public static IServiceCollection AddMssqlDatastore(this IServiceCollection services)
     {
         services.AddTransient<IVendorRepository, VendorRepository>();
+        services.AddTransient<IOwnershipTokenRepository, OwnershipTokenRepository>();
         services.AddTransient<IApplicationRepository, ApplicationRepository>();
         services.AddTransient<IApiClientRepository, ApiClientRepository>();
         services.AddTransient<ITenantRepository, TenantRepository>();
@@ -38,6 +39,7 @@ public static class MssqlServiceExtensions
             ClaimsDataLoader.ResourceClaimMetadataRepository
         >();
         services.AddTransient<IClaimSetDataProvider, ClaimSetDataProvider>();
+        services.AddTransient<IApplicationLockManager, MssqlApplicationLockManager>();
         return services;
     }
 }

@@ -140,6 +140,20 @@ public class Given_A_Postgresql_Relational_Delete_Authorization_With_A_Synthetic
             100,
             []
         ),
+        new(
+            new DocumentUuid(Guid.Parse("88888888-2000-0000-0000-000000000013")),
+            213,
+            "delete-one-command",
+            100,
+            []
+        ),
+        new(
+            new DocumentUuid(Guid.Parse("88888888-2000-0000-0000-000000000014")),
+            214,
+            "delete-one-command-wildcard",
+            100,
+            []
+        ),
     ];
 
     private static readonly AuthorizationRootChildSeed _directClaimRootChildSeed = new(
@@ -608,8 +622,14 @@ public class Given_A_Postgresql_Relational_Delete_Authorization_With_A_Synthetic
         );
     }
 
+    /// <summary>
+    /// OwnershipBased is the only strategy in the relationship classifier's known-but-not-enabled set, so
+    /// once Delete is enforced this composition plans instead of returning a 501. These rows were seeded
+    /// without an ownership token, which is auth.md 2.14 — and the row assertions below are the point: a
+    /// denial must leave the row exactly where it was.
+    /// </summary>
     [Test]
-    public async Task It_returns_501_and_security_configuration_failures_before_deleting()
+    public async Task It_denies_and_reports_security_configuration_failures_before_deleting()
     {
         var knownUnsupportedSeed = _authorizationRootChildSeeds[7];
 
@@ -625,13 +645,11 @@ public class Given_A_Postgresql_Relational_Delete_Authorization_With_A_Synthetic
             RelationshipAuthorizationCrudTestSupport.EdOrgOnlyPlusKnownUnsupportedStrategyNames
         );
 
-        var notImplemented = knownUnsupportedResult
+        knownUnsupportedResult
             .Should()
-            .BeOfType<DeleteResult.DeleteFailureNotImplemented>()
-            .Subject;
-        notImplemented
-            .FailureMessage.Should()
-            .Contain(RelationshipAuthorizationCrudTestSupport.OwnershipBased);
+            .BeOfType<DeleteResult.DeleteFailureOwnershipNotAuthorized>()
+            .Which.OwnershipFailure.FailureKind.Should()
+            .Be(OwnershipAuthorizationFailureKind.StoredOwnershipTokenUninitialized);
         var securityConfiguration = securityConfigurationResult
             .Should()
             .BeOfType<DeleteResult.DeleteFailureSecurityConfiguration>()
@@ -713,6 +731,49 @@ public class Given_A_Postgresql_Relational_Delete_Authorization_With_A_Synthetic
 
         result.Should().BeOfType<DeleteResult.DeleteSuccess>();
         _context.AssertDeleteWithIfMatchSharedGuardedSession();
+        await AssertRowsAsync(
+            RelationshipAuthorizationCrudTestSupport.RootAndChildEdOrgResourceName,
+            seed.DocumentUuid,
+            0
+        );
+    }
+
+    [Test]
+    public async Task It_authorizes_and_deletes_in_one_command_without_a_precondition()
+    {
+        var seed = _authorizationRootChildSeeds[11];
+
+        var result = await DeleteRootChildAsync(
+            seed,
+            RelationshipAuthorizationCrudTestSupport.EdOrgOnlyStrategyNames
+        );
+
+        // Nothing has to be decided in process between observing the target and modifying it, so capture,
+        // authorization and both deletes share one command and one round trip.
+        result.Should().BeOfType<DeleteResult.DeleteSuccess>();
+        _context.AssertDeleteIsOneCommittedCommand();
+        await AssertRowsAsync(
+            RelationshipAuthorizationCrudTestSupport.RootAndChildEdOrgResourceName,
+            seed.DocumentUuid,
+            0
+        );
+    }
+
+    [Test]
+    public async Task It_authorizes_and_deletes_in_one_command_for_a_wildcard_if_match()
+    {
+        var seed = _authorizationRootChildSeeds[12];
+
+        var result = await DeleteRootChildAsync(
+            seed,
+            RelationshipAuthorizationCrudTestSupport.EdOrgOnlyStrategyNames,
+            ifMatch: "*"
+        );
+
+        // A wildcard is an existence-only precondition, and the capture already answers existence, so it
+        // needs no in-process compare and stays on the one-command path.
+        result.Should().BeOfType<DeleteResult.DeleteSuccess>();
+        _context.AssertDeleteIsOneCommittedCommand();
         await AssertRowsAsync(
             RelationshipAuthorizationCrudTestSupport.RootAndChildEdOrgResourceName,
             seed.DocumentUuid,

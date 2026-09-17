@@ -108,7 +108,13 @@ internal static class SecurityConfigurationFailureLogger
     {
         string operation = requestInfo.Method switch
         {
-            RequestMethod.GET when requestInfo.PathComponents.HasDocumentUuidSegment => "GetById",
+            RequestMethod.GET when requestInfo.PathComponents.Operation is ResourcePathOperation.ById =>
+                "GetById",
+            // Named apart from GetMany because the two operations answer different requests over the
+            // same authorized candidate relation, and a security-configuration failure has to say which
+            // one the client asked for.
+            RequestMethod.GET when requestInfo.PathComponents.Operation is ResourcePathOperation.Partitions =>
+                "GetPartitions",
             RequestMethod.GET => "GetMany",
             RequestMethod.POST => "Create",
             RequestMethod.PUT => "Update",

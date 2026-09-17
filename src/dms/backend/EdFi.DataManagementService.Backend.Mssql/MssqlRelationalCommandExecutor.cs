@@ -7,7 +7,7 @@ using System.Data.Common;
 using EdFi.DataManagementService.Backend;
 using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Core.Configuration;
-using Microsoft.Data.SqlClient;
+using EdFi.DataManagementService.Core.External.Backend;
 using Microsoft.Extensions.Logging;
 
 namespace EdFi.DataManagementService.Backend.Mssql;
@@ -16,52 +16,51 @@ internal sealed class MssqlRelationalCommandExecutor : IRelationalCommandExecuto
 {
     public SqlDialect Dialect => SqlDialect.Mssql;
 
-    private readonly Func<CancellationToken, Task<DbConnection>> _openConnectionAsync;
+    private readonly Func<CancellationToken, Task<MssqlLeasedConnection>> _openConnectionAsync;
     private readonly ILogger<MssqlRelationalCommandExecutor> _logger;
 
     public MssqlRelationalCommandExecutor(
         IDataStoreSelection dataStoreSelection,
-        ILogger<MssqlRelationalCommandExecutor> logger
-    )
-        : this(dataStoreSelection, connectionString => new SqlConnection(connectionString), logger) { }
-
-    internal MssqlRelationalCommandExecutor(
-        IDataStoreSelection dataStoreSelection,
-        Func<string, DbConnection> createConnection,
+        IMssqlConnectionAcquisition acquisition,
         ILogger<MssqlRelationalCommandExecutor> logger
     )
     {
         ArgumentNullException.ThrowIfNull(dataStoreSelection);
-        ArgumentNullException.ThrowIfNull(createConnection);
+        ArgumentNullException.ThrowIfNull(acquisition);
 
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _openConnectionAsync = async cancellationToken =>
-        {
-            var selectedInstance = dataStoreSelection.GetSelectedDataStore();
-            var connectionString = selectedInstance.ConnectionString;
-
-            if (string.IsNullOrWhiteSpace(connectionString))
-            {
-                throw new InvalidOperationException(
-                    $"Selected data store '{selectedInstance.Id}' does not have a valid connection string."
-                );
-            }
-
-            var connection = createConnection(connectionString);
-            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-
-            return connection;
-        };
+        _openConnectionAsync = cancellationToken =>
+            MssqlSeamConnection.OpenAsync(dataStoreSelection, acquisition, logger, cancellationToken);
     }
 
+    /// <summary>
+    /// Test seam: an injected open, guarded exactly as the production one is.
+    /// </summary>
+    /// <param name="targetKind">
+    /// The kind the guard classifies against. Primary by default, which is what every existing caller
+    /// means, so a test that cares about the snapshot boundary is the only one that names it.
+    /// </param>
     internal MssqlRelationalCommandExecutor(
         Func<CancellationToken, Task<DbConnection>> openConnectionAsync,
-        ILogger<MssqlRelationalCommandExecutor> logger
+        ILogger<MssqlRelationalCommandExecutor> logger,
+        EffectiveTargetKind targetKind = EffectiveTargetKind.Primary
     )
     {
-        _openConnectionAsync =
-            openConnectionAsync ?? throw new ArgumentNullException(nameof(openConnectionAsync));
+        ArgumentNullException.ThrowIfNull(openConnectionAsync);
+
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _openConnectionAsync = cancellationToken =>
+            ConnectionAcquisition.GuardAsync(
+                async () =>
+                    MssqlLeasedConnection.WithoutLease(
+                        await openConnectionAsync(cancellationToken).ConfigureAwait(false)
+                    ),
+                targetKind,
+                MssqlConnectionAcquisitionFailure.IsExpected,
+                MssqlConnectionAcquisitionFailure.Describe,
+                logger,
+                cancellationToken
+            );
     }
 
     public async Task<TResult> ExecuteReaderAsync<TResult>(
@@ -78,7 +77,8 @@ internal sealed class MssqlRelationalCommandExecutor : IRelationalCommandExecuto
             command.Parameters.Count
         );
 
-        await using var connection = await _openConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var leased = await _openConnectionAsync(cancellationToken).ConfigureAwait(false);
+        DbConnection connection = leased.Connection;
         await using var dbCommand = connection.CreateCommand();
         dbCommand.CommandText = command.CommandText;
 

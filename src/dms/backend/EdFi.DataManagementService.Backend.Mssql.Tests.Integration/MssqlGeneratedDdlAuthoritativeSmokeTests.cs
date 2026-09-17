@@ -4,6 +4,7 @@
 // See the LICENSE and NOTICES files in the project root for more information.
 
 using System.Globalization;
+using System.Xml.Linq;
 using Be.Vlaanderen.Basisregisters.Generators.Guid;
 using EdFi.DataManagementService.Backend.Tests.Common;
 using EdFi.DataManagementService.Backend.Tests.Integration.Common;
@@ -30,12 +31,9 @@ internal sealed record AuthoritativeSampleSmokeSeedData(
     long SchoolYearTypeDocumentId
 );
 
-internal sealed record DocumentStampState(
-    long ContentVersion,
-    long IdentityVersion,
-    DateTimeOffset ContentLastModifiedAt,
-    DateTimeOffset IdentityLastModifiedAt
-);
+internal sealed record ExecutedPlanStatement(int ParentObjectId, string StatementText);
+
+internal sealed record DocumentStampState(long ContentVersion, DateTimeOffset ContentLastModifiedAt);
 
 internal sealed record CourseOfferingSessionReferenceState(
     long SessionDocumentId,
@@ -162,6 +160,72 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         {
             await _databaseLease.DisposeAsync();
         }
+    }
+
+    [Test]
+    public async Task It_should_create_the_representation_restamp_operation_manifest_with_a_primary_key_and_required_columns()
+    {
+        var columns = await _database.QueryRowsAsync(
+            """
+            SELECT columns.name AS ColumnName, columns.is_nullable AS IsNullable
+            FROM sys.columns columns
+            INNER JOIN sys.tables tables ON tables.object_id = columns.object_id
+            INNER JOIN sys.schemas schemas ON schemas.schema_id = tables.schema_id
+            WHERE schemas.name = 'dms'
+              AND tables.name = 'RepresentationRestampOperation'
+            """
+        );
+        var primaryKeyColumns = await _database.QueryRowsAsync(
+            """
+            SELECT columns.name AS ColumnName
+            FROM sys.key_constraints constraints
+            INNER JOIN sys.tables tables ON tables.object_id = constraints.parent_object_id
+            INNER JOIN sys.schemas schemas ON schemas.schema_id = tables.schema_id
+            INNER JOIN sys.index_columns index_columns
+                ON index_columns.object_id = constraints.parent_object_id
+                AND index_columns.index_id = constraints.unique_index_id
+            INNER JOIN sys.columns columns
+                ON columns.object_id = index_columns.object_id
+                AND columns.column_id = index_columns.column_id
+            WHERE constraints.type = 'PK'
+              AND schemas.name = 'dms'
+              AND tables.name = 'RepresentationRestampOperation'
+            ORDER BY index_columns.key_ordinal
+            """
+        );
+
+        string[] expectedColumns =
+        [
+            "OperationId",
+            "ContractVersion",
+            "TenantKey",
+            "DataStoreId",
+            "PhysicalSourceFingerprint",
+            "ScopeJson",
+            "Reason",
+            "Mode",
+            "PreRestampBoundary",
+            "PreviewDocumentCount",
+            "CommittedDocumentCount",
+            "State",
+            "CreatedAt",
+            "UpdatedAt",
+        ];
+
+        columns
+            .Select(column => Convert.ToString(column["ColumnName"], CultureInfo.InvariantCulture))
+            .Should()
+            .BeEquivalentTo(expectedColumns);
+        columns
+            .Select(column => Convert.ToBoolean(column["IsNullable"], CultureInfo.InvariantCulture))
+            .Should()
+            .OnlyContain(isNullable => !isNullable);
+        primaryKeyColumns
+            .Select(column => Convert.ToString(column["ColumnName"], CultureInfo.InvariantCulture))
+            .Should()
+            .ContainSingle()
+            .Which.Should()
+            .Be("OperationId");
     }
 
     [Test]
@@ -393,7 +457,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
     }
 
     [Test]
-    public async Task It_should_stamp_content_only_root_changes_without_touching_identity_stamps()
+    public async Task It_should_stamp_content_only_root_changes()
     {
         var before = await GetDocumentStampStateAsync(_seedData.ContactDocumentId);
 
@@ -412,12 +476,10 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
         after.ContentVersion.Should().BeGreaterThan(before.ContentVersion);
         after.ContentLastModifiedAt.Should().BeAfter(before.ContentLastModifiedAt);
-        after.IdentityVersion.Should().Be(before.IdentityVersion);
-        after.IdentityLastModifiedAt.Should().Be(before.IdentityLastModifiedAt);
     }
 
     [Test]
-    public async Task It_should_stamp_child_representation_changes_without_touching_identity_stamps()
+    public async Task It_should_stamp_child_representation_changes()
     {
         var before = await GetDocumentStampStateAsync(_seedData.ContactDocumentId);
 
@@ -438,12 +500,10 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
         after.ContentVersion.Should().BeGreaterThan(before.ContentVersion);
         after.ContentLastModifiedAt.Should().BeAfter(before.ContentLastModifiedAt);
-        after.IdentityVersion.Should().Be(before.IdentityVersion);
-        after.IdentityLastModifiedAt.Should().Be(before.IdentityLastModifiedAt);
     }
 
     [Test]
-    public async Task It_should_stamp_child_inserts_without_touching_identity_stamps()
+    public async Task It_should_stamp_child_inserts()
     {
         var before = await GetDocumentStampStateAsync(_seedData.ContactDocumentId);
         var addressTypeDescriptorDocumentId = await GetDescriptorDocumentIdAsync(
@@ -470,8 +530,353 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
         after.ContentVersion.Should().BeGreaterThan(before.ContentVersion);
         after.ContentLastModifiedAt.Should().BeAfter(before.ContentLastModifiedAt);
-        after.IdentityVersion.Should().Be(before.IdentityVersion);
-        after.IdentityLastModifiedAt.Should().Be(before.IdentityLastModifiedAt);
+    }
+
+    [Test]
+    public async Task It_should_not_run_the_root_affected_docs_update_when_a_child_insert_re_fires_the_root_stamp_trigger()
+    {
+        // A child collection insert stamps its root document, and the child trigger's mirror
+        // UPDATE on [edfi].[Contact] re-fires TR_Contact_Stamp as an UPDATE whose SET list holds
+        // only mirrored stamp columns. That re-firing's affectedDocs workset is provably empty,
+        // so the emitted guard must skip the statement outright instead of letting it resolve a
+        // join against [dms].[Document]. Every stamping assertion in this fixture is satisfied
+        // identically by "the statement was skipped" and by "the statement ran and found
+        // nothing", so this test reads the actual execution plan: a skipped statement executes
+        // no plan and therefore contributes no plan node at all.
+        var rootStampTriggerObjectId = await GetTriggerObjectIdAsync("edfi.TR_Contact_Stamp");
+        var childStampTriggerObjectId = await GetTriggerObjectIdAsync("edfi.TR_ContactAddress_Stamp");
+        var addressTypeDescriptorDocumentId = await GetDescriptorDocumentIdAsync(
+            "Ed-Fi:AddressTypeDescriptor",
+            "Home"
+        );
+        var stateAbbreviationDescriptorDocumentId = await GetDescriptorDocumentIdAsync(
+            "Ed-Fi:StateAbbreviationDescriptor",
+            "TX"
+        );
+        var before = await GetDocumentStampStateAsync(_seedData.ContactDocumentId);
+
+        await DelayForDistinctTimestampsAsync();
+        var childInsertStatements = await ReadExecutedPlanStatementsAsync(
+            """
+            INSERT INTO [edfi].[ContactAddress] (
+                [Contact_DocumentId],
+                [Ordinal],
+                [AddressTypeDescriptor_DescriptorId],
+                [StateAbbreviationDescriptor_DescriptorId],
+                [City],
+                [PostalCode],
+                [StreetNumberName]
+            )
+            VALUES (
+                @contactDocumentId,
+                3,
+                @addressTypeDescriptorDocumentId,
+                @stateAbbreviationDescriptorDocumentId,
+                N'Austin',
+                N'78703',
+                N'300 Congress Ave'
+            );
+            """,
+            new SqlParameter("@contactDocumentId", _seedData.ContactDocumentId),
+            new SqlParameter("@addressTypeDescriptorDocumentId", addressTypeDescriptorDocumentId),
+            new SqlParameter("@stateAbbreviationDescriptorDocumentId", stateAbbreviationDescriptorDocumentId)
+        );
+
+        var after = await GetDocumentStampStateAsync(_seedData.ContactDocumentId);
+        var childTriggerStatements = PlanStatementTextsFor(childInsertStatements, childStampTriggerObjectId);
+        var rootTriggerStatements = PlanStatementTextsFor(childInsertStatements, rootStampTriggerObjectId);
+
+        // The capture is only evidence if it reads statements executed inside triggers at all,
+        // and the child's own affectedDocs UPDATE is the statement that must still run.
+        childTriggerStatements
+            .Should()
+            .ContainSingle(statementText => statementText.Contains("affectedDocs", StringComparison.Ordinal));
+
+        // The root trigger did re-fire and did evaluate the guard.
+        rootTriggerStatements
+            .Should()
+            .Contain(statementText =>
+                statementText.Contains(
+                    "IF EXISTS (SELECT 1 FROM deleted) AND (NOT EXISTS (SELECT 1 FROM inserted) OR UPDATE(",
+                    StringComparison.Ordinal
+                )
+            );
+
+        // The defect itself: the guarded statement contributed no plan, so it did not execute.
+        rootTriggerStatements
+            .Should()
+            .NotContain(statementText => statementText.Contains("affectedDocs", StringComparison.Ordinal));
+
+        after.ContentVersion.Should().BeGreaterThan(before.ContentVersion);
+
+        // Control arm. The same statement is captured when the guard admits real work, so its
+        // absence above is "it did not execute", not "it is not visible to this capture".
+        var rootUpdateStatements = await ReadExecutedPlanStatementsAsync(
+            """
+            UPDATE [edfi].[Contact]
+            SET [FirstName] = @firstName
+            WHERE [DocumentId] = @documentId;
+            """,
+            new SqlParameter("@firstName", "Rowan"),
+            new SqlParameter("@documentId", _seedData.ContactDocumentId)
+        );
+
+        PlanStatementTextsFor(rootUpdateStatements, rootStampTriggerObjectId)
+            .Should()
+            .ContainSingle(statementText => statementText.Contains("affectedDocs", StringComparison.Ordinal));
+    }
+
+    [Test]
+    public async Task It_should_not_run_the_root_affected_docs_update_on_a_pure_insert()
+    {
+        // The other half of the resource root guard's predicate, and the case the ticket opened on:
+        // both affectedDocs branches require a matching deleted row, so on a pure INSERT into a root
+        // table the workset is provably empty while the statement would still resolve its join
+        // against [dms].[Document] and take update locks on rows it never modifies.
+        //
+        // Covered here rather than inferred from the descriptor test above: that test proves the
+        // pure-INSERT skip for CoreDdlEmitter's predicate, and the child re-firing test proves the
+        // skip for RelationalModelDdlEmitter's, but the two emitters build the predicate
+        // independently, so neither result carries to the other's shape. As everywhere else in this
+        // suite, every stamping assertion is satisfied identically by "the statement was skipped"
+        // and by "the statement ran and found nothing", so this reads the actual execution plan.
+        var rootStampTriggerObjectId = await GetTriggerObjectIdAsync("edfi.TR_Contact_Stamp");
+        var contactResourceKeyId = await GetResourceKeyIdAsync("Ed-Fi", "Contact");
+        var documentId = await InsertDocumentAsync(
+            Guid.Parse("0c0c0c0c-0c0c-0c0c-0c0c-0c0c0c0c0c0c"),
+            contactResourceKeyId
+        );
+
+        await DelayForDistinctTimestampsAsync();
+        var rootInsertStatements = await ReadExecutedPlanStatementsAsync(
+            """
+            INSERT INTO [edfi].[Contact] ([DocumentId], [ContactUniqueId], [FirstName], [LastSurname])
+            VALUES (@documentId, @contactUniqueId, @firstName, @lastSurname);
+            """,
+            new SqlParameter("@documentId", documentId),
+            new SqlParameter("@contactUniqueId", "10004"),
+            new SqlParameter("@firstName", "Devi"),
+            new SqlParameter("@lastSurname", "Nakamura")
+        );
+
+        var rootTriggerStatements = PlanStatementTextsFor(rootInsertStatements, rootStampTriggerObjectId);
+
+        // The trigger did fire and did evaluate the guard, so the capture reads inside it.
+        rootTriggerStatements
+            .Should()
+            .Contain(statementText =>
+                statementText.Contains(
+                    "IF EXISTS (SELECT 1 FROM deleted) AND (NOT EXISTS (SELECT 1 FROM inserted) OR UPDATE(",
+                    StringComparison.Ordinal
+                )
+            );
+
+        // The defect itself: the guarded statement contributed no plan, so it did not execute.
+        rootTriggerStatements
+            .Should()
+            .NotContain(statementText => statementText.Contains("affectedDocs", StringComparison.Ordinal));
+
+        // The @stamped pre-population sits outside the guard precisely so a root insert still carries
+        // the document's existing stamp into the mirror. If the guard ever swallowed it, the mirror
+        // would keep its DEFAULT 0 sentinel and this would fail.
+        await AssertRootMirrorMatchesDocumentAsync("edfi", "Contact", documentId);
+
+        // Control arm. The same statement is captured when the guard admits real work, so its
+        // absence above is "it did not execute", not "it is not visible to this capture".
+        var rootUpdateStatements = await ReadExecutedPlanStatementsAsync(
+            """
+            UPDATE [edfi].[Contact]
+            SET [FirstName] = @firstName
+            WHERE [DocumentId] = @documentId;
+            """,
+            new SqlParameter("@firstName", "Rowan"),
+            new SqlParameter("@documentId", documentId)
+        );
+
+        PlanStatementTextsFor(rootUpdateStatements, rootStampTriggerObjectId)
+            .Should()
+            .ContainSingle(statementText => statementText.Contains("affectedDocs", StringComparison.Ordinal));
+    }
+
+    [Test]
+    public async Task It_should_not_run_the_descriptor_affected_docs_update_on_a_pure_insert()
+    {
+        // The descriptor stamping trigger carries the same guard as the resource root shape. Its
+        // reachable half here is the pure-INSERT case: both affectedDocs branches require a matching
+        // deleted row, so on an insert the workset is provably empty while the statement would still
+        // resolve its join against [dms].[Document] and take update locks on rows it never modifies.
+        // Descriptors are bulk-loaded first and heaviest, so that is the firing the guard has to
+        // skip. As with the resource shape, every stamping assertion is satisfied identically by
+        // "the statement was skipped" and by "the statement ran and found nothing", so this reads
+        // the actual execution plan: a skipped statement executes no plan and contributes no node.
+        var descriptorStampTriggerObjectId = await GetTriggerObjectIdAsync(
+            "dms.TR_Descriptor_Stamp_Document"
+        );
+        var termDescriptorResourceKeyId = await GetResourceKeyIdAsync("Ed-Fi", "TermDescriptor");
+        var documentId = await InsertDocumentAsync(
+            Guid.Parse("0a0a0a0a-0a0a-0a0a-0a0a-0a0a0a0a0a0a"),
+            termDescriptorResourceKeyId
+        );
+
+        await DelayForDistinctTimestampsAsync();
+        var descriptorInsertStatements = await ReadExecutedPlanStatementsAsync(
+            """
+            INSERT INTO [dms].[Descriptor] (
+                [DocumentId],
+                [ResourceKeyId],
+                [Namespace],
+                [CodeValue],
+                [ShortDescription],
+                [Description],
+                [Discriminator],
+                [Uri]
+            )
+            VALUES (
+                @documentId,
+                @resourceKeyId,
+                N'uri://ed-fi.org/TermDescriptor',
+                N'Summer',
+                N'Summer',
+                N'Summer',
+                N'Ed-Fi:TermDescriptor',
+                N'uri://ed-fi.org/TermDescriptor#Summer'
+            );
+            """,
+            new SqlParameter("@documentId", documentId),
+            new SqlParameter("@resourceKeyId", termDescriptorResourceKeyId)
+        );
+
+        var descriptorTriggerStatements = PlanStatementTextsFor(
+            descriptorInsertStatements,
+            descriptorStampTriggerObjectId
+        );
+
+        // The trigger did fire and did evaluate the guard, so the capture reads inside it.
+        descriptorTriggerStatements
+            .Should()
+            .Contain(statementText =>
+                statementText.Contains(
+                    "IF EXISTS (SELECT 1 FROM deleted) AND (NOT EXISTS (SELECT 1 FROM inserted) OR UPDATE(",
+                    StringComparison.Ordinal
+                )
+            );
+
+        // The defect itself: the guarded statement contributed no plan, so it did not execute.
+        descriptorTriggerStatements
+            .Should()
+            .NotContain(statementText => statementText.Contains("affectedDocs", StringComparison.Ordinal));
+
+        // The @stamped pre-population sits outside the guard precisely so a descriptor insert still
+        // carries the document's existing stamp into the mirror. If the guard ever swallowed it, the
+        // mirror would keep its DEFAULT 0 sentinel and this would fail.
+        await AssertRootMirrorMatchesDocumentAsync("dms", "Descriptor", documentId);
+
+        // Control arm. The same statement is captured when the guard admits real work, so its
+        // absence above is "it did not execute", not "it is not visible to this capture".
+        var descriptorUpdateStatements = await ReadExecutedPlanStatementsAsync(
+            """
+            UPDATE [dms].[Descriptor]
+            SET [ShortDescription] = @shortDescription
+            WHERE [DocumentId] = @documentId;
+            """,
+            new SqlParameter("@shortDescription", "Summer term"),
+            new SqlParameter("@documentId", documentId)
+        );
+
+        PlanStatementTextsFor(descriptorUpdateStatements, descriptorStampTriggerObjectId)
+            .Should()
+            .ContainSingle(statementText => statementText.Contains("affectedDocs", StringComparison.Ordinal));
+    }
+
+    [Test]
+    public async Task It_should_stamp_every_document_when_one_statement_produces_a_multi_row_mirror_workset()
+    {
+        // The mirror stamp is hinted WITH (FORCESEEK), which forbids a scan of the mirror table and
+        // so constrains the plan to one seek per @stamped row. It matters because SQL Server does not
+        // fall back when it cannot honor the hint - it fails the statement with error 8622 - and
+        // because a multi-row workset is what a cascade fan-out or a bulk delete produces in
+        // production. One UPDATE across many root rows yields one trigger firing whose @stamped
+        // carries all of them.
+        //
+        // Not redundant with It_should_allocate_distinct_content_versions_for_multi_row_root_updates,
+        // which also drives a multi-row statement: that test reads only dms.Document, so nothing in
+        // it would notice the mirror UPDATE landing on some rows of @stamped and not others. This one
+        // asserts the mirror per document. The workset is also deliberately larger than two, so a
+        // plan built on the table variable's fixed one-row estimate is unambiguously wrong for it.
+        const int AdditionalContacts = 10;
+        var contactResourceKeyId = await GetResourceKeyIdAsync("Ed-Fi", "Contact");
+
+        for (int i = 0; i < AdditionalContacts; i++)
+        {
+            var documentId = await InsertDocumentAsync(
+                Guid.Parse($"0b0b0b0b-0b0b-0b0b-0b0b-0b0b0b0b0b{i:D2}"),
+                contactResourceKeyId
+            );
+            await InsertContactAsync(documentId, $"205{i:D2}", "Alex", $"Rivera{i:D2}");
+        }
+
+        // Read from the table rather than from the seed constants plus the loop above. The UPDATE
+        // below deliberately carries no WHERE, so the workset is whatever edfi.Contact holds, and a
+        // seed that grows a Contact would otherwise fail the row-count assertion with a message
+        // about the workset when the list is what went stale.
+        var documentIds = await ReadAllContactDocumentIdsAsync();
+        documentIds
+            .Count.Should()
+            .BeGreaterThan(
+                2,
+                "the workset must be unambiguously larger than the table variable's fixed one-row "
+                    + "cardinality estimate, and larger than the two-row sibling test"
+            );
+
+        Dictionary<long, DocumentStampState> before = [];
+        foreach (var documentId in documentIds)
+        {
+            before[documentId] = await GetDocumentStampStateAsync(documentId);
+        }
+
+        await DelayForDistinctTimestampsAsync();
+
+        // No WHERE clause: every seeded Contact changes in one statement, so the root trigger fires
+        // once with a @stamped of documentIds.Count rows. None of them is already named "Rowan", so
+        // the null-safe value diff admits all of them.
+        var affectedRows = await _database.ExecuteNonQueryAsync(
+            """
+            UPDATE [edfi].[Contact]
+            SET [FirstName] = @firstName;
+            """,
+            new SqlParameter("@firstName", "Rowan")
+        );
+
+        // Consistency check on the reading above rather than a claim about the workset size, which
+        // documentIds.Count > 2 already made: the per-document assertions below only cover the
+        // workset if the rows the UPDATE reached are the rows that were read.
+        affectedRows
+            .Should()
+            .Be(documentIds.Count, "the rows asserted below must be the rows the statement stamped");
+
+        List<long> contentVersions = [];
+        foreach (var documentId in documentIds)
+        {
+            var after = await GetDocumentStampStateAsync(documentId);
+            after
+                .ContentVersion.Should()
+                .BeGreaterThan(
+                    before[documentId].ContentVersion,
+                    $"document {documentId} was in the multi-row workset and must be stamped"
+                );
+
+            // The FORCESEEK-hinted mirror update has to land on every row of the workset, not only
+            // on whichever row a single-row plan would have found.
+            await AssertRootMirrorMatchesDocumentAsync("edfi", "Contact", documentId);
+            contentVersions.Add(after.ContentVersion);
+        }
+
+        contentVersions
+            .Should()
+            .OnlyHaveUniqueItems(
+                "one trigger fire allocates exactly one change version per affected document, so a "
+                    + "multi-row workset must not collapse onto a shared value"
+            );
     }
 
     [Test]
@@ -502,7 +907,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
     }
 
     [Test]
-    public async Task It_should_stamp_extension_scope_representation_changes_without_touching_identity_stamps()
+    public async Task It_should_stamp_extension_scope_representation_changes()
     {
         var before = await GetDocumentStampStateAsync(_seedData.ContactDocumentId);
 
@@ -523,8 +928,6 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
         after.ContentVersion.Should().BeGreaterThan(before.ContentVersion);
         after.ContentLastModifiedAt.Should().BeAfter(before.ContentLastModifiedAt);
-        after.IdentityVersion.Should().Be(before.IdentityVersion);
-        after.IdentityLastModifiedAt.Should().Be(before.IdentityLastModifiedAt);
     }
 
     [Test]
@@ -555,7 +958,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
     }
 
     [Test]
-    public async Task It_should_stamp_root_extension_inserts_without_touching_identity_stamps()
+    public async Task It_should_stamp_root_extension_inserts()
     {
         var contactResourceKeyId = await GetResourceKeyIdAsync("Ed-Fi", "Contact");
         var documentId = await InsertDocumentAsync(
@@ -573,14 +976,18 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
         after.ContentVersion.Should().BeGreaterThan(before.ContentVersion);
         after.ContentLastModifiedAt.Should().BeAfter(before.ContentLastModifiedAt);
-        after.IdentityVersion.Should().Be(before.IdentityVersion);
-        after.IdentityLastModifiedAt.Should().Be(before.IdentityLastModifiedAt);
     }
 
     [Test]
-    public async Task It_should_stamp_root_identity_changes_as_both_content_and_identity_updates()
+    public async Task It_should_stamp_root_identity_changes_as_content_updates()
     {
         var before = await GetDocumentStampStateAsync(_seedData.ContactDocumentId);
+        var contactDocumentUuid = await GetDocumentUuidAsync(_seedData.ContactDocumentId);
+        var beforeTrackedRows = await CountTrackedChangeRowsAsync(
+            "tracked_changes_edfi",
+            "Contact",
+            contactDocumentUuid
+        );
 
         await DelayForDistinctTimestampsAsync();
         await _database.ExecuteNonQueryAsync(
@@ -594,11 +1001,15 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         );
 
         var after = await GetDocumentStampStateAsync(_seedData.ContactDocumentId);
+        var afterTrackedRows = await CountTrackedChangeRowsAsync(
+            "tracked_changes_edfi",
+            "Contact",
+            contactDocumentUuid
+        );
 
         after.ContentVersion.Should().BeGreaterThan(before.ContentVersion);
         after.ContentLastModifiedAt.Should().BeAfter(before.ContentLastModifiedAt);
-        after.IdentityVersion.Should().BeGreaterThan(before.IdentityVersion);
-        after.IdentityLastModifiedAt.Should().BeAfter(before.IdentityLastModifiedAt);
+        afterTrackedRows.Should().Be(beforeTrackedRows + 1);
     }
 
     [Test]
@@ -643,6 +1054,12 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
         var beforeStamps = await GetDocumentStampStateAsync(_seedData.ContactDocumentId);
         var beforeRiRows = await GetReferentialIdentityRowsForDocumentAsync(_seedData.ContactDocumentId);
+        var contactDocumentUuid = await GetDocumentUuidAsync(_seedData.ContactDocumentId);
+        var beforeTrackedRows = await CountTrackedChangeRowsAsync(
+            "tracked_changes_edfi",
+            "Contact",
+            contactDocumentUuid
+        );
         beforeRiRows.Should().Equal(expectedRiRows);
 
         await TruncateReferentialIdentityAuditAsync();
@@ -658,21 +1075,27 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
         var afterStamps = await GetDocumentStampStateAsync(_seedData.ContactDocumentId);
         var afterRiRows = await GetReferentialIdentityRowsForDocumentAsync(_seedData.ContactDocumentId);
+        var afterTrackedRows = await CountTrackedChangeRowsAsync(
+            "tracked_changes_edfi",
+            "Contact",
+            contactDocumentUuid
+        );
         var auditOps = await CountReferentialIdentityAuditOpsForDocumentAsync(_seedData.ContactDocumentId);
 
         afterStamps.Should().Be(beforeStamps);
         afterRiRows.Should().Equal(beforeRiRows);
+        afterTrackedRows.Should().Be(beforeTrackedRows);
         auditOps.Should().Be(0);
     }
 
     [Test]
-    public async Task It_should_not_stamp_identity_when_scalar_identity_column_is_self_assigned_alongside_content_change()
+    public async Task It_should_avoid_referential_identity_rewrites_when_scalar_identity_column_is_self_assigned_alongside_content_change()
     {
         // The pure same-value test above is filtered out before the inner identity-only
         // gate runs. This test sends a content change AND a same-value self-assignment
         // of the identity column in one UPDATE — UPDATE([ContactUniqueId]) returns true
         // (the column appeared in SET), so the inner null-safe value-diff predicate is
-        // what must keep IdentityVersion and dms.ReferentialIdentity untouched.
+        // what must keep dms.ReferentialIdentity untouched.
         var contactResourceKeyId = await GetResourceKeyIdAsync("Ed-Fi", "Contact");
         var expectedRiRows = SortReferentialIdentityRows(
             new[]
@@ -687,6 +1110,12 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
         var beforeStamps = await GetDocumentStampStateAsync(_seedData.ContactDocumentId);
         var beforeRiRows = await GetReferentialIdentityRowsForDocumentAsync(_seedData.ContactDocumentId);
+        var contactDocumentUuid = await GetDocumentUuidAsync(_seedData.ContactDocumentId);
+        var beforeTrackedRows = await CountTrackedChangeRowsAsync(
+            "tracked_changes_edfi",
+            "Contact",
+            contactDocumentUuid
+        );
         beforeRiRows.Should().Equal(expectedRiRows);
 
         await TruncateReferentialIdentityAuditAsync();
@@ -704,18 +1133,22 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
         var afterStamps = await GetDocumentStampStateAsync(_seedData.ContactDocumentId);
         var afterRiRows = await GetReferentialIdentityRowsForDocumentAsync(_seedData.ContactDocumentId);
+        var afterTrackedRows = await CountTrackedChangeRowsAsync(
+            "tracked_changes_edfi",
+            "Contact",
+            contactDocumentUuid
+        );
         var auditOps = await CountReferentialIdentityAuditOpsForDocumentAsync(_seedData.ContactDocumentId);
 
         afterStamps.ContentVersion.Should().BeGreaterThan(beforeStamps.ContentVersion);
         afterStamps.ContentLastModifiedAt.Should().BeAfter(beforeStamps.ContentLastModifiedAt);
-        afterStamps.IdentityVersion.Should().Be(beforeStamps.IdentityVersion);
-        afterStamps.IdentityLastModifiedAt.Should().Be(beforeStamps.IdentityLastModifiedAt);
         afterRiRows.Should().Equal(beforeRiRows);
+        afterTrackedRows.Should().Be(beforeTrackedRows);
         auditOps.Should().Be(0);
     }
 
     [Test]
-    public async Task It_should_not_stamp_identity_for_content_only_updates_on_identity_propagation_tables()
+    public async Task It_should_stamp_content_only_updates_on_identity_propagation_tables()
     {
         var schoolResourceKeyId = await GetResourceKeyIdAsync("Ed-Fi", "School");
         var schoolDocumentId = await InsertDocumentAsync(
@@ -729,6 +1162,12 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         );
 
         var before = await GetDocumentStampStateAsync(schoolDocumentId);
+        var schoolDocumentUuid = await GetDocumentUuidAsync(schoolDocumentId);
+        var beforeTrackedRows = await CountTrackedChangeRowsAsync(
+            "tracked_changes_edfi",
+            "School",
+            schoolDocumentUuid
+        );
 
         await DelayForDistinctTimestampsAsync();
         await _database.ExecuteNonQueryAsync(
@@ -742,11 +1181,15 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         );
 
         var after = await GetDocumentStampStateAsync(schoolDocumentId);
+        var afterTrackedRows = await CountTrackedChangeRowsAsync(
+            "tracked_changes_edfi",
+            "School",
+            schoolDocumentUuid
+        );
 
         after.ContentVersion.Should().BeGreaterThan(before.ContentVersion);
         after.ContentLastModifiedAt.Should().BeAfter(before.ContentLastModifiedAt);
-        after.IdentityVersion.Should().Be(before.IdentityVersion);
-        after.IdentityLastModifiedAt.Should().Be(before.IdentityLastModifiedAt);
+        afterTrackedRows.Should().Be(beforeTrackedRows);
     }
 
     [Test]
@@ -835,24 +1278,16 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
         afterSession.ContentVersion.Should().BeGreaterThan(beforeSession.ContentVersion);
         afterSession.ContentLastModifiedAt.Should().BeAfter(beforeSession.ContentLastModifiedAt);
-        afterSession.IdentityVersion.Should().BeGreaterThan(beforeSession.IdentityVersion);
-        afterSession.IdentityLastModifiedAt.Should().BeAfter(beforeSession.IdentityLastModifiedAt);
 
         afterCourseOffering.ContentVersion.Should().BeGreaterThan(beforeCourseOffering.ContentVersion);
         afterCourseOffering
             .ContentLastModifiedAt.Should()
             .BeAfter(beforeCourseOffering.ContentLastModifiedAt);
-        afterCourseOffering.IdentityVersion.Should().BeGreaterThan(beforeCourseOffering.IdentityVersion);
-        afterCourseOffering
-            .IdentityLastModifiedAt.Should()
-            .BeAfter(beforeCourseOffering.IdentityLastModifiedAt);
 
         afterSurvey.ContentVersion.Should().BeGreaterThan(beforeSurvey.ContentVersion);
         afterSurvey.ContentLastModifiedAt.Should().BeAfter(beforeSurvey.ContentLastModifiedAt);
         // Survey's identity is Namespace + SurveyIdentifier only; Session_SessionName is a reference
-        // field, not part of Survey's identity, so IdentityVersion must not change here.
-        afterSurvey.IdentityVersion.Should().Be(beforeSurvey.IdentityVersion);
-        afterSurvey.IdentityLastModifiedAt.Should().Be(beforeSurvey.IdentityLastModifiedAt);
+        // field, not part of Survey's identity. The cascade still changes its stored representation.
 
         AssertMirrorContentMatchesDocument(afterSessionMirror, afterSession);
         AssertMirrorContentMatchesDocument(afterCourseOfferingMirror, afterCourseOffering);
@@ -1014,7 +1449,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         // CourseOffering's INSTEAD OF UPDATE rewrites every column unconditionally, so the
         // AFTER stamp/RI triggers see UPDATE([Session_SessionName]) = true even though the
         // user-issued UPDATE was a same-value self-assignment. Only the null-safe value diff
-        // in the trigger body should prevent a false content/identity stamp bump and a
+        // in the trigger body should prevent a false content stamp bump and a
         // redundant RI row rewrite.
         var courseOfferingResourceKeyId = await GetResourceKeyIdAsync("Ed-Fi", "CourseOffering");
         var expectedRiRows = SortReferentialIdentityRows(
@@ -1046,6 +1481,12 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         var beforeRiRows = await GetReferentialIdentityRowsForDocumentAsync(
             _seedData.CourseOfferingDocumentId
         );
+        var courseOfferingDocumentUuid = await GetDocumentUuidAsync(_seedData.CourseOfferingDocumentId);
+        var beforeTrackedRows = await CountTrackedChangeRowsAsync(
+            "tracked_changes_edfi",
+            "CourseOffering",
+            courseOfferingDocumentUuid
+        );
         beforeRiRows.Should().Equal(expectedRiRows);
 
         await TruncateReferentialIdentityAuditAsync();
@@ -1068,6 +1509,11 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         var afterRiRows = await GetReferentialIdentityRowsForDocumentAsync(
             _seedData.CourseOfferingDocumentId
         );
+        var afterTrackedRows = await CountTrackedChangeRowsAsync(
+            "tracked_changes_edfi",
+            "CourseOffering",
+            courseOfferingDocumentUuid
+        );
         var auditOps = await CountReferentialIdentityAuditOpsForDocumentAsync(
             _seedData.CourseOfferingDocumentId
         );
@@ -1076,18 +1522,18 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         afterMirror.Should().Be(beforeMirror);
         AssertMirrorContentMatchesDocument(afterMirror, afterStamps);
         afterRiRows.Should().Equal(beforeRiRows);
+        afterTrackedRows.Should().Be(beforeTrackedRows);
         auditOps.Should().Be(0);
     }
 
     [Test]
-    public async Task It_should_not_stamp_identity_when_propagated_identity_reference_is_self_assigned_alongside_content_change()
+    public async Task It_should_avoid_referential_identity_rewrites_when_propagated_identity_reference_is_self_assigned_alongside_content_change()
     {
         // Mixed-write counterpart for the propagated identity-source reference column:
         // a non-identity content column changes while the propagated identity column is
         // self-assigned to the same value. UPDATE([Session_SessionName]) returns true
         // (and CourseOffering's INSTEAD OF UPDATE rewrites every column anyway), so the
-        // null-safe value-diff predicate is the sole protection against false
-        // IdentityVersion bumps and redundant RI rewrites.
+        // null-safe value-diff predicate is the sole protection against redundant RI rewrites.
         var courseOfferingResourceKeyId = await GetResourceKeyIdAsync("Ed-Fi", "CourseOffering");
         var expectedRiRows = SortReferentialIdentityRows(
             new[]
@@ -1112,6 +1558,12 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         var beforeRiRows = await GetReferentialIdentityRowsForDocumentAsync(
             _seedData.CourseOfferingDocumentId
         );
+        var courseOfferingDocumentUuid = await GetDocumentUuidAsync(_seedData.CourseOfferingDocumentId);
+        var beforeTrackedRows = await CountTrackedChangeRowsAsync(
+            "tracked_changes_edfi",
+            "CourseOffering",
+            courseOfferingDocumentUuid
+        );
         beforeRiRows.Should().Equal(expectedRiRows);
 
         await TruncateReferentialIdentityAuditAsync();
@@ -1131,15 +1583,19 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         var afterRiRows = await GetReferentialIdentityRowsForDocumentAsync(
             _seedData.CourseOfferingDocumentId
         );
+        var afterTrackedRows = await CountTrackedChangeRowsAsync(
+            "tracked_changes_edfi",
+            "CourseOffering",
+            courseOfferingDocumentUuid
+        );
         var auditOps = await CountReferentialIdentityAuditOpsForDocumentAsync(
             _seedData.CourseOfferingDocumentId
         );
 
         afterStamps.ContentVersion.Should().BeGreaterThan(beforeStamps.ContentVersion);
         afterStamps.ContentLastModifiedAt.Should().BeAfter(beforeStamps.ContentLastModifiedAt);
-        afterStamps.IdentityVersion.Should().Be(beforeStamps.IdentityVersion);
-        afterStamps.IdentityLastModifiedAt.Should().Be(beforeStamps.IdentityLastModifiedAt);
         afterRiRows.Should().Equal(beforeRiRows);
+        afterTrackedRows.Should().Be(beforeTrackedRows);
         auditOps.Should().Be(0);
     }
 
@@ -1164,10 +1620,10 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         var afterOtherContact = await GetDocumentStampStateAsync(_seedData.OtherContactDocumentId);
 
         afterContact.ContentVersion.Should().BeGreaterThan(beforeContact.ContentVersion);
+        afterContact.ContentLastModifiedAt.Should().BeAfter(beforeContact.ContentLastModifiedAt);
         afterOtherContact.ContentVersion.Should().BeGreaterThan(beforeOtherContact.ContentVersion);
+        afterOtherContact.ContentLastModifiedAt.Should().BeAfter(beforeOtherContact.ContentLastModifiedAt);
         afterContact.ContentVersion.Should().NotBe(afterOtherContact.ContentVersion);
-        afterContact.IdentityVersion.Should().Be(beforeContact.IdentityVersion);
-        afterOtherContact.IdentityVersion.Should().Be(beforeOtherContact.IdentityVersion);
     }
 
     [Test]
@@ -1206,7 +1662,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
         var afterUpdate = await GetDocumentStampStateAsync(busDocumentId);
         afterUpdate.ContentVersion.Should().BeGreaterThan(afterInsert.ContentVersion);
-        afterUpdate.IdentityVersion.Should().BeGreaterThan(afterInsert.IdentityVersion);
+        afterUpdate.ContentLastModifiedAt.Should().BeAfter(afterInsert.ContentLastModifiedAt);
         await AssertRootMirrorMatchesDocumentAsync("sample", "Bus", busDocumentId);
 
         var beforeNoOpMirror = await GetRootMirrorStampStateAsync("sample", "Bus", busDocumentId);
@@ -1227,6 +1683,24 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         afterNoOp.Should().Be(afterUpdate);
         afterNoOpMirror.Should().Be(beforeNoOpMirror);
         AssertMirrorContentMatchesDocument(afterNoOpMirror, afterNoOp);
+    }
+
+    [Test]
+    public async Task It_should_advance_max_change_version_by_one_for_document_inserts()
+    {
+        var contactResourceKeyId = await GetResourceKeyIdAsync("Ed-Fi", "Contact");
+        var beforeMaxChangeVersion = await ReadMaxChangeVersionAsync();
+
+        var documentId = await InsertDocumentAsync(
+            Guid.Parse("13131313-1313-1313-1313-131313131313"),
+            contactResourceKeyId
+        );
+
+        var afterMaxChangeVersion = await ReadMaxChangeVersionAsync();
+        var documentStamps = await GetDocumentStampStateAsync(documentId);
+
+        afterMaxChangeVersion.Should().Be(beforeMaxChangeVersion + 1);
+        documentStamps.ContentVersion.Should().Be(afterMaxChangeVersion);
     }
 
     [Test]
@@ -1396,7 +1870,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         var after = await GetDocumentStampStateAsync(seed.AssociationDocumentId);
 
         after.ContentVersion.Should().BeGreaterThan(before.ContentVersion);
-        after.IdentityVersion.Should().Be(before.IdentityVersion);
+        after.ContentLastModifiedAt.Should().BeAfter(before.ContentLastModifiedAt);
         (
             await CountTrackedChangeRowsAsync(
                 "tracked_changes_edfi",
@@ -1546,9 +2020,9 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
     public async Task It_should_insert_key_change_rows_only_for_identity_changed_rows_in_a_mixed_workset_update()
     {
         // The core statement-level-trigger risk: one UPDATE whose workset contains
-        // multiple rows where only SOME change identity. @identityChangedDocs must
-        // admit exactly the changed row — no key-change row and no stamps at all
-        // for the row whose values were self-assigned.
+        // multiple rows where only SOME change identity. The null-safe changed-docs
+        // workset must admit exactly the changed row: no key-change row and no
+        // content stamps for the row whose values were self-assigned.
         const int SchoolYear = 2025;
         const string GradingPeriodDescriptorNamespace = "uri://ed-fi.org/GradingPeriodDescriptor";
         const string GradingPeriodDescriptorCodeValue = "SecondSixWeeks";
@@ -1623,7 +2097,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         var unchangedAfter = await GetDocumentStampStateAsync(unchangedDocumentId);
 
         changedAfter.ContentVersion.Should().BeGreaterThan(changedBefore.ContentVersion);
-        changedAfter.IdentityVersion.Should().BeGreaterThan(changedBefore.IdentityVersion);
+        changedAfter.ContentLastModifiedAt.Should().BeAfter(changedBefore.ContentLastModifiedAt);
         // The self-assigned row is a stored-value no-op: no stamps at all.
         unchangedAfter.Should().Be(unchangedBefore);
 
@@ -1718,7 +2192,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
         var after = await GetDocumentStampStateAsync(gradingPeriodDocumentId);
         after.ContentVersion.Should().BeGreaterThan(before.ContentVersion);
-        after.IdentityVersion.Should().BeGreaterThan(before.IdentityVersion);
+        after.ContentLastModifiedAt.Should().BeAfter(before.ContentLastModifiedAt);
 
         (
             await CountTrackedChangeRowsAsync(
@@ -1819,7 +2293,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
         var after = await GetDocumentStampStateAsync(studentAssessmentDocumentId);
         after.ContentVersion.Should().BeGreaterThan(before.ContentVersion);
-        after.IdentityVersion.Should().BeGreaterThan(before.IdentityVersion);
+        after.ContentLastModifiedAt.Should().BeAfter(before.ContentLastModifiedAt);
 
         (
             await CountTrackedChangeRowsAsync(
@@ -1849,6 +2323,41 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
             .ToInt64(trackedRow["ChangeVersion"], CultureInfo.InvariantCulture)
             .Should()
             .Be(after.ContentVersion);
+
+        await DelayForDistinctTimestampsAsync();
+        rowsAffected = await _database.ExecuteNonQueryAsync(
+            """
+            UPDATE [edfi].[StudentAssessment]
+            SET [StudentAssessmentIdentifier] = @clearedIdentifier,
+                [ReportedSchool_DocumentId] = NULL,
+                [ReportedSchool_SchoolId] = NULL
+            WHERE [DocumentId] = @documentId;
+            """,
+            new SqlParameter("@clearedIdentifier", "SA-001-cleared"),
+            new SqlParameter("@documentId", studentAssessmentDocumentId)
+        );
+        rowsAffected.Should().Be(1);
+
+        var afterClear = await GetDocumentStampStateAsync(studentAssessmentDocumentId);
+        afterClear.ContentVersion.Should().BeGreaterThan(after.ContentVersion);
+        afterClear.ContentLastModifiedAt.Should().BeAfter(after.ContentLastModifiedAt);
+
+        trackedRow = await GetLatestTrackedChangeRowAsync(
+            "tracked_changes_edfi",
+            "StudentAssessment",
+            studentAssessmentDocumentUuid
+        );
+        trackedRow["OldStudentAssessmentIdentifier"].Should().Be("SA-001-renamed");
+        trackedRow["NewStudentAssessmentIdentifier"].Should().Be("SA-001-cleared");
+        Convert
+            .ToInt64(trackedRow["OldReportedSchool_SchoolId"], CultureInfo.InvariantCulture)
+            .Should()
+            .Be(seededSchoolId);
+        trackedRow["NewReportedSchool_SchoolId"].Should().BeNull();
+        Convert
+            .ToInt64(trackedRow["ChangeVersion"], CultureInfo.InvariantCulture)
+            .Should()
+            .Be(afterClear.ContentVersion);
     }
 
     [Test]
@@ -1973,6 +2482,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         (await CountDocumentRowsAsync(seed.AssociationDocumentId)).Should().Be(1);
         var afterResourceDelete = await GetDocumentStampStateAsync(seed.AssociationDocumentId);
         afterResourceDelete.ContentVersion.Should().BeGreaterThan(before.ContentVersion);
+        afterResourceDelete.ContentLastModifiedAt.Should().BeAfter(before.ContentLastModifiedAt);
 
         (
             await CountTrackedChangeRowsAsync(
@@ -2067,6 +2577,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         (await CountDocumentRowsAsync(descriptorDocumentId)).Should().Be(1);
         var afterResourceDelete = await GetDocumentStampStateAsync(descriptorDocumentId);
         afterResourceDelete.ContentVersion.Should().BeGreaterThan(before.ContentVersion);
+        afterResourceDelete.ContentLastModifiedAt.Should().BeAfter(before.ContentLastModifiedAt);
 
         (await CountTrackedChangeRowsAsync("tracked_changes_edfi", "Descriptor", descriptorDocumentUuid))
             .Should()
@@ -2134,6 +2645,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         (await CountDocumentRowsAsync(schoolDocumentId)).Should().Be(1);
         var afterResourceDelete = await GetDocumentStampStateAsync(schoolDocumentId);
         afterResourceDelete.ContentVersion.Should().BeGreaterThan(before.ContentVersion);
+        afterResourceDelete.ContentLastModifiedAt.Should().BeAfter(before.ContentLastModifiedAt);
 
         (await CountTrackedChangeRowsAsync("tracked_changes_edfi", "School", schoolDocumentUuid))
             .Should()
@@ -2193,7 +2705,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         var before = await GetDocumentStampStateAsync(schoolDocumentId);
 
         // A successful identity-value change on a concrete-abstract resource must bump
-        // IdentityVersion but never insert a key-change row: deletes are the only writes
+        // ContentVersion but never insert a key-change row: deletes are the only writes
         // that land in tracked_changes for concrete-abstract resources.
         await DelayForDistinctTimestampsAsync();
         var rowsAffected = await _database.ExecuteNonQueryAsync(
@@ -2210,7 +2722,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         var after = await GetDocumentStampStateAsync(schoolDocumentId);
 
         after.ContentVersion.Should().BeGreaterThan(before.ContentVersion);
-        after.IdentityVersion.Should().BeGreaterThan(before.IdentityVersion);
+        after.ContentLastModifiedAt.Should().BeAfter(before.ContentLastModifiedAt);
         (await CountTrackedChangeRowsAsync("tracked_changes_edfi", "School", schoolDocumentUuid))
             .Should()
             .Be(0);
@@ -2812,6 +3324,14 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
         );
     }
 
+    private async Task<Guid> GetDocumentUuidAsync(long documentId)
+    {
+        return await _database.ExecuteScalarAsync<Guid>(
+            """SELECT [DocumentUuid] FROM [dms].[Document] WHERE [DocumentId] = @documentId;""",
+            new SqlParameter("@documentId", documentId)
+        );
+    }
+
     private async Task<long> InsertDescriptorAsync(
         Guid documentUuid,
         short resourceKeyId,
@@ -2828,6 +3348,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
             """
             INSERT INTO [dms].[Descriptor] (
                 [DocumentId],
+                [ResourceKeyId],
                 [Namespace],
                 [CodeValue],
                 [ShortDescription],
@@ -2837,6 +3358,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
             )
             VALUES (
                 @documentId,
+                @resourceKeyId,
                 @namespace,
                 @codeValue,
                 @shortDescription,
@@ -2846,6 +3368,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
             );
             """,
             new SqlParameter("@documentId", documentId),
+            new SqlParameter("@resourceKeyId", resourceKeyId),
             new SqlParameter("@namespace", @namespace),
             new SqlParameter("@codeValue", codeValue),
             new SqlParameter("@shortDescription", shortDescription),
@@ -3892,9 +4415,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
                 """
                 SELECT
                     [ContentVersion],
-                    [IdentityVersion],
-                    [ContentLastModifiedAt],
-                    [IdentityLastModifiedAt]
+                    [ContentLastModifiedAt]
                 FROM [dms].[Document]
                 WHERE [DocumentId] = @documentId;
                 """,
@@ -3904,9 +4425,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
         return new(
             Convert.ToInt64(row["ContentVersion"], CultureInfo.InvariantCulture),
-            Convert.ToInt64(row["IdentityVersion"], CultureInfo.InvariantCulture),
-            ReadDateTimeOffset(row["ContentLastModifiedAt"]),
-            ReadDateTimeOffset(row["IdentityLastModifiedAt"])
+            ReadDateTimeOffset(row["ContentLastModifiedAt"])
         );
     }
 
@@ -3931,9 +4450,7 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
         return new(
             Convert.ToInt64(row["ContentVersion"], CultureInfo.InvariantCulture),
-            IdentityVersion: 0,
-            ReadDateTimeOffset(row["ContentLastModifiedAt"]),
-            IdentityLastModifiedAt: DateTimeOffset.UnixEpoch
+            ReadDateTimeOffset(row["ContentLastModifiedAt"])
         );
     }
 
@@ -4138,7 +4655,127 @@ public class Given_A_Mssql_Generated_Ddl_Apply_Harness_With_The_Authoritative_DS
 
     private async Task DelayForDistinctTimestampsAsync()
     {
-        await _database.ExecuteNonQueryAsync("""WAITFOR DELAY '00:00:00.050';""");
+        await _database.WaitForUtcClockToAdvanceAsync();
+    }
+
+    /// <summary>
+    /// Every DocumentId currently in <c>edfi.Contact</c>. Used where a statement's workset is the
+    /// whole table, so the expectation tracks what the seed actually created rather than restating
+    /// its cardinality.
+    /// </summary>
+    private async Task<List<long>> ReadAllContactDocumentIdsAsync()
+    {
+        var rows = await _database.QueryRowsAsync("SELECT [DocumentId] FROM [edfi].[Contact];");
+
+        return [.. rows.Select(row => Convert.ToInt64(row["DocumentId"], CultureInfo.InvariantCulture))];
+    }
+
+    private async Task<int> GetTriggerObjectIdAsync(string qualifiedTriggerName)
+    {
+        var objectId = await _database.ExecuteScalarOrDefaultAsync<int>(
+            "SELECT OBJECT_ID(@qualifiedTriggerName, N'TR');",
+            new SqlParameter("@qualifiedTriggerName", qualifiedTriggerName)
+        );
+
+        return objectId != 0
+            ? objectId
+            : throw new InvalidOperationException(
+                $"Trigger '{qualifiedTriggerName}' does not exist in the generated schema."
+            );
+    }
+
+    /// <summary>
+    /// Executes <paramref name="sql"/> under SET STATISTICS XML ON and returns every statement
+    /// that actually executed, including statements executed inside triggers. Statements in a
+    /// conditional branch that was not taken produce no plan, so their absence here is the
+    /// evidence that the branch was skipped rather than run against an empty workset.
+    /// <para>
+    /// SQL Server truncates each plan's StatementText at 4000 characters, and the generated
+    /// stamping statements routinely exceed that, so callers must match on text near the start of
+    /// a statement rather than on a table or join that appears late in it.
+    /// </para>
+    /// </summary>
+    private async Task<IReadOnlyList<ExecutedPlanStatement>> ReadExecutedPlanStatementsAsync(
+        string sql,
+        params SqlParameter[] parameters
+    )
+    {
+        await using SqlConnection connection = new(_database.ConnectionString);
+        await connection.OpenAsync();
+
+        await SetStatisticsXmlAsync(connection, enabled: true);
+        try
+        {
+            await using SqlCommand command = connection.CreateCommand();
+            command.CommandText = sql;
+            command.CommandTimeout = 300;
+            command.Parameters.AddRange(parameters);
+
+            List<ExecutedPlanStatement> statements = [];
+            await using SqlDataReader reader = await command.ExecuteReaderAsync();
+            do
+            {
+                while (await reader.ReadAsync())
+                {
+                    if (
+                        reader.FieldCount != 1
+                        || reader.GetFieldType(0) != typeof(string)
+                        || await reader.IsDBNullAsync(0)
+                    )
+                    {
+                        continue;
+                    }
+
+                    statements.AddRange(ParseExecutedPlanStatements(reader.GetString(0)));
+                }
+            } while (await reader.NextResultAsync());
+
+            return statements;
+        }
+        finally
+        {
+            await SetStatisticsXmlAsync(connection, enabled: false);
+        }
+    }
+
+    private static async Task SetStatisticsXmlAsync(SqlConnection connection, bool enabled)
+    {
+        await using SqlCommand command = connection.CreateCommand();
+        command.CommandText = enabled ? "SET STATISTICS XML ON;" : "SET STATISTICS XML OFF;";
+        command.CommandTimeout = 300;
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static IEnumerable<ExecutedPlanStatement> ParseExecutedPlanStatements(string planFragment)
+    {
+        if (!planFragment.TrimStart().StartsWith("<ShowPlanXML", StringComparison.Ordinal))
+        {
+            return [];
+        }
+
+        XNamespace showPlan = "http://schemas.microsoft.com/sqlserver/2004/07/showplan";
+
+        return XDocument
+            .Parse(planFragment)
+            .Descendants(showPlan + "StmtSimple")
+            .Select(statement => new ExecutedPlanStatement(
+                int.Parse(statement.Attribute("ParentObjectId")?.Value ?? "0", CultureInfo.InvariantCulture),
+                statement.Attribute("StatementText")?.Value ?? ""
+            ))
+            .ToArray();
+    }
+
+    private static IReadOnlyList<string> PlanStatementTextsFor(
+        IReadOnlyList<ExecutedPlanStatement> statements,
+        int moduleObjectId
+    )
+    {
+        return
+        [
+            .. statements
+                .Where(statement => statement.ParentObjectId == moduleObjectId)
+                .Select(statement => statement.StatementText),
+        ];
     }
 
     private static DateTimeOffset ReadDateTimeOffset(object? value)

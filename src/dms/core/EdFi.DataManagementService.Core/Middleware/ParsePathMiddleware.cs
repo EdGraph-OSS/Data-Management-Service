@@ -3,8 +3,6 @@
 // The Ed-Fi Alliance licenses this file to you under the Apache License, Version 2.0.
 // See the LICENSE and NOTICES files in the project root for more information.
 
-using System.Text.RegularExpressions;
-using EdFi.DataManagementService.Core.External.Model;
 using EdFi.DataManagementService.Core.Model;
 using EdFi.DataManagementService.Core.Pipeline;
 using EdFi.DataManagementService.Core.Response;
@@ -12,44 +10,12 @@ using Microsoft.Extensions.Logging;
 
 namespace EdFi.DataManagementService.Core.Middleware;
 
-internal record PathInfo(string ProjectEndpointName, string EndpointName, string? DocumentUuid);
-
 /// <summary>
 /// Parses and validates the path from the frontend is well-formed. Adds PathComponents
 /// to the requestInfo if it is.
 /// </summary>
 internal class ParsePathMiddleware(ILogger _logger) : IPipelineStep
 {
-    /// <summary>
-    /// Uses a regex to split the path into PathComponents, or return null if the path is invalid
-    /// </summary>
-    private static PathInfo? PathInfoFrom(string path)
-    {
-        Match match = UtilityService.PathExpressionRegex().Match(path);
-
-        if (!match.Success)
-        {
-            return null;
-        }
-
-        string documentUuidValue = match.Groups["documentUuid"].Value;
-        string? documentUuid = documentUuidValue == "" ? null : documentUuidValue;
-
-        return new(
-            ProjectEndpointName: new(match.Groups["projectNamespace"].Value.ToLower()),
-            EndpointName: new(match.Groups["endpointName"].Value),
-            DocumentUuid: documentUuid
-        );
-    }
-
-    /// <summary>
-    /// Check that this is a well-formed UUID string
-    /// </summary>
-    private static bool IsDocumentUuidWellFormed(string documentUuidString)
-    {
-        return UtilityService.UuidRegex().IsMatch(documentUuidString.ToLower());
-    }
-
     public async Task Execute(RequestInfo requestInfo, Func<Task> next)
     {
         _logger.LogDebug(
@@ -57,59 +23,64 @@ internal class ParsePathMiddleware(ILogger _logger) : IPipelineStep
             requestInfo.FrontendRequest.TraceId.Value
         );
 
-        PathInfo? pathInfo = PathInfoFrom(requestInfo.FrontendRequest.Path);
-
-        if (pathInfo is null)
+        switch (ResourcePathParser.Parse(requestInfo.FrontendRequest.Path))
         {
-            _logger.LogDebug(
-                "ParsePathMiddleware: Not a valid path - {TraceId}",
-                requestInfo.FrontendRequest.TraceId.Value
-            );
-            requestInfo.FrontendResponse = new FrontendResponse(
-                StatusCode: 404,
-                Body: FailureResponse.ForNotFound(
-                    "The specified data could not be found.",
-                    requestInfo.FrontendRequest.TraceId
-                ),
-                Headers: [],
-                ContentType: "application/problem+json"
-            );
-            return;
+            case ResourcePathParseResult.Unmatched:
+                _logger.LogDebug(
+                    "ParsePathMiddleware: Not a valid path - {TraceId}",
+                    requestInfo.FrontendRequest.TraceId.Value
+                );
+                requestInfo.FrontendResponse = new FrontendResponse(
+                    StatusCode: 404,
+                    Body: FailureResponse.ForNotFound(
+                        "The specified data could not be found.",
+                        requestInfo.FrontendRequest.TraceId
+                    ),
+                    Headers: [],
+                    ContentType: "application/problem+json"
+                );
+                return;
+
+            case ResourcePathParseResult.InvalidIdentifier invalidIdentifier:
+                RespondWithInvalidIdentifier(requestInfo, invalidIdentifier.SuppliedSegment);
+                return;
+
+            case ResourcePathParseResult.Recognized recognized:
+                // Every recognized operation, including partitions, continues into the pipeline that
+                // dispatch selected for it. The invalid-identifier response above is reserved for an
+                // unrecognized third segment, which is what a client that mistyped a document id
+                // supplied.
+                requestInfo.PathComponents = recognized.PathComponents;
+
+                await next();
+                return;
+
+            default:
+                throw new InvalidOperationException(
+                    "ParsePathMiddleware received an unhandled resource path parse result."
+                );
         }
+    }
 
-        if (pathInfo.DocumentUuid != null && !IsDocumentUuidWellFormed(pathInfo.DocumentUuid))
-        {
-            _logger.LogDebug(
-                "ParsePathMiddleware: Not a valid document UUID - {TraceId}",
-                requestInfo.FrontendRequest.TraceId.Value
-            );
-
-            requestInfo.FrontendResponse = new FrontendResponse(
-                StatusCode: 400,
-                Body: FailureResponse.ForDataValidation(
-                    detail: "Data validation failed. See 'validationErrors' for details.",
-                    traceId: requestInfo.FrontendRequest.TraceId,
-                    validationErrors: new Dictionary<string, string[]>
-                    {
-                        { "$.id", new[] { $"The value '{pathInfo.DocumentUuid}' is not valid." } },
-                    },
-                    errors: []
-                ),
-                Headers: []
-            );
-            return;
-        }
-
-        DocumentUuid documentUuid =
-            pathInfo.DocumentUuid == null ? No.DocumentUuid : new(new(pathInfo.DocumentUuid));
-
-        requestInfo.PathComponents = new(
-            ProjectEndpointName: new(pathInfo.ProjectEndpointName),
-            EndpointName: new(pathInfo.EndpointName),
-            DocumentUuid: documentUuid,
-            HasDocumentUuidSegment: pathInfo.DocumentUuid is not null
+    private void RespondWithInvalidIdentifier(RequestInfo requestInfo, string suppliedSegment)
+    {
+        _logger.LogDebug(
+            "ParsePathMiddleware: Not a valid document UUID - {TraceId}",
+            requestInfo.FrontendRequest.TraceId.Value
         );
 
-        await next();
+        requestInfo.FrontendResponse = new FrontendResponse(
+            StatusCode: 400,
+            Body: FailureResponse.ForDataValidation(
+                detail: "Data validation failed. See 'validationErrors' for details.",
+                traceId: requestInfo.FrontendRequest.TraceId,
+                validationErrors: new Dictionary<string, string[]>
+                {
+                    { "$.id", new[] { $"The value '{suppliedSegment}' is not valid." } },
+                },
+                errors: []
+            ),
+            Headers: []
+        );
     }
 }

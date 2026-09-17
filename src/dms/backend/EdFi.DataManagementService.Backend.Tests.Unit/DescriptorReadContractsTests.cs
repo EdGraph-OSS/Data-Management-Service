@@ -71,11 +71,8 @@ public class Given_Descriptor_Read_Contracts
                 "string"
             ),
         ];
-        var paginationParameters = new PaginationParameters(
-            Limit: 25,
-            Offset: 10,
-            TotalCount: true,
-            MaximumPageSize: 500
+        var paging = new CollectionPaging.Traditional(
+            new PaginationParameters(Limit: 25, Offset: 10, TotalCount: true, MaximumPageSize: 500)
         );
         AuthorizationStrategyEvaluator[] authorizationStrategyEvaluators =
         [
@@ -92,21 +89,26 @@ public class Given_Descriptor_Read_Contracts
             mappingSet,
             _descriptorResource,
             queryElements,
-            paginationParameters,
+            paging,
             authorizationStrategyEvaluators,
             readableProfileProjectionContext,
-            traceId
+            traceId,
+            PageOrderingMode.ContentVersion
         );
 
         request.Should().NotBeAssignableTo<IQueryRequest>();
         request.MappingSet.Should().BeSameAs(mappingSet);
         request.Resource.Should().Be(_descriptorResource);
         request.QueryElements.Should().BeSameAs(queryElements);
-        request.PaginationParameters.Should().BeSameAs(paginationParameters);
+        request.Paging.Should().BeSameAs(paging);
         request.AuthorizationStrategyEvaluators.Should().BeSameAs(authorizationStrategyEvaluators);
         request.ReadableProfileProjectionContext.Should().BeSameAs(readableProfileProjectionContext);
         request.TraceId.Should().Be(traceId);
         request.ChangeVersionRange.Should().Be(ChangeVersionRange.None);
+
+        // Asserted with the non-default anchor: DocumentId is the enum's zero value, so a request
+        // built with it would carry the right value whether or not the parameter reached the property.
+        request.PageOrderingMode.Should().Be(PageOrderingMode.ContentVersion);
     }
 
     [Test]
@@ -121,10 +123,13 @@ public class Given_Descriptor_Read_Contracts
             mappingSet,
             _descriptorResource,
             [],
-            new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: 25, Offset: 0, TotalCount: false, MaximumPageSize: 500)
+            ),
             [],
             null,
             new TraceId("trace-id"),
+            PageOrderingMode.ContentVersion,
             changeVersionRange: changeVersionRange
         );
 

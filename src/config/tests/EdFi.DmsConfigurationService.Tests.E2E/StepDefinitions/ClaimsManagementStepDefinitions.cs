@@ -16,6 +16,7 @@ public class ClaimsManagementStepDefinitions(ScenarioContext scenarioContext)
     private const string InitialReloadIdKey = "InitialReloadId";
     private const string CurrentReloadIdKey = "CurrentReloadId";
     private const string UploadedClaimsKey = "UploadedClaims";
+    private const string CapturedClaimsKey = "CapturedClaims";
 
     private static JsonNode? _authoritativeComposition;
 
@@ -52,6 +53,71 @@ public class ClaimsManagementStepDefinitions(ScenarioContext scenarioContext)
         }
     }
 
+    /// <summary>
+    /// Captures the current claims response verbatim, together with its reload id, so a later step can
+    /// upload the exact same bytes and the reload id can be proven to have changed.
+    /// </summary>
+    [Given("the current claims response is captured")]
+    public async Task GivenTheCurrentClaimsResponseIsCaptured()
+    {
+        var stepDefinitions = scenarioContext.ScenarioContainer.Resolve<StepDefinitions>();
+
+        await stepDefinitions.WhenAGETRequestIsMadeTo("/management/current-claims");
+
+        var response = GetLastApiResponse();
+        response
+            .Status.Should()
+            .Be(200, "the current claims must be readable before they can be uploaded unchanged");
+
+        // Held as the exact response text, not a reparsed document, so the upload posts it byte for byte.
+        scenarioContext[CapturedClaimsKey] = await response.TextAsync();
+
+        bool hasReloadId = response.Headers.TryGetValue("x-reload-id", out var reloadId);
+        hasReloadId
+            .Should()
+            .BeTrue("the upload can only be proven to change the reload id if the GET reported one");
+        scenarioContext[InitialReloadIdKey] = reloadId!;
+    }
+
+    /// <summary>
+    /// Uploads the captured current-claims response with no wrapping, editing or reserialization. The
+    /// verbatim POST helper is used deliberately: the shared POST step applies placeholder substitution
+    /// to the body, which would defeat the point of an unchanged upload.
+    /// </summary>
+    [When("the captured claims response is uploaded unchanged")]
+    public async Task WhenTheCapturedClaimsResponseIsUploadedUnchanged()
+    {
+        var stepDefinitions = scenarioContext.ScenarioContainer.Resolve<StepDefinitions>();
+
+        await stepDefinitions.PostVerbatimBodyAsync(
+            "/management/upload-claims",
+            (string)scenarioContext[CapturedClaimsKey]
+        );
+    }
+
+    [Then("the response body matches the captured claims response")]
+    public async Task ThenTheResponseBodyMatchesTheCapturedClaimsResponse()
+    {
+        JsonObject captured = JsonNode.Parse((string)scenarioContext[CapturedClaimsKey])!.AsObject();
+        JsonObject current = JsonNode.Parse(await GetLastApiResponse().TextAsync())!.AsObject();
+
+        // The upload deletes and re-inserts claim sets, so their order is not guaranteed; compare them
+        // as an unordered set of name / system-reserved pairs.
+        ClaimSetSummaries(current).Should().BeEquivalentTo(ClaimSetSummaries(captured));
+
+        // The hierarchy is persisted as a single document, so it must survive the round trip exactly.
+        current["claimsHierarchy"]!.ToJsonString().Should().Be(captured["claimsHierarchy"]!.ToJsonString());
+    }
+
+    private static List<string> ClaimSetSummaries(JsonObject claimsDocument) =>
+        claimsDocument["claimSets"]!
+            .AsArray()
+            .Select(claimSet =>
+                $"{claimSet!["claimSetName"]?.GetValue<string>()}|{claimSet["isSystemReserved"]?.GetValue<bool>()}"
+            )
+            .OrderBy(summary => summary, StringComparer.Ordinal)
+            .ToList();
+
     [Given("claims have been uploaded")]
     public async Task GivenClaimsHaveBeenUploaded()
     {
@@ -60,25 +126,23 @@ public class ClaimsManagementStepDefinitions(ScenarioContext scenarioContext)
         // Upload test claims
         var uploadBody = """
             {
-                "claims": {
-                    "claimSets": [{"claimSetName": "TestUploadSet", "isSystemReserved": false}],
-                    "claimsHierarchy": [
-                        {
-                            "name": "http://ed-fi.org/identity/claims/test",
-                            "claimSets": [
-                                {
-                                    "name": "TestUploadSet",
-                                    "actions": [{"name": "Read"}]
-                                }
-                            ]
-                        }
-                    ]
-                }
+                "claimSets": [{"claimSetName": "TestUploadSet", "isSystemReserved": false}],
+                "claimsHierarchy": [
+                    {
+                        "name": "http://ed-fi.org/identity/claims/test",
+                        "claimSets": [
+                            {
+                                "name": "TestUploadSet",
+                                "actions": [{"name": "Read"}]
+                            }
+                        ]
+                    }
+                ]
             }
             """;
 
         await stepDefinitions.WhenSendingAPOSTRequestToWithBody("/management/upload-claims", uploadBody);
-        scenarioContext[UploadedClaimsKey] = JsonNode.Parse(uploadBody)!["claims"];
+        scenarioContext[UploadedClaimsKey] = JsonNode.Parse(uploadBody)!;
     }
 
     [Given("dynamic claims loading is disabled")]
@@ -283,21 +347,38 @@ public class ClaimsManagementStepDefinitions(ScenarioContext scenarioContext)
     [Then("the response body contains validation errors")]
     public async Task ThenTheResponseBodyContainsValidationErrors()
     {
-        var response = GetLastApiResponse();
-        var responseBody = await response.TextAsync();
-        var responseJson = JsonNode.Parse(responseBody);
+        IAPIResponse response = GetLastApiResponse();
+        string responseBody = await response.TextAsync();
+        JsonObject body = JsonNode.Parse(responseBody)!.AsObject();
 
-        // Check for validation error structure
-        var errors = responseJson!["errors"]?.AsArray();
-        var success = responseJson["success"]?.GetValue<bool>();
+        // Exact Ed-Fi data-validation contract. This scenario posts a path-bearing
+        // schema-validation failure, so the response is a data-validation problem: the detail is
+        // carried in "validationErrors" and "errors" is empty.
+        body["type"]!.GetValue<string>().Should().Be("urn:ed-fi:api:bad-request:data");
+        body["title"]!.GetValue<string>().Should().Be("Data Validation Failed");
+        body["detail"]!
+            .GetValue<string>()
+            .Should()
+            .Be("Data validation failed. See 'validationErrors' for details.");
+        body["status"]!.GetValue<int>().Should().Be(400);
+        body["correlationId"]!.GetValue<string>().Should().NotBeNullOrWhiteSpace();
 
-        if (success.HasValue)
-        {
-            success.Should().BeFalse();
-        }
+        // Field-level validation detail lives in the "validationErrors" object (keyed by property path).
+        body["validationErrors"].Should().NotBeNull();
+        JsonObject validationErrors = body["validationErrors"]!.AsObject();
+        validationErrors
+            .Count.Should()
+            .BeGreaterThan(0, "path-bearing schema-validation failures populate 'validationErrors'");
 
-        errors.Should().NotBeNull();
-        errors!.Count.Should().BeGreaterThan(0, "Expected validation errors in the response");
+        // "errors" is reserved for general developer messages and is empty for a path-bearing
+        // data-validation response.
+        body["errors"].Should().NotBeNull();
+        JsonArray errors = body["errors"]!.AsArray();
+        errors.Count.Should().Be(0, "'errors' is empty for a path-bearing data-validation response");
+
+        // The legacy upload response shape (a boolean success flag) must be absent under the contract.
+        body.ContainsKey("success").Should().BeFalse();
+        body.ContainsKey("Success").Should().BeFalse();
     }
 
     private IAPIResponse GetLastApiResponse()

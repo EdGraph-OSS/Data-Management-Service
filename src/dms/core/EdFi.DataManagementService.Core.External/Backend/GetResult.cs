@@ -52,6 +52,20 @@ public record GetResult
         : GetResult();
 
     /// <summary>
+    /// A failure because custom view-based authorization denied access to the document. Carries the
+    /// custom-view failure metadata so Core can build the §2.4/§2.7/§2.8 ProblemDetails response.
+    /// </summary>
+    public record GetFailureCustomViewNotAuthorized(CustomViewAuthorizationFailure CustomViewFailure)
+        : GetResult();
+
+    /// <summary>
+    /// A failure because stored ownership-based authorization denied access to the document. Carries the
+    /// ownership failure metadata so Core can build the §2.13/§2.14 ProblemDetails response.
+    /// </summary>
+    public record GetFailureOwnershipNotAuthorized(OwnershipAuthorizationFailure OwnershipFailure)
+        : GetResult();
+
+    /// <summary>
     /// A failure because the requested read operation is intentionally not implemented.
     /// </summary>
     /// <param name="FailureMessage">A message providing failure information</param>

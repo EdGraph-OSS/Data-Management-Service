@@ -10,8 +10,6 @@ using EdFi.DmsConfigurationService.DataModel.Model.DataStoreDerivative;
 using EdFi.DmsConfigurationService.Frontend.AspNetCore.Infrastructure;
 using EdFi.DmsConfigurationService.Frontend.AspNetCore.Infrastructure.Authorization;
 using EdFi.DmsConfigurationService.Frontend.AspNetCore.Models;
-using FluentValidation;
-using FluentValidation.Results;
 
 namespace EdFi.DmsConfigurationService.Frontend.AspNetCore.Modules;
 
@@ -49,11 +47,18 @@ public class DataStoreDerivativeModule : IEndpointModule
                 }
             ),
             DataStoreDerivativeInsertResult.FailureForeignKeyViolation => Results.Json(
-                FailureResponse.ForBadRequest(
+                FailureResponse.ForUnresolvedReference(
                     "The specified DataStore does not exist.",
                     httpContext.TraceIdentifier
                 ),
-                statusCode: (int)HttpStatusCode.BadRequest
+                statusCode: (int)HttpStatusCode.Conflict
+            ),
+            DataStoreDerivativeInsertResult.FailureDuplicateDataStoreDerivative duplicate => Results.Json(
+                FailureResponse.ForConflict(
+                    DuplicateDerivativeDetail(duplicate.DataStoreId, duplicate.DerivativeType),
+                    httpContext.TraceIdentifier
+                ),
+                statusCode: (int)HttpStatusCode.Conflict
             ),
             _ => FailureResults.Unknown(httpContext.TraceIdentifier),
         };
@@ -78,7 +83,7 @@ public class DataStoreDerivativeModule : IEndpointModule
     }
 
     private static async Task<IResult> GetById(
-        long id,
+        int id,
         HttpContext httpContext,
         IDataStoreDerivativeRepository repository
     )
@@ -99,21 +104,16 @@ public class DataStoreDerivativeModule : IEndpointModule
     }
 
     private static async Task<IResult> Update(
-        long id,
+        int id,
         DataStoreDerivativeUpdateCommand command,
         DataStoreDerivativeUpdateCommand.Validator validator,
         HttpContext httpContext,
         IDataStoreDerivativeRepository repository
     )
     {
-        await validator.GuardAsync(command);
+        PutGuards.GuardRouteIdMatchesBodyId(id, command.Id);
 
-        if (command.Id != id)
-        {
-            throw new ValidationException(
-                new[] { new ValidationFailure("Id", "Request body id must match the id in the url.") }
-            );
-        }
+        await validator.GuardAsync(command);
 
         var updateResult = await repository.UpdateDataStoreDerivative(command);
 
@@ -128,18 +128,28 @@ public class DataStoreDerivativeModule : IEndpointModule
                 statusCode: (int)HttpStatusCode.NotFound
             ),
             DataStoreDerivativeUpdateResult.FailureForeignKeyViolation => Results.Json(
-                FailureResponse.ForBadRequest(
+                FailureResponse.ForUnresolvedReference(
                     "The specified DataStore does not exist.",
                     httpContext.TraceIdentifier
                 ),
-                statusCode: (int)HttpStatusCode.BadRequest
+                statusCode: (int)HttpStatusCode.Conflict
+            ),
+            DataStoreDerivativeUpdateResult.FailureDuplicateDataStoreDerivative duplicate => Results.Json(
+                FailureResponse.ForConflict(
+                    DuplicateDerivativeDetail(duplicate.DataStoreId, duplicate.DerivativeType),
+                    httpContext.TraceIdentifier
+                ),
+                statusCode: (int)HttpStatusCode.Conflict
             ),
             _ => FailureResults.Unknown(httpContext.TraceIdentifier),
         };
     }
 
+    private static string DuplicateDerivativeDetail(int dataStoreId, string derivativeType) =>
+        $"A DataStoreDerivative of type {derivativeType} already exists for DataStore {dataStoreId}.";
+
     private static async Task<IResult> Delete(
-        long id,
+        int id,
         HttpContext httpContext,
         IDataStoreDerivativeRepository repository
     )

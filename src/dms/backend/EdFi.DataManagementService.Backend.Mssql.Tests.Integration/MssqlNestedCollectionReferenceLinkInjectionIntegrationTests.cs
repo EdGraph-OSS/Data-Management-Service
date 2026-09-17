@@ -202,7 +202,7 @@ public class Given_A_Mssql_BellSchedule_With_Nested_Collection_ClassPeriod_Refer
         services.Configure<DatabaseOptions>(options => options.IsolationLevel = IsolationLevel.ReadCommitted);
         services.AddTestReadableProfileProjector();
         services.AddScoped<RelationalDocumentStoreRepository>();
-        services.AddMssqlReferenceResolver();
+        services.AddMssqlBackendIntegrationTestServices();
 
         short schoolResourceKeyId = _mappingSet.ResourceKeyIdByResource[SchoolResource];
         short classPeriodResourceKeyId = _mappingSet.ResourceKeyIdByResource[ClassPeriodResource];
@@ -420,13 +420,16 @@ public class Given_A_Mssql_BellSchedule_With_Nested_Collection_ClassPeriod_Refer
             MappingSet: _mappingSet,
             QueryElements: [],
             AuthorizationStrategyEvaluators: [],
-            PaginationParameters: new PaginationParameters(
-                Limit: 25,
-                Offset: 0,
-                TotalCount: false,
-                MaximumPageSize: MaximumPageSize
+            Paging: new CollectionPaging.Traditional(
+                new PaginationParameters(
+                    Limit: 25,
+                    Offset: 0,
+                    TotalCount: false,
+                    MaximumPageSize: MaximumPageSize
+                )
             ),
-            TraceId: new TraceId("mssql-29c-query-bellschedule")
+            TraceId: new TraceId("mssql-29c-query-bellschedule"),
+            PageOrderingMode: PageOrderingMode.DocumentId
         );
 
         return await scope
@@ -555,6 +558,7 @@ public class Given_A_Mssql_BellSchedule_With_Nested_Collection_ClassPeriod_Refer
             """
             INSERT INTO [dms].[Descriptor] (
                 [DocumentId],
+                [ResourceKeyId],
                 [Namespace],
                 [CodeValue],
                 [ShortDescription],
@@ -564,6 +568,7 @@ public class Given_A_Mssql_BellSchedule_With_Nested_Collection_ClassPeriod_Refer
             )
             VALUES (
                 @documentId,
+                @resourceKeyId,
                 @namespace,
                 @codeValue,
                 @shortDescription,
@@ -573,6 +578,7 @@ public class Given_A_Mssql_BellSchedule_With_Nested_Collection_ClassPeriod_Refer
             );
             """,
             new SqlParameter("@documentId", documentId),
+            new SqlParameter("@resourceKeyId", resourceKeyId),
             new SqlParameter("@namespace", @namespace),
             new SqlParameter("@codeValue", codeValue),
             new SqlParameter("@shortDescription", shortDescription),

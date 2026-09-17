@@ -12,6 +12,9 @@ on:
       - "v*.*.*"
     paths:
       - "src/dms/**"
+      # The plugin contract tree. Both main solutions build it and the DMS image build stage
+      # copies it, so a plugins-only merge must produce a DMS prerelease like any other.
+      - "src/plugins/**"
 
 env:
   API_URL: https://api.github.com/repos/${{ github.repository }}
@@ -28,7 +31,7 @@ jobs:
         shell: pwsh
     steps:
       - name: Checkout the Repo
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # MinVer needs to have more than just the current commit, so tell
           # GitHub to get many more. Setting to 0 forces retrieval of _all_

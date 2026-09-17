@@ -5,6 +5,7 @@
 
 using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Backend.RelationalModel;
+using EdFi.DataManagementService.Backend.RelationalModel.Naming;
 
 namespace EdFi.DataManagementService.Backend.Plans;
 
@@ -26,6 +27,19 @@ internal sealed record ResolvedEdOrgSecurableElementCandidateResolution(
 /// </summary>
 internal static class SecurableElementColumnPathResolver
 {
+    private static readonly DbTableName DescriptorTable = new(new DbSchemaName("dms"), "Descriptor");
+
+    /// <summary>
+    /// One explored subject-to-basis path, with the ranking inputs the winner is chosen by plus the
+    /// terminal reference metadata carried alongside them.
+    /// </summary>
+    private sealed record BasisPathCandidate(
+        IReadOnlyList<(bool IsIdentity, bool IsRequired, bool IsRoleNamed)> Hops,
+        bool PreferExactAbstractBasis,
+        IReadOnlyList<ColumnPathStep> Steps,
+        IReadOnlyList<string> TerminalReferenceJsonPaths
+    );
+
     /// <summary>
     /// Resolves all securable element column paths for a single concrete resource.
     /// Returns a list of resolved paths, each carrying the element kind and the column path chain.
@@ -139,6 +153,387 @@ internal static class SecurableElementColumnPathResolver
         }
 
         return results;
+    }
+
+    /// <summary>
+    /// Resolves the preferred join path from a subject resource name to a basis resource name.
+    /// This overload matches the view-based authorization design contract.
+    /// </summary>
+    public static IReadOnlyList<ColumnPathStep> ResolveSecurableElementColumnPath(
+        QualifiedResourceName subjectResource,
+        QualifiedResourceName basisResource,
+        DerivedRelationalModelSet modelSet
+    ) => ResolveBasisResourcePath(subjectResource, basisResource, modelSet);
+
+    /// <summary>
+    /// Resolves the preferred join path from a subject resource name to a basis resource name.
+    /// </summary>
+    public static IReadOnlyList<ColumnPathStep> ResolveBasisResourcePath(
+        QualifiedResourceName subjectResource,
+        QualifiedResourceName basisResource,
+        DerivedRelationalModelSet modelSet
+    ) => ResolveBasisResourcePathWithMetadata(subjectResource, basisResource, modelSet).Steps;
+
+    /// <summary>
+    /// Resolves the preferred join path from a subject resource name to a basis resource name, together
+    /// with the JSON paths of the reference that terminates the winning path. The steps are identical to
+    /// those returned by the step-only overload; only the reference metadata is additional.
+    /// </summary>
+    public static ResolvedBasisResourcePath ResolveBasisResourcePathWithMetadata(
+        QualifiedResourceName subjectResource,
+        QualifiedResourceName basisResource,
+        DerivedRelationalModelSet modelSet
+    )
+    {
+        ArgumentNullException.ThrowIfNull(modelSet);
+
+        var resourceLookup = modelSet.GetConcreteResourceModelsByResource();
+        return
+            !resourceLookup.TryGetValue(subjectResource, out var subjectConcreteResource)
+            || !IsKnownBasisResource(basisResource, resourceLookup, modelSet.AbstractUnionViewsInNameOrder)
+            ? ResolvedBasisResourcePath.Unresolved
+            : ResolveBasisResourcePathWithMetadata(
+                subjectConcreteResource,
+                basisResource,
+                resourceLookup,
+                modelSet.AbstractUnionViewsInNameOrder
+            );
+    }
+
+    private static bool IsKnownBasisResource(
+        QualifiedResourceName basisResource,
+        IReadOnlyDictionary<QualifiedResourceName, ConcreteResourceModel> resourceLookup,
+        IReadOnlyList<AbstractUnionViewInfo> abstractUnionViews
+    ) =>
+        resourceLookup.ContainsKey(basisResource)
+        || abstractUnionViews.Any(view =>
+            view.AbstractResourceKey.Resource == basisResource
+            || view.UnionArmsInOrder.Any(arm => arm.ConcreteMemberResourceKey.Resource == basisResource)
+        );
+
+    /// <summary>
+    /// Resolves the preferred join path from a subject resource model to a basis resource.
+    /// Returns an ordered list of column-path steps that end at the basis resource's DocumentId.
+    /// </summary>
+    public static IReadOnlyList<ColumnPathStep> ResolveBasisResourcePath(
+        ConcreteResourceModel subjectResource,
+        QualifiedResourceName basisResource,
+        IReadOnlyDictionary<QualifiedResourceName, ConcreteResourceModel> resourceLookup,
+        IReadOnlyList<AbstractUnionViewInfo> abstractUnionViews
+    ) =>
+        ResolveBasisResourcePathWithMetadata(
+            subjectResource,
+            basisResource,
+            resourceLookup,
+            abstractUnionViews
+        ).Steps;
+
+    /// <summary>
+    /// Resolves the preferred join path from a subject resource model to a basis resource, together with
+    /// the JSON paths of the reference that terminates the winning path. Only references and descriptor
+    /// edges that live on a resource's root table participate: ODS matches basis identifier properties by
+    /// name on the subject root entity, so routes through child collection tables or extension
+    /// (<c>_ext</c>) tables are not join paths (auth.md: authorization checks do not apply to collection
+    /// items or to fields added through extensions).
+    /// </summary>
+    public static ResolvedBasisResourcePath ResolveBasisResourcePathWithMetadata(
+        ConcreteResourceModel subjectResource,
+        QualifiedResourceName basisResource,
+        IReadOnlyDictionary<QualifiedResourceName, ConcreteResourceModel> resourceLookup,
+        IReadOnlyList<AbstractUnionViewInfo> abstractUnionViews
+    )
+    {
+        ArgumentNullException.ThrowIfNull(subjectResource);
+        ArgumentNullException.ThrowIfNull(resourceLookup);
+        ArgumentNullException.ThrowIfNull(abstractUnionViews);
+
+        var subjectModel = subjectResource.RelationalModel;
+        var subjectRoot = subjectModel.Root;
+        var abstractBasisMembersByResource = abstractUnionViews
+            .GroupBy(static view => view.AbstractResourceKey.Resource)
+            .ToDictionary(
+                static grouping => grouping.Key,
+                grouping =>
+                    grouping
+                        .SelectMany(static view => view.UnionArmsInOrder)
+                        .Select(static arm => arm.ConcreteMemberResourceKey.Resource)
+                        .ToHashSet()
+            );
+        var basisIsAbstract = abstractBasisMembersByResource.ContainsKey(basisResource);
+
+        if (IsBasisMatch(subjectModel.Resource, basisResource, abstractBasisMembersByResource))
+        {
+            // The basis is the subject itself, so the path terminates on the subject's own DocumentId
+            // rather than on a reference. There is no terminal reference JSON path to report.
+            return new ResolvedBasisResourcePath(
+                [
+                    new ColumnPathStep(
+                        subjectRoot.Table,
+                        PersonJoinPathResolver.ResolveToCanonicalColumn(
+                            subjectRoot,
+                            RelationalNameConventions.DocumentIdColumnName
+                        ),
+                        null,
+                        null
+                    ),
+                ],
+                []
+            );
+        }
+
+        var candidates = Explore(subjectModel, [subjectModel.Resource], [], []);
+
+        if (candidates.Count == 0)
+        {
+            return ResolvedBasisResourcePath.Unresolved;
+        }
+
+        var bestCandidate = candidates[0];
+        for (var index = 1; index < candidates.Count; index++)
+        {
+            if (CompareCandidates(candidates[index], bestCandidate) < 0)
+            {
+                bestCandidate = candidates[index];
+            }
+        }
+
+        return new ResolvedBasisResourcePath(bestCandidate.Steps, bestCandidate.TerminalReferenceJsonPaths);
+
+        List<BasisPathCandidate> Explore(
+            RelationalResourceModel currentModel,
+            HashSet<QualifiedResourceName> visitedResources,
+            List<(bool IsIdentity, bool IsRequired, bool IsRoleNamed)> hopsSoFar,
+            List<ColumnPathStep> stepsSoFar
+        )
+        {
+            var foundCandidates = new List<BasisPathCandidate>();
+            var rootTable = currentModel.Root;
+
+            foreach (var binding in currentModel.DocumentReferenceBindings)
+            {
+                // Only root-table references are authorization subjects. ODS matches basis identifier
+                // properties by name on the subject root entity, so a reference that lives on a child
+                // collection table or an extension (_ext) table can never carry the basis join
+                // (auth.md: checks do not apply to collection items or extension fields).
+                if (!binding.Table.Equals(rootTable.Table))
+                {
+                    continue;
+                }
+
+                if (visitedResources.Contains(binding.TargetResource))
+                {
+                    continue;
+                }
+
+                if (hopsSoFar.Count > 0 && !binding.IsIdentityComponent)
+                {
+                    continue;
+                }
+
+                var sourceColumnName = PersonJoinPathResolver.ResolveToCanonicalColumn(
+                    rootTable,
+                    binding.FkColumn
+                );
+                var terminalMatch = IsBasisMatch(
+                    binding.TargetResource,
+                    basisResource,
+                    abstractBasisMembersByResource
+                );
+                if (terminalMatch && !IsKnownBasisResource(basisResource, resourceLookup, abstractUnionViews))
+                {
+                    continue;
+                }
+
+                if (!terminalMatch)
+                {
+                    if (!resourceLookup.TryGetValue(binding.TargetResource, out var nextResource))
+                    {
+                        continue;
+                    }
+
+                    var nextSteps = new List<ColumnPathStep>(stepsSoFar)
+                    {
+                        new(
+                            rootTable.Table,
+                            sourceColumnName,
+                            nextResource.RelationalModel.Root.Table,
+                            PersonJoinPathResolver.ResolveToCanonicalColumn(
+                                nextResource.RelationalModel.Root,
+                                RelationalNameConventions.DocumentIdColumnName
+                            )
+                        ),
+                    };
+                    var nextHops = new List<(bool IsIdentity, bool IsRequired, bool IsRoleNamed)>(hopsSoFar)
+                    {
+                        GetBindingPriority(binding, rootTable),
+                    };
+                    var nextVisitedResources = new HashSet<QualifiedResourceName>(visitedResources)
+                    {
+                        binding.TargetResource,
+                    };
+
+                    foundCandidates.AddRange(
+                        Explore(nextResource.RelationalModel, nextVisitedResources, nextHops, nextSteps)
+                    );
+                    continue;
+                }
+
+                var terminalSteps = new List<ColumnPathStep>(stepsSoFar)
+                {
+                    new(rootTable.Table, sourceColumnName, null, null),
+                };
+                var terminalHops = new List<(bool IsIdentity, bool IsRequired, bool IsRoleNamed)>(hopsSoFar)
+                {
+                    GetBindingPriority(binding, rootTable),
+                };
+
+                foundCandidates.Add(
+                    new BasisPathCandidate(
+                        terminalHops,
+                        basisIsAbstract && binding.TargetResource == basisResource,
+                        terminalSteps,
+                        [
+                            .. binding.IdentityBindings.Select(static identityBinding =>
+                                identityBinding.ReferenceJsonPath.Canonical
+                            ),
+                        ]
+                    )
+                );
+            }
+
+            foreach (var descriptorEdge in currentModel.DescriptorEdgeSources)
+            {
+                if (!Equals(descriptorEdge.DescriptorResource, basisResource))
+                {
+                    continue;
+                }
+
+                // The root-only rule above applies to descriptor edges too: a descriptor referenced only
+                // inside a collection or an extension has no identifier column on the subject root table.
+                if (!descriptorEdge.Table.Equals(rootTable.Table))
+                {
+                    continue;
+                }
+
+                var descriptorSteps = new List<ColumnPathStep>(stepsSoFar)
+                {
+                    new(
+                        rootTable.Table,
+                        PersonJoinPathResolver.ResolveToCanonicalColumn(rootTable, descriptorEdge.FkColumn),
+                        DescriptorTable,
+                        RelationalNameConventions.DocumentIdColumnName
+                    ),
+                };
+                var descriptorHops = new List<(bool IsIdentity, bool IsRequired, bool IsRoleNamed)>(hopsSoFar)
+                {
+                    GetDescriptorEdgePriority(descriptorEdge, rootTable),
+                };
+
+                foundCandidates.Add(
+                    new BasisPathCandidate(
+                        descriptorHops,
+                        false,
+                        descriptorSteps,
+                        [descriptorEdge.DescriptorValuePath.Canonical]
+                    )
+                );
+            }
+
+            return foundCandidates;
+        }
+
+        static bool IsBasisMatch(
+            QualifiedResourceName reachedResource,
+            QualifiedResourceName basis,
+            IReadOnlyDictionary<QualifiedResourceName, HashSet<QualifiedResourceName>> abstractMembersByBasis
+        ) =>
+            reachedResource == basis
+            || (
+                abstractMembersByBasis.TryGetValue(basis, out var abstractMembers)
+                && abstractMembers.Contains(reachedResource)
+            )
+            || (
+                abstractMembersByBasis.TryGetValue(reachedResource, out var reachedAbstractMembers)
+                && reachedAbstractMembers.Contains(basis)
+            );
+
+        // Ranking reads only Hops, PreferExactAbstractBasis, and Steps. TerminalReferenceJsonPaths is
+        // carried metadata and deliberately takes no part in candidate selection, so adding it cannot
+        // change which path wins.
+        static int CompareCandidates(BasisPathCandidate left, BasisPathCandidate right)
+        {
+            // auth.md requires StudentSchoolAssociation -> GraduationPlan -> EducationOrganization
+            // to win over the direct School union-arm route for an EducationOrganization basis.
+            // This exact-abstract terminal match intentionally precedes generic path ranking.
+            if (left.PreferExactAbstractBasis != right.PreferExactAbstractBasis)
+            {
+                return left.PreferExactAbstractBasis ? -1 : 1;
+            }
+
+            var hopCount = Math.Min(left.Hops.Count, right.Hops.Count);
+            for (var hopIndex = 0; hopIndex < hopCount; hopIndex++)
+            {
+                var leftPriority = left.Hops[hopIndex];
+                var rightPriority = right.Hops[hopIndex];
+
+                if (leftPriority.IsIdentity != rightPriority.IsIdentity)
+                {
+                    return leftPriority.IsIdentity ? -1 : 1;
+                }
+
+                if (leftPriority.IsRequired != rightPriority.IsRequired)
+                {
+                    return leftPriority.IsRequired ? -1 : 1;
+                }
+
+                if (leftPriority.IsRoleNamed != rightPriority.IsRoleNamed)
+                {
+                    return leftPriority.IsRoleNamed ? 1 : -1;
+                }
+            }
+
+            if (left.Steps.Count != right.Steps.Count)
+            {
+                return left.Steps.Count < right.Steps.Count ? -1 : 1;
+            }
+
+            return 0;
+        }
+
+        static (bool IsIdentity, bool IsRequired, bool IsRoleNamed) GetBindingPriority(
+            DocumentReferenceBinding binding,
+            DbTableModel owningTable
+        )
+        {
+            var isRequired = binding.IsRequired;
+
+            if (!isRequired)
+            {
+                var fkColumn = owningTable.Columns.FirstOrDefault(column =>
+                    column.ColumnName == binding.FkColumn
+                );
+
+                if (fkColumn is not null)
+                {
+                    isRequired = !fkColumn.IsNullable;
+                }
+            }
+
+            return (binding.IsIdentityComponent, isRequired, binding.IsRoleNamed);
+        }
+
+        static (bool IsIdentity, bool IsRequired, bool IsRoleNamed) GetDescriptorEdgePriority(
+            DescriptorEdgeSource descriptorEdge,
+            DbTableModel owningTable
+        )
+        {
+            var fkColumn = owningTable.Columns.FirstOrDefault(column =>
+                column.ColumnName == descriptorEdge.FkColumn
+            );
+            var isRequired = descriptorEdge.IsRequired || (fkColumn is not null && !fkColumn.IsNullable);
+
+            return (descriptorEdge.IsIdentityComponent, isRequired, descriptorEdge.IsRoleNamed);
+        }
     }
 
     internal static ResolvedEdOrgSecurableElementCandidateResolution ResolveEducationOrganizationCandidates(

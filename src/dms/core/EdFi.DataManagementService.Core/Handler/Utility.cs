@@ -11,6 +11,7 @@ using EdFi.DataManagementService.Core.Model;
 using EdFi.DataManagementService.Core.Pipeline;
 using EdFi.DataManagementService.Core.Profile;
 using EdFi.DataManagementService.Core.Response;
+using EdFi.DataManagementService.Core.Utilities;
 using Microsoft.Extensions.Logging;
 using Polly;
 using Polly.Retry;
@@ -38,9 +39,30 @@ public static class Utility
         result
             is DeleteResult.DeleteFailureWriteConflict
                 or GetResult.GetFailureRetryable
+                or PartitionResult.PartitionFailureRetryable
                 or QueryResult.QueryFailureRetryable
                 or UpdateResult.UpdateFailureWriteConflict
                 or UpsertResult.UpsertFailureWriteConflict;
+
+    /// <summary>
+    /// Returns true if the given result represents an unknown backend or system failure. This is the
+    /// single source of truth for the circuit-breaker predicate used by the resilience pipeline.
+    /// </summary>
+    /// <remarks>
+    /// Extracted alongside <see cref="IsRetryableResult" /> so the two predicates guarding the same
+    /// pipeline are declared the same way and are equally testable. Held here rather than inline at the
+    /// composition site because an operation that adds a result type has to extend both, and a
+    /// classification that only exists inside a pipeline builder cannot be asserted without building
+    /// the pipeline.
+    /// </remarks>
+    internal static bool IsUnknownFailureResult(object result) =>
+        result
+            is DeleteResult.UnknownFailure
+                or GetResult.UnknownFailure
+                or PartitionResult.UnknownPartitionFailure
+                or QueryResult.UnknownFailure
+                or UpdateResult.UnknownFailure
+                or UpsertResult.UnknownFailure;
 
     /// <summary>
     /// Creates the OnRetry callback used by the deadlock retry policy.
@@ -80,6 +102,39 @@ public static class Utility
     public static JsonNode? ToJsonError(string errorInfo, TraceId traceId)
     {
         return new JsonObject { ["error"] = errorInfo, ["correlationId"] = traceId.Value };
+    }
+
+    /// <summary>
+    /// Shapes the response for a backend failure the backend itself could not classify. The failure
+    /// message is written for diagnosis and names internal components, so it is logged rather than
+    /// served; several producers build it from a caught exception and log nothing else, which makes
+    /// this the only record of what went wrong. Being exception-derived is also why it is sanitized
+    /// like the request path beside it, at the cost of the punctuation the whitelist drops. The
+    /// client receives the standard problem-details envelope in its place. Note that a failure
+    /// escaping as an exception instead of a result is answered by
+    /// <c>CoreExceptionLoggingMiddleware</c>, whose generic 500 deliberately carries a different,
+    /// non-problem-details body, so the two shapes both exist for server-side failures.
+    /// </summary>
+    internal static FrontendResponse CreateUnknownFailureResponse(
+        ILogger logger,
+        RequestInfo requestInfo,
+        string failureMessage
+    )
+    {
+        logger.LogError(
+            "Backend reported an unknown failure for {Method} {Path}: {FailureMessage} - {TraceId}",
+            requestInfo.Method,
+            LoggingSanitizer.SanitizeForLogging(requestInfo.FrontendRequest.Path),
+            LoggingSanitizer.SanitizeForLogging(failureMessage),
+            requestInfo.FrontendRequest.TraceId.Value
+        );
+
+        return new FrontendResponse(
+            StatusCode: 500,
+            Body: FailureResponse.ForSystemError(requestInfo.FrontendRequest.TraceId),
+            Headers: [],
+            ContentType: "application/problem+json"
+        );
     }
 
     internal static FrontendResponse CreateSecurityConfigurationFailureResponse(
@@ -169,6 +224,20 @@ public static class Utility
     /// <summary>
     /// Executes an operation within a resilience pipeline, handling retry logging.
     /// </summary>
+    /// <param name="resilienceCancellationToken">
+    /// The token the resilience context - and therefore the operation itself - is seeded with.
+    /// Defaults to <see cref="CancellationToken.None" />, so the retry loop is not abandonable
+    /// unless a caller opts in.
+    /// The default is deliberately the conservative direction rather than the convenient one: a
+    /// write handler that forgets to opt out would silently drop a non-idempotent write that would
+    /// otherwise have been retried and applied, while a read handler that forgets to opt in only
+    /// keeps retrying work nobody is waiting for. The failure modes are not symmetric, so the
+    /// default protects the one that loses data.
+    /// Read handlers therefore pass <see cref="RequestInfo.RequestCancellationToken" /> explicitly.
+    /// All three write handlers pass <see cref="CancellationToken.None" /> explicitly rather than
+    /// relying on the default, so the durability choice stays visible at the call site and none of
+    /// them changes behaviour if this default is ever flipped. No call site relies on the default.
+    /// </param>
     internal static async Task<TResult> ExecuteWithRetryLogging<TResult>(
         ResiliencePipeline resiliencePipeline,
         ILogger logger,
@@ -177,12 +246,13 @@ public static class Utility
         Func<TResult, bool> isRetryExhausted,
         Func<TResult, bool> isSuccess,
         Func<CancellationToken, ValueTask<TResult>> operation,
-        RequestInfo requestInfo
+        RequestInfo requestInfo,
+        CancellationToken resilienceCancellationToken = default
     )
         where TResult : class
     {
         int attemptCount = 0;
-        var context = ResilienceContextPool.Shared.Get();
+        var context = ResilienceContextPool.Shared.Get(resilienceCancellationToken);
         context.Properties.Set(TraceIdKey, traceId.Value);
         context.Properties.Set(OperationNameKey, operationName);
 

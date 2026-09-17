@@ -12,7 +12,6 @@ using EdFi.DmsConfigurationService.Frontend.AspNetCore.Infrastructure;
 using EdFi.DmsConfigurationService.Frontend.AspNetCore.Infrastructure.Authorization;
 using EdFi.DmsConfigurationService.Frontend.AspNetCore.Models;
 using FluentValidation;
-using FluentValidation.Results;
 
 namespace EdFi.DmsConfigurationService.Frontend.AspNetCore.Modules;
 
@@ -83,7 +82,7 @@ public class ClaimSetModule : IEndpointModule
     }
 
     private static async Task<IResult> GetById(
-        long id,
+        int id,
         HttpContext httpContext,
         IClaimSetRepository repository,
         ILogger<ClaimSetModule> logger
@@ -107,21 +106,16 @@ public class ClaimSetModule : IEndpointModule
     }
 
     private static async Task<IResult> Update(
-        long id,
+        int id,
         ClaimSetUpdateCommand command,
         ClaimSetUpdateCommand.Validator validator,
         HttpContext httpContext,
         IClaimSetRepository repository
     )
     {
-        await validator.GuardAsync(command);
+        PutGuards.GuardRouteIdMatchesBodyId(id, command.Id);
 
-        if (command.Id != id)
-        {
-            throw new ValidationException(
-                new[] { new ValidationFailure("Id", "Request body id must match the id in the url.") }
-            );
-        }
+        await validator.GuardAsync(command);
 
         var result = await repository.UpdateClaimSet(command);
 
@@ -163,7 +157,7 @@ public class ClaimSetModule : IEndpointModule
     }
 
     private static async Task<IResult> Delete(
-        long id,
+        int id,
         HttpContext httpContext,
         IClaimSetRepository repository,
         ILogger<ClaimSetModule> logger
@@ -205,7 +199,7 @@ public class ClaimSetModule : IEndpointModule
     }
 
     private static async Task<IResult> Export(
-        long id,
+        int id,
         HttpContext httpContext,
         IClaimSetRepository repository,
         ILogger<ClaimSetModule> logger
@@ -248,11 +242,12 @@ public class ClaimSetModule : IEndpointModule
                 null
             ),
             ClaimSetCopyResult.FailureNotFound => Results.Json(
-                FailureResponse.ForNotFound(
+                FailureResponse.ForUnresolvedReference(
                     $"OriginalId {entity.OriginalId} not found. It may have been recently deleted.",
                     httpContext.TraceIdentifier
                 ),
-                statusCode: (int)HttpStatusCode.NotFound
+                contentType: "application/problem+json",
+                statusCode: (int)HttpStatusCode.Conflict
             ),
             ClaimSetCopyResult.FailureDuplicateClaimSetName => DuplicateClaimSetName(httpContext),
             ClaimSetCopyResult.FailureMultiUserConflict => Results.Json(

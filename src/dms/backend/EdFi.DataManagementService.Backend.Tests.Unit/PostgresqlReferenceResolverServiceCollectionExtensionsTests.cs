@@ -8,6 +8,7 @@ using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Backend.Plans;
 using EdFi.DataManagementService.Backend.Postgresql;
 using EdFi.DataManagementService.Core.Configuration;
+using EdFi.DataManagementService.Core.DocumentCache;
 using EdFi.DataManagementService.Core.External.Backend;
 using EdFi.DataManagementService.Core.External.Model;
 using EdFi.DataManagementService.Core.Profile;
@@ -24,6 +25,8 @@ namespace EdFi.DataManagementService.Backend.Tests.Unit;
 [Parallelizable]
 public class Given_Postgresql_Reference_Resolver_Service_Collection_Extensions
 {
+    private static readonly DocumentCacheTargetKey TargetKey = DocumentCacheTargetKey.Create("TenantA", 7);
+
     [Test]
     public void It_registers_the_postgresql_reference_resolution_composition_surface()
     {
@@ -32,6 +35,7 @@ public class Given_Postgresql_Reference_Resolver_Service_Collection_Extensions
         services.AddLogging();
         services.AddSingleton(A.Fake<IReadableProfileProjector>());
         services.AddSingleton<NpgsqlDataSourceCache>();
+        services.AddSingleton(A.Fake<IDataStoreProvider>());
         services.AddScoped<IDataStoreSelection, DataStoreSelection>();
         services.AddScoped<NpgsqlDataSourceProvider>();
         services.Configure<DatabaseOptions>(options => options.IsolationLevel = IsolationLevel.ReadCommitted);
@@ -44,8 +48,6 @@ public class Given_Postgresql_Reference_Resolver_Service_Collection_Extensions
         var writeFlattener = scope.ServiceProvider.GetRequiredService<IRelationalWriteFlattener>();
         var currentStateLoader =
             scope.ServiceProvider.GetRequiredService<IRelationalWriteCurrentStateLoader>();
-        var writeFreshnessChecker =
-            scope.ServiceProvider.GetRequiredService<IRelationalWriteFreshnessChecker>();
         var noProfileMergeSynthesizer =
             scope.ServiceProvider.GetRequiredService<IRelationalWriteNoProfileMergeSynthesizer>();
         var noProfilePersister = scope.ServiceProvider.GetRequiredService<IRelationalWritePersister>();
@@ -60,6 +62,35 @@ public class Given_Postgresql_Reference_Resolver_Service_Collection_Extensions
         var adapter = scope.ServiceProvider.GetRequiredService<IReferenceResolverAdapter>();
         var commandExecutor = scope.ServiceProvider.GetRequiredService<IRelationalCommandExecutor>();
         var readMaterializer = scope.ServiceProvider.GetRequiredService<IRelationalReadMaterializer>();
+        var documentCacheMaterializationDataStore =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheMaterializationDataStore>();
+        var documentCacheWriter = scope.ServiceProvider.GetRequiredService<IDocumentCacheWriter>();
+        var documentCacheSessionBoundWriter =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheSessionBoundWriter>();
+        var documentCacheWriterRetryAdapter =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheWriterRetryAdapter>();
+        var documentProjectionWorkPager =
+            scope.ServiceProvider.GetRequiredService<IDocumentProjectionWorkPager>();
+        var documentCacheAdministrativeMutex =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheAdministrativeMutex>();
+        var documentCacheAdministrativePrimitives =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheAdministrativePrimitives>();
+        var providerCommandTimeoutClassifier =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheProviderCommandTimeoutClassifier>();
+        var documentCacheBaselineSeeder =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheBaselineSeeder>();
+        var documentCacheOfflineActivationCommand =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheOfflineActivationCommand>();
+        var documentCacheOfflineDeactivationCommand =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheOfflineDeactivationCommand>();
+        var documentCacheOnlineCacheRebuildCommand =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheOnlineCacheRebuildCommand>();
+        var documentCacheInternalOnlyCacheAheadRecoveryCommand =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheInternalOnlyCacheAheadRecoveryCommand>();
+        var documentCacheExplicitIntegrityScrubCommand =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheExplicitIntegrityScrubCommand>();
+        var documentCacheProjectionDrainPageProcessor =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheProjectionDrainPageProcessor>();
         var readTargetLookupService =
             scope.ServiceProvider.GetRequiredService<IRelationalReadTargetLookupService>();
         var writeExceptionClassifier =
@@ -74,11 +105,12 @@ public class Given_Postgresql_Reference_Resolver_Service_Collection_Extensions
             scope.ServiceProvider.GetRequiredService<IRelationalDeleteEtagPreconditionChecker>();
         var relationshipAuthorizationProviderFailureExtractor =
             scope.ServiceProvider.GetRequiredService<IRelationshipAuthorizationProviderFailureExtractor>();
+        var documentCacheReadAccelerationCoordinator =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheReadAccelerationCoordinator>();
 
         resolver.Should().BeOfType<ReferenceResolver>();
         writeFlattener.Should().BeOfType<RelationalWriteFlattener>();
         currentStateLoader.Should().BeOfType<RelationalWriteCurrentStateLoader>();
-        writeFreshnessChecker.Should().BeOfType<RelationalWriteFreshnessChecker>();
         noProfileMergeSynthesizer.Should().BeOfType<RelationalWriteNoProfileMergeSynthesizer>();
         noProfilePersister.Should().BeOfType<RelationalWriteNoProfilePersister>();
         targetLookupService.Should().BeOfType<RelationalWriteTargetLookupService>();
@@ -90,6 +122,32 @@ public class Given_Postgresql_Reference_Resolver_Service_Collection_Extensions
         adapter.Should().BeOfType<PostgresqlReferenceResolverAdapter>();
         commandExecutor.Should().BeOfType<PostgresqlRelationalCommandExecutor>();
         readMaterializer.Should().BeOfType<RelationalReadMaterializer>();
+        documentCacheMaterializationDataStore
+            .Should()
+            .BeOfType<PostgresqlDocumentCacheMaterializationDataStore>();
+        documentCacheWriter.Should().BeOfType<PostgresqlDocumentCacheWriter>();
+        documentCacheSessionBoundWriter.Should().BeSameAs(documentCacheWriter);
+        documentCacheWriterRetryAdapter.Should().BeOfType<DocumentCacheWriterRetryAdapter>();
+        documentProjectionWorkPager.Should().BeOfType<PostgresqlDocumentProjectionWorkPager>();
+        documentCacheAdministrativePrimitives.Should().BeOfType<DocumentCacheAdministrativePrimitives>();
+        documentCacheAdministrativePrimitives.ProviderToken.Should().Be(RelationalProviderToken.Postgresql);
+        providerCommandTimeoutClassifier
+            .Should()
+            .BeOfType<PostgresqlDocumentCacheProviderCommandTimeoutClassifier>();
+        documentCacheBaselineSeeder.Should().BeOfType<DocumentCacheBaselineSeeder>();
+        documentCacheOfflineActivationCommand.Should().BeOfType<DocumentCacheOfflineActivationCommand>();
+        documentCacheOfflineDeactivationCommand.Should().BeOfType<DocumentCacheOfflineDeactivationCommand>();
+        documentCacheOnlineCacheRebuildCommand.Should().BeOfType<DocumentCacheOnlineCacheRebuildCommand>();
+        documentCacheInternalOnlyCacheAheadRecoveryCommand
+            .Should()
+            .BeOfType<DocumentCacheInternalOnlyCacheAheadRecoveryCommand>();
+        documentCacheExplicitIntegrityScrubCommand
+            .Should()
+            .BeOfType<DocumentCacheExplicitIntegrityScrubCommand>();
+        documentCacheAdministrativeMutex.Should().BeOfType<PostgresqlDocumentCacheAdministrativeMutex>();
+        documentCacheProjectionDrainPageProcessor
+            .Should()
+            .BeOfType<DocumentCacheProjectionDrainPageProcessor>();
         readTargetLookupService.Should().BeOfType<RelationalReadTargetLookupService>();
         writeExceptionClassifier.Should().BeOfType<PostgresqlRelationalWriteExceptionClassifier>();
         writeConstraintResolver.Should().BeOfType<RelationalWriteConstraintResolver>();
@@ -100,6 +158,170 @@ public class Given_Postgresql_Reference_Resolver_Service_Collection_Extensions
         relationshipAuthorizationProviderFailureExtractor
             .Should()
             .BeOfType<PostgresqlRelationshipAuthorizationProviderFailureExtractor>();
+        documentCacheReadAccelerationCoordinator
+            .Should()
+            .BeSameAs(PassthroughDocumentCacheReadAccelerationCoordinator.Instance);
+    }
+
+    [Test]
+    public void It_registers_the_full_read_acceleration_coordinator_when_read_acceleration_is_enabled()
+    {
+        var services = new ServiceCollection();
+
+        services.AddLogging();
+        services.AddSingleton(A.Fake<IReadableProfileProjector>());
+        services.AddSingleton<NpgsqlDataSourceCache>();
+        services.AddSingleton(A.Fake<IDataStoreProvider>());
+        services.AddScoped<IDataStoreSelection, DataStoreSelection>();
+        services.AddScoped<NpgsqlDataSourceProvider>();
+        services.Configure<DocumentCacheOptions>(options => options.ReadAcceleration.Enabled = true);
+        services.Configure<DatabaseOptions>(options => options.IsolationLevel = IsolationLevel.ReadCommitted);
+        services.AddPostgresqlReferenceResolver();
+
+        using var serviceProvider = BuildServiceProvider(services);
+        using var scope = serviceProvider.CreateScope();
+
+        scope
+            .ServiceProvider.GetRequiredService<IDocumentCacheReadAccelerationCoordinator>()
+            .Should()
+            .BeOfType<DocumentCacheReadAccelerationCoordinator>();
+    }
+
+    [Test]
+    public async Task It_uses_passthrough_reads_without_cache_telemetry_when_read_acceleration_is_disabled()
+    {
+        var readTelemetry = A.Fake<IDocumentCacheReadTelemetry>();
+        var services = new ServiceCollection();
+
+        services.AddLogging();
+        services.AddSingleton(readTelemetry);
+        services.AddSingleton(A.Fake<IReadableProfileProjector>());
+        services.AddSingleton<NpgsqlDataSourceCache>();
+        services.AddSingleton(A.Fake<IDataStoreProvider>());
+        services.AddScoped<IDataStoreSelection, DataStoreSelection>();
+        services.AddScoped<NpgsqlDataSourceProvider>();
+        services.Configure<DatabaseOptions>(options => options.IsolationLevel = IsolationLevel.ReadCommitted);
+        services.AddPostgresqlReferenceResolver();
+
+        using var serviceProvider = BuildServiceProvider(services);
+        using var scope = serviceProvider.CreateScope();
+
+        var coordinator =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheReadAccelerationCoordinator>();
+        var getFallback = new GetResult.GetFailureNotExists();
+        var queryFallback = new QueryResult.QueryFailureKnownError("fallback");
+        int getFallbackCount = 0;
+        int queryFallbackCount = 0;
+
+        GetResult getResult = await coordinator.GetByIdAsync(
+            CreateReadAccelerationGetByIdRequest(
+                _ =>
+                {
+                    getFallbackCount++;
+                    return Task.FromResult<GetResult>(getFallback);
+                },
+                _ => throw new InvalidOperationException("GET candidate selection should not run.")
+            )
+        );
+        QueryResult queryResult = await coordinator.QueryAsync(
+            CreateReadAccelerationQueryRequest(
+                _ =>
+                {
+                    queryFallbackCount++;
+                    return Task.FromResult<QueryResult>(queryFallback);
+                },
+                _ => throw new InvalidOperationException("query candidate selection should not run.")
+            )
+        );
+
+        coordinator.Should().BeSameAs(PassthroughDocumentCacheReadAccelerationCoordinator.Instance);
+        getResult.Should().BeSameAs(getFallback);
+        queryResult.Should().BeSameAs(queryFallback);
+        getFallbackCount.Should().Be(1);
+        queryFallbackCount.Should().Be(1);
+        AssertNoReadTelemetry(readTelemetry);
+    }
+
+    [Test]
+    public void DocumentCacheWriter_ServiceRegistration_registers_postgresql_writer_and_projection_pager_adapters()
+    {
+        var services = new ServiceCollection();
+
+        services.AddLogging();
+        services.AddSingleton(A.Fake<IReadableProfileProjector>());
+        services.AddSingleton<NpgsqlDataSourceCache>();
+        services.AddSingleton(A.Fake<IDataStoreProvider>());
+        services.AddScoped<IDataStoreSelection, DataStoreSelection>();
+        services.AddScoped<NpgsqlDataSourceProvider>();
+        services.Configure<DatabaseOptions>(options => options.IsolationLevel = IsolationLevel.ReadCommitted);
+        services.AddPostgresqlReferenceResolver();
+
+        services
+            .Where(descriptor => descriptor.ServiceType == typeof(PostgresqlDocumentCacheWriter))
+            .Should()
+            .ContainSingle()
+            .Which.Should()
+            .Match<ServiceDescriptor>(descriptor =>
+                descriptor.Lifetime == ServiceLifetime.Scoped
+                && descriptor.ImplementationType == typeof(PostgresqlDocumentCacheWriter)
+            );
+        AssertScopedFactory<IDocumentCacheWriter>(services);
+        AssertScopedFactory<IDocumentCacheSessionBoundWriter>(services);
+        services
+            .Where(descriptor => descriptor.ServiceType == typeof(IDocumentProjectionWorkPager))
+            .Should()
+            .ContainSingle()
+            .Which.Should()
+            .Match<ServiceDescriptor>(descriptor =>
+                descriptor.Lifetime == ServiceLifetime.Singleton
+                && descriptor.ImplementationType == typeof(PostgresqlDocumentProjectionWorkPager)
+            );
+        services
+            .Where(descriptor => descriptor.ServiceType == typeof(IDocumentCacheAdministrativeMutex))
+            .Should()
+            .ContainSingle()
+            .Which.Should()
+            .Match<ServiceDescriptor>(descriptor =>
+                descriptor.Lifetime == ServiceLifetime.Singleton
+                && descriptor.ImplementationType == typeof(PostgresqlDocumentCacheAdministrativeMutex)
+            );
+        services
+            .Single(descriptor =>
+                descriptor.ServiceType == typeof(IDocumentCacheProjectionDrainPageProcessor)
+            )
+            .ImplementationType.Should()
+            .Be<DocumentCacheProjectionDrainPageProcessor>();
+
+        using var serviceProvider = BuildServiceProvider(services);
+        using var scope = serviceProvider.CreateScope();
+
+        var documentCacheWriter = scope.ServiceProvider.GetRequiredService<IDocumentCacheWriter>();
+        var documentCacheSessionBoundWriter =
+            scope.ServiceProvider.GetRequiredService<IDocumentCacheSessionBoundWriter>();
+
+        documentCacheWriter.Should().BeOfType<PostgresqlDocumentCacheWriter>();
+        documentCacheSessionBoundWriter.Should().BeSameAs(documentCacheWriter);
+        scope
+            .ServiceProvider.GetRequiredService<IDocumentProjectionWorkPager>()
+            .Should()
+            .BeOfType<PostgresqlDocumentProjectionWorkPager>();
+        scope
+            .ServiceProvider.GetRequiredService<IDocumentCacheAdministrativeMutex>()
+            .Should()
+            .BeOfType<PostgresqlDocumentCacheAdministrativeMutex>();
+    }
+
+    [Test]
+    public void It_does_not_register_the_postgresql_Cdc_source_position_adapter_by_default()
+    {
+        var services = new ServiceCollection();
+
+        services.AddPostgresqlReferenceResolver();
+
+        services
+            .Where(descriptor => descriptor.ServiceType == typeof(PostgresqlCdcSourcePositionAdapter))
+            .Should()
+            .BeEmpty();
     }
 
     [Test]
@@ -119,6 +341,20 @@ public class Given_Postgresql_Reference_Resolver_Service_Collection_Extensions
             .ErrorCode.Should()
             .Be(RelationshipAuthorizationAuth1FailurePayloadCodec.ProviderFailureCode);
         providerFailure.Message.Should().Be("1|7|1|0:0:n");
+    }
+
+    [Test]
+    public void It_builds_an_embeddable_postgresql_reference_lookup_command()
+    {
+        var factory = new PostgresqlReferenceResolverAdapterFactory(A.Fake<IRelationalCommandExecutor>());
+        var request = CreateLookupRequest(3);
+
+        var command = factory.TryBuildSessionLookupCommand(request);
+
+        command.Should().NotBeNull();
+        command!.Parameters.Should().ContainSingle();
+        command.Parameters[0].Name.Should().Be("@referentialIds");
+        command.CommandText.Should().Contain("unnest(@referentialIds::uuid[])");
     }
 
     [Test]
@@ -146,7 +382,10 @@ public class Given_Postgresql_Reference_Resolver_Service_Collection_Extensions
 
     private static ServiceProvider BuildServiceProvider(IServiceCollection services)
     {
+        services.TryAddSingleton(new DeadlockRetrySettings());
         services.TryAddSingleton<IDocumentLinkSlugResolver, NoLinkSlugResolver>();
+        services.TryAddSingleton<IDocumentCacheProjectionSupervisor, StubDocumentCacheProjectionSupervisor>();
+        services.TryAddSingleton<IDocumentCacheTargetRegistry, StubDocumentCacheTargetRegistry>();
         services.AddOptions<ResourceLinksOptions>();
 
         return services.BuildServiceProvider(
@@ -154,10 +393,139 @@ public class Given_Postgresql_Reference_Resolver_Service_Collection_Extensions
         );
     }
 
+    private static DocumentCacheReadAccelerationGetByIdRequest CreateReadAccelerationGetByIdRequest(
+        Func<CancellationToken, Task<GetResult>> fallback,
+        Func<
+            CancellationToken,
+            Task<DocumentCacheReadAccelerationGetByIdSelectionResult>
+        > selectAuthorizedCandidate
+    )
+    {
+        var resource = new QualifiedResourceName("Ed-Fi", "Student");
+
+        return new DocumentCacheReadAccelerationGetByIdRequest(
+            TargetKey.TenantKey,
+            RelationalAccessTestData.CreateMappingSet(resource),
+            resource,
+            new DocumentUuid(Guid.Parse("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb")),
+            DocumentCacheReadAccelerationResourceKind.Resource,
+            fallback,
+            selectAuthorizedCandidate
+        );
+    }
+
+    private static DocumentCacheReadAccelerationQueryRequest CreateReadAccelerationQueryRequest(
+        Func<CancellationToken, Task<QueryResult>> fallback,
+        Func<
+            CancellationToken,
+            Task<DocumentCacheReadAccelerationQuerySelectionResult>
+        > selectAuthorizedCandidatePage
+    )
+    {
+        var resource = new QualifiedResourceName("Ed-Fi", "Student");
+
+        return new DocumentCacheReadAccelerationQueryRequest(
+            TargetKey.TenantKey,
+            RelationalAccessTestData.CreateMappingSet(resource),
+            resource,
+            DocumentCacheReadAccelerationResourceKind.Resource,
+            fallback,
+            selectAuthorizedCandidatePage
+        );
+    }
+
+    private static void AssertNoReadTelemetry(IDocumentCacheReadTelemetry readTelemetry)
+    {
+        A.CallTo(() => readTelemetry.RecordAttempt(A<DocumentCacheReadTelemetryContext>._))
+            .MustNotHaveHappened();
+        A.CallTo(() => readTelemetry.RecordHit(A<DocumentCacheReadTelemetryContext>._)).MustNotHaveHappened();
+        A.CallTo(() => readTelemetry.RecordPageHit(A<DocumentCacheReadTelemetryContext>._))
+            .MustNotHaveHappened();
+        A.CallTo(() => readTelemetry.RecordMiss(A<DocumentCacheReadTelemetryContext>._))
+            .MustNotHaveHappened();
+        A.CallTo(() => readTelemetry.RecordFallback(A<DocumentCacheReadTelemetryContext>._))
+            .MustNotHaveHappened();
+        A.CallTo(() => readTelemetry.RecordCacheUnavailable(A<DocumentCacheReadTelemetryContext>._))
+            .MustNotHaveHappened();
+        A.CallTo(() => readTelemetry.RecordAdapterAcquisitionFailure(A<DocumentCacheReadTelemetryContext>._))
+            .MustNotHaveHappened();
+        A.CallTo(() => readTelemetry.RecordUnexpectedException(A<DocumentCacheReadTelemetryContext>._))
+            .MustNotHaveHappened();
+        A.CallTo(() => readTelemetry.RecordDirectFill(A<DocumentCacheReadTelemetryContext>._))
+            .MustNotHaveHappened();
+        A.CallTo(() =>
+                readTelemetry.RecordCacheLookupDuration(A<DocumentCacheReadTelemetryContext>._, A<TimeSpan>._)
+            )
+            .MustNotHaveHappened();
+        A.CallTo(() =>
+                readTelemetry.RecordDirectFillDuration(A<DocumentCacheReadTelemetryContext>._, A<TimeSpan>._)
+            )
+            .MustNotHaveHappened();
+    }
+
+    private static void AssertScopedFactory<TService>(IServiceCollection services)
+        where TService : class
+    {
+        ServiceDescriptor descriptor = services
+            .Where(descriptor => descriptor.ServiceType == typeof(TService))
+            .Should()
+            .ContainSingle()
+            .Subject;
+
+        descriptor.Lifetime.Should().Be(ServiceLifetime.Scoped);
+        descriptor.ImplementationFactory.Should().NotBeNull();
+        descriptor.ImplementationType.Should().BeNull();
+        descriptor.ImplementationInstance.Should().BeNull();
+    }
+
+    private static ReferenceLookupRequest CreateLookupRequest(int count)
+    {
+        var requestResource = new QualifiedResourceName("Ed-Fi", "Student");
+        var mappingSet = RelationalAccessTestData.CreateMappingSet(requestResource);
+
+        return new ReferenceLookupRequest(
+            mappingSet,
+            requestResource,
+            Enumerable
+                .Range(1, count)
+                .Select(index =>
+                    RelationalAccessTestData.CreateSchoolLookup(
+                        new ReferentialId(Guid.ParseExact($"{index:x8}000000000000000000000000", "N"))
+                    )
+                )
+                .ToArray()
+        );
+    }
+
     private sealed class NoLinkSlugResolver : IDocumentLinkSlugResolver
     {
         public DocumentLinkSlugTriple Resolve(MappingSet mappingSet, short resourceKeyId) =>
             throw new InvalidOperationException("NoLinkSlugResolver is unused in composition-surface tests.");
+    }
+
+    private sealed class StubDocumentCacheProjectionSupervisor : IDocumentCacheProjectionSupervisor
+    {
+        public System.Collections.Immutable.ImmutableArray<DocumentCacheProjectionTargetRuntimeContext> CurrentTargetContexts =>
+            [];
+
+        public Task<DocumentCacheTargetRegistrySnapshot> RefreshAsync(
+            DocumentCacheTargetRefreshReason reason,
+            CancellationToken cancellationToken = default
+        ) => throw new InvalidOperationException("Stub supervisor is unused in composition-surface tests.");
+    }
+
+    private sealed class StubDocumentCacheTargetRegistry : IDocumentCacheTargetRegistry
+    {
+        private static readonly DateTimeOffset ObservedAt = new(2026, 8, 1, 12, 0, 0, TimeSpan.Zero);
+
+        public DocumentCacheTargetRegistrySnapshot CurrentSnapshot { get; } = new([], ObservedAt);
+
+        public DocumentCacheTargetRuntimeSnapshot CurrentRuntimeSnapshot { get; } = new([], ObservedAt);
+
+        public Task<DocumentCacheTargetRegistrySnapshot> RefreshAsync(
+            DocumentCacheTargetRefreshReason reason,
+            CancellationToken cancellationToken = default
+        ) => throw new InvalidOperationException("Stub registry is unused in composition-surface tests.");
     }
 
     private sealed class StubRelationalTokenInfoEducationOrganizationLookup

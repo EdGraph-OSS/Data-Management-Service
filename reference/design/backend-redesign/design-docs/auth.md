@@ -195,7 +195,7 @@ Excluding the `*Inverted` and `*ThroughResponsibility` strategies, these strateg
 
 `*Inverted`, `*ThroughResponsibility`, and `*IncludingDeletes` strategies are similar to their non-suffixed equivalents; the only difference is that these strategies may choose to add a suffix to the view name (known as `pathModifier`) that gets used to authorize the securable element, for example, the `RelationshipsWithStudentsOnlyThroughResponsibility` strategy uses the `EducationOrganizationIdToStudentUSIThroughResponsibility` view, which uses `StudentEducationOrganizationResponsibilityAssociation` instead of `StudentSchoolAssociation` to establish the relationship.
 
-### View-based authorization strategy
+### Custom view-based authorization strategy
 
 Some use cases require additional authorization restrictions based on student enrollment in specific courses (e.g., "Students enrolled in CTE courses") or grade levels (e.g., "Primary third grade students").
 
@@ -203,7 +203,7 @@ For example, suppose we want to return only CourseTranscripts whose student is e
 
 ```sql
 CREATE OR REPLACE VIEW auth.StudentWithCTECourseEnrollments AS
-SELECT DISTINCT
+SELECT
     ssa.StudentUSI
 FROM
     edfi.StudentSectionAssociation ssa
@@ -220,9 +220,11 @@ WHERE
 
 The view must follow this naming convention: `{BasisResource}With{SomeDescription}`.
 
-When a GET request for CourseTranscript arrives, if the configured authorization strategy name is unknown, we fall back to the custom view-based strategy and extract from the strategy name the *basis resource*. In this case, `auth.StudentWithCTECourseEnrollments` maps to `Student`. Then, we validate that all the primary key columns from `Student` appear in `CourseTranscript`. These columns will be used to join with the custom view and authorize the request.
+Note that the view above does not deduplicate, even though the equivalent ODS artifact would use `SELECT DISTINCT` (a student enrolled in two CTE sections appears twice). The reason is the one given in "Sub-queries instead of joins" above: DMS authorizes against custom views with an `IN` membership predicate rather than a join, so duplicate rows cannot affect results, and on PostgreSQL a `DISTINCT` makes the view unflattenable — the planner must materialize and deduplicate the entire view instead of driving the membership check into its joins. Custom views are authored outside DMS, so this is guidance for whoever writes one rather than something the emitter can enforce.
 
-Non-primary-key and role-named columns are allowed for the target resource ([more info here](https://github.com/Ed-Fi-Alliance-OSS/Ed-Fi-ODS/blob/511cf65e71b1f3d96a7e3801a3ed71dc84239e20/Application/EdFi.Ods.Common/Security/Authorization/CustomViewBasedAuthorizationStrategy.cs#L69)). For example, assume that `StudentUniqueId` is nullable in `CourseTranscript`; the strategy will allow it. However, for GET-many requests it will only return non-null values that match the result from the view, and for GET-by-ID it will return an unauthorized error if the entry has a null `StudentUniqueId`. Change query endpoints cannot be authorized with this strategy if it maps to non-PK columns in the target resource ([more info here](https://github.com/Ed-Fi-Alliance-OSS/Ed-Fi-ODS/blob/511cf65e71b1f3d96a7e3801a3ed71dc84239e20/Application/EdFi.Ods.Api/Security/AuthorizationStrategies/CustomViewBased/CustomViewBasedAuthorizationFilterDefinitionsFactory.cs#L147)).
+When a GET request for CourseTranscript arrives, if the configured authorization strategy name is unknown, we fall back to the custom view-based strategy and extract from the strategy name the *basis resource*. In this case, `auth.StudentWithCTECourseEnrollments` maps to `Student`. Then, we validate that all the primary key columns from `Student` appear in `CourseTranscript`. These columns will be used to match against the custom view and authorize the request.
+
+Non-primary-key and role-named columns are allowed for the target resource ([more info here](https://github.com/Ed-Fi-Alliance-OSS/Ed-Fi-ODS/blob/511cf65e71b1f3d96a7e3801a3ed71dc84239e20/Application/EdFi.Ods.Common/Security/Authorization/CustomViewBasedAuthorizationStrategy.cs#L69)). For example, assume that `StudentUniqueId` is nullable in `CourseTranscript`; the strategy will allow it. However, for GET-many requests it will only return non-null values that match the result from the view, and for GET-by-ID it will return an unauthorized error if the entry has a null `StudentUniqueId`. Change query endpoints cannot be authorized with this strategy when the basis is reached through a reference that is neither part of the target resource's identity nor one of its securable elements, because tombstones store only identity and securable values; ODS applies the stricter identifying-only rule ([defined here](https://github.com/Ed-Fi-Alliance-OSS/Ed-Fi-ODS/blob/511cf65e71b1f3d96a7e3801a3ed71dc84239e20/Application/EdFi.Ods.Api/Security/AuthorizationStrategies/CustomViewBased/CustomViewBasedAuthorizationFilterDefinitionsFactory.cs#L147)).
 
 When searching for the *basis resource*, we prioritize resources from the standard over resources from extensions (for example, `edfi.Student` gets selected instead of `homograph.Student`).
 
@@ -361,11 +363,66 @@ In DMS, there is a shared table where all resource entries are tracked (`dms.Doc
 
 Storing the `CreatedByOwnershipTokenId` in `dms.Document` also means that we must join with `dms.Document` to authorize the resource entries.
 
-### View-based authorization strategy
+### Custom view-based authorization strategy
 
 In DMS, we aim to apply joins using the DocumentId surrogate key instead of natural keys, meaning that the custom authorization views used by this strategy must output the DocumentId of the basis resource instead of the natural keys.
 
 In the example above, the `auth.StudentWithCTECourseEnrollments` view will return the Student's DocumentId instead of the StudentUSI. See the `Resolving the DB columns used for authorization` section below for more information.
+
+The same views serve `ReadChanges` (`/deletes` and `/keyChanges`) authorization, where DMS seeks the live basis row by the tombstone's old natural-key values and checks its `DocumentId` against the view; a basis that is the subject itself or a person reads a stored `DocumentId` instead and is authorized by its current membership, as ODS does for its surrogate-keyed bases. A view whose name ends with `IncludingDeletes` (for example `auth.SchoolWithAlternativeTypeIncludingDeletes`) additionally makes DMS probe the basis resource's tombstone table, so that custom views keeps authorizing tombstones after the basis row itself was deleted; without the suffix such a view degrades to live-only behavior. The suffix has no meaning on the live read paths. See "Custom view-based strategies" in [change-queries.md](change-queries.md).
+
+Because custom views are configured in CMS rather than deployed with the schema, DMS validates each resolved custom view per request, before the page query runs, instead of at startup. The contract is: the `auth.{StrategyName}` object must exist and be a view — a regular view or a materialized view — and its `DocumentId` column must be `bigint`. Both conditions are checked against the engine catalogs (`pg_catalog.pg_class` / `pg_catalog.pg_attribute` on PostgreSQL, `sys.views` / `sys.columns` on SQL Server) rather than `information_schema`, whose column metadata omits materialized views. The check is completed by a row-free bind probe (`LIMIT 0` / `TOP (0)`) that forces the engine to resolve the view and column without scanning rows, so validation cost does not grow with view size and an empty or disjoint view is not treated differently from a populated one. Validation runs on the read executor, which takes a separate read connection and round trip per probe, so a GET-many never opens a write transaction. A validation failure is a security-configuration problem, not a client error: it surfaces as the `urn:ed-fi:api:system` 500 ProblemDetails shown above rather than as a silently empty 200 page. Custom views are AND filters executing in CMS-configured order, so only the views configured ahead of a Namespace-based terminal (a 403) or another strategy's security-configuration failure (a 500) are validated — an earlier missing or non-conforming view keeps its own error instead of being masked by a later strategy's failure. `OwnershipBased` is the exception: per *Execution order* above it always executes last, whatever position the CMS gave it, and for GET-many it is a page filter rather than a terminal, so it can never mask a view's error. Its only failure surface is the security-configuration 500 raised when the client holds 2,000 or more ownership tokens, and every resolved custom view is validated ahead of that 500 — and ahead of the empty-page short-circuit for a client with no ownership tokens.
+
+DMS matches `auth.{StrategyName}` case-sensitively on both engines, emitting the schema and view name as quoted identifiers (`"auth"."StudentWithCTECourseEnrollments"` / `[auth].[StudentWithCTECourseEnrollments]`) and comparing the catalog name against the strategy name verbatim. On PostgreSQL that makes quoting the DDL mandatory: an unquoted `CREATE VIEW auth.StudentWithCTECourseEnrollments` folds to `auth.studentwithctecourseenrollments`, which the catalog check does not match, and the request fails validation as a missing view. Custom views must therefore be created with the PascalCase name quoted:
+
+```sql
+CREATE OR REPLACE VIEW "auth"."StudentWithCTECourseEnrollments" AS ...
+```
+
+#### Single-record operations
+
+GET-by-id, POST, PUT, and DELETE authorize against the same views as GET-many, but they check one document
+rather than filtering a page, so the check is a membership test on that document's DocumentId.
+
+For a regular resource the check rides the `AUTH1` abort device alongside the other strategies. Custom-view
+payloads use the `cv1|{index}|{kind}` prefix, an index space independent of the relationship (`1|`) and
+namespace (`ns1|`) families, so a failure is always mapped back to the request's own planned custom-view
+list and cannot be misread as another family's check. Indexes are request-wide, which lets several emitted
+checks share one command without colliding.
+
+Each operation checks the values it actually has:
+
+* GET-by-id and DELETE check the **stored** value — the document as it exists.
+* PUT checks the stored value and then the **proposed** value, in that order, so a client cannot move a
+  document out of its authorized set, nor edit one it could not read.
+* POST-create has no stored value, so it checks only the proposed value.
+
+When the basis resource *is* the resource being written, a create can never satisfy the view: the view
+returns DocumentIds of rows that already exist, and the row being created does not exist yet. A POST-create
+under a self-basis custom view is therefore always denied with the 2.4 ProblemDetails, even when the view
+would authorize the identity being created once it exists. This is a property of the strategy, not a
+defect — a self-basis custom view is only meaningful for operations on existing documents.
+
+Descriptors have no `AUTH1` statement to carry checks: descriptor GET-by-id reads the row and evaluates
+namespace in memory, and descriptor DELETE authorizes inside the locked-target boundary. Their custom-view
+checks therefore execute as their own membership query, sequenced in C# by CMS-configured index rather than
+by position within a statement. Two consequences follow from the locked boundary. The check must run on the
+**write session's** command executor, because a fresh connection would either block on the lock the session
+holds or read uncommitted state. And it runs ahead of the precondition outcome, so a request that both
+fails `If-Match` and fails the view reports the authorization denial, not the etag mismatch.
+
+Descriptor writes handle a self-basis proposed check fully. A proposed check whose basis is some other
+resource would require reading a reference value out of the descriptor body, which no shipped descriptor
+has — descriptors declare no document references — so rather than infer that from the ApiSchema, the write
+fails closed with a security-configuration 500 if one is ever planned.
+
+Validation keeps the GET-many contract and the GET-many attribution rule: only the views configured ahead of
+the failing terminal are validated, so an earlier missing or non-conforming view keeps its own 500 instead
+of being masked. On the write paths this happens lazily, after a provider failure has already aborted the
+write transaction, which is why validation always takes a fresh `IRelationalCommandExecutor` — those
+implementations open a new connection per command — rather than the aborted session. Only the views the
+failing command actually emitted are probed; a view that was planned but never emitted is not blamed for a
+failure it could not have caused.
 
 ### Relationship-based direct EdOrg claim match
 
@@ -396,6 +453,8 @@ Acceptance coverage should include these cases:
 
 ### Performance improvements over ODS
 
+> **Pre-implementation draft.** The per-operation roundtrip counts in this section were written before the relational write path existed and do not describe the implemented pipeline. The verified counts, the agreed targets, and the technically justified deviations live in [`epics/07-relational-write-path/08-write-roundtrip-batching.md`](../epics/07-relational-write-path/08-write-roundtrip-batching.md). This section is retained as the historical design rationale; its proof of concept below remains the reference for the database-side abort device.
+
 ODS executes an additional DB roundtrip for single-record authorizations, presumably because NHibernate limitations make batching difficult. In DMS, we have fine-grained control over the SQL queries we execute. Below are the expected DB roundtrips per operation.
 
 #### PUT
@@ -405,7 +464,7 @@ ODS executes an additional DB roundtrip for single-record authorizations, presum
 - Roundtrip #2
   - Run authorization check using the already-stored values (throw if unauthorized)
   - Run authorization check using the values from the request body (throw if unauthorized) (only if identifying values changed)
-  - Retrieve the referenced resources' DocumentIds (using `dms.ReferentialIdentity`)
+  - Retrieve the referenced resources' DocumentIds (using the generated natural-key resolver)
   - Reconstitute the record and/or materialize comparable current rowsets for no-op detection
 - Roundtrip #3
   - Execute guarded no-op or update (only if it actually changed)
@@ -415,7 +474,7 @@ ODS requires at least 4 roundtrips for the same operation, and more if the resou
 #### POST
 
 - Roundtrip #1
-  - Retrieve the referenced resources' DocumentIds (using `dms.ReferentialIdentity`).
+  - Retrieve the referenced resources' DocumentIds (using the generated natural-key resolver).
 - Roundtrip #2
   - Retrieve the DocumentId and etag by its identifying values (to check if already exists, and for reconstitution) (etag to enforce `If-Match`, if applicable)
 - Roundtrip #3
@@ -519,7 +578,8 @@ async Task GetManyCourses()
     // - RelationshipsWithEdOrgsAndPeople
     // - RelationshipsWithEdOrgsAndPeopleInverted
 
-    // Omitted roundtrip #1: If filtering by Descriptor(s), convert DescriptorUris -> DocumentIds (using dms.ReferentialIdentity)
+    // Omitted roundtrip #1: If filtering by Descriptor(s), convert DescriptorUris -> DocumentIds
+    // using the descriptor lowered-URI + ResourceKeyId probe.
 
     var filterSql = @"
         SELECT edfi.Course.DocumentId
@@ -592,7 +652,7 @@ async Task PostCourseTranscript()
         }
     };
 
-    // Omitted roundtrip #1: Retrieve referenced resources using dms.ReferentialIdentity, the next values are dummy
+    // Omitted roundtrip #1: Retrieve referenced resources using the generated natural-key resolver; the next values are dummy
     var resolvedCourseAttemptResultDescriptorId = 12;
     var resolvedCourseDocumentId = 34;
     var resolvedStudentAcademicRecordDocumentId = 56;
@@ -630,7 +690,7 @@ async Task PostCourseTranscript()
         // POST results in create
 
         await using var roundtrip3 = new NpgsqlCommand(@"
-            -- Authorize request body values: view-based
+            -- Authorize request body values: custom view-based
             SELECT CASE
                 WHEN EXISTS (
                     SELECT 1
@@ -685,7 +745,7 @@ async Task PostCourseTranscript()
         // POST results in update
 
         await using var roundtrip3 = new NpgsqlCommand(@"
-            -- Authorize stored values: view-based
+            -- Authorize stored values: custom view-based
             SELECT CASE
                 WHEN EXISTS (
                     SELECT 1
@@ -730,7 +790,7 @@ async Task PostCourseTranscript()
 
             -- The next authorization checks use the new values (from the request body), they are only needed if the identifying values changed
 
-            -- Authorize request body values: view-based
+            -- Authorize request body values: custom view-based
             SELECT CASE
                 WHEN EXISTS (
                     SELECT 1
@@ -764,7 +824,7 @@ async Task PostCourseTranscript()
         roundtrip3.Parameters.AddWithValue("NewStudentAcademicRecord_DocumentId", resolvedStudentAcademicRecordDocumentId);
         roundtrip3.Parameters.AddWithValue("NewEducationOrganizationId", requestBody.studentAcademicRecordReference.educationOrganizationId);
 
-        // Omitted command: Retrieve referenced resources using dms.ReferentialIdentity
+        // Omitted command: Retrieve referenced resources using the generated natural-key resolver
         // Omitted command: Reconstitution queries
 
         try
@@ -976,7 +1036,7 @@ The high-level logic is as follows:
 
 Note that a securableElement might have multiple paths when key unification takes place. In this situation, the function should follow each path and pick the shortest one to minimize the number of joins. Use the canonical column instead of the alias, since the canonical column will be indexed.
 
-When the provided securableElement is a `Namespace` or an `EducationOrganization`, it should extract the column name directly (no need to visit references) because those values are denormalized onto whichever table the reference lives on. For non-nested paths the column is on the root resource table; for array-nested paths (e.g. `$.requiredAssessments[*].assessmentReference.namespace` on `GraduationPlan`, or any of the other DS 5.2 resources that expose a nested namespace securable — `AssessmentAdministration`, `AssessmentBatteryPart`, `ObjectiveAssessment`, `StudentAssessment`, `StudentObjectiveAssessment`) the column is on the child collection table that owns the reference (e.g. `edfi.GraduationPlanRequiredAssessment.RequiredAssessmentAssessment_Namespace`). The index is emitted on whichever table the column is on; no traversal back to the root is required.
+When the provided securableElement is a `Namespace` or an `EducationOrganization`, it should extract the column name directly (no need to visit references) because those values are denormalized onto whichever table the reference lives on. For non-nested paths the column is on the root resource table; for array-nested paths the column is on the child collection table that owns the reference. Corrected authoritative ApiSchema artifacts declare Namespace securable elements at resource-root scope only, but older DS 5.2 artifacts emitted collection-scoped paths (e.g. `$.requiredAssessments[*].assessmentReference.namespace` on `GraduationPlan`, resolving to `edfi.GraduationPlanRequiredAssessment.RequiredAssessmentAssessment_Namespace`), and resolution still supports them. The index is emitted on whichever table the column is on; no traversal back to the root is required.
 
 This is physical column resolution only. It does not mean every resolved path participates in every authorization operation. For ODS-parity EdOrg relationship GET-many, results whose `sourceTable` is a child collection table are excluded from the relationship authorization subject set.
 
@@ -1037,7 +1097,7 @@ The helper function should return:
 
 ---
 
-In the View-based authorization strategy, the basis resource *is* the securableElement, meaning that we need a similar helper function that takes the subject and the basis resource.
+In the custom view-based authorization strategy, the basis resource *is* the securableElement, meaning that we need a similar helper function that takes the subject and the basis resource.
 
 **ResolveSecurableElementColumnPath(subjectResourceFullName, basisResourceFullName)**
 
@@ -1046,6 +1106,8 @@ In the View-based authorization strategy, the basis resource *is* the securableE
 - The returned value is the same as above
 
 The high-level logic is as follows: using ApiSchema.json's `documentPathsMapping`, recursively traverse all the references from the subjectResource and take note of those that reach the basisResource. 
+
+Only references (and descriptor values) that resolve to the resource's **root table** are candidates, at every level of the traversal. References inside collections (array items) and references or fields added through extensions (`_ext` tables) are never candidates. A basis reachable only through a collection or extension is therefore no join path at all, and the request fails with the `RelationshipAuthorization.NoCustomViewJoinPath` security-configuration error below.
 
 There can be multiple resulting paths; pick the winner based on:
 
@@ -1101,27 +1163,23 @@ There are a few SQL queries that must filter based on a list:
 1. Filter `auth.EducationOrganizationIdToEducationOrganizationId` based on the EdOrgIds defined in the token
 2. Filter the resource's Namespace based on the prefixes defined in the token
 3. In the GET-many scenario, filter the page by the authorized DocumentIds
-4. When retrieving the referenced resources DocumentIds using the `dms.ReferentialIdentity` table, we need to filter by a list of ReferentialIds
-5. Filter the resource's `CreatedByOwnershipTokenId` by the ownership tokens configured in the token
+4. Filter the resource's `CreatedByOwnershipTokenId` by the ownership tokens configured in the token
 
-PostgreSQL allows sending arrays as parameters (as shown in the POC above); the equivalent in SQL Server is Table-Valued Parameters (TVPs). Note that TVPs seem to degrade performance as reported [here](https://dba.stackexchange.com/a/344923).
+Natural-key reference resolution uses its own batched SQL shapes (PostgreSQL arrays and SQL Server `OPENJSON`) rather than authorization TVPs.
+
+PostgreSQL allows sending arrays as parameters (as shown in the POC above); the equivalent in SQL Server for the authorization lists above is Table-Valued Parameters (TVPs). Note that TVPs seem to degrade performance as reported [here](https://dba.stackexchange.com/a/344923).
 
 When the list has fewer than 2,000 records, ODS uses `IN(@p1, @p2, @p3...)`. Otherwise, it uses TVPs to avoid hitting the parameter limit and presumably to improve performance.
 
 DMS should follow a similar approach for SQL Server: when any of the lists mentioned above have fewer than 2,000 records, it should fall back to a parameterized `IN` clause (or an `OR` clause for Namespace prefixes) and use TVPs when the list has 2,000 or more entries.
 
-This means that the DDL generator has to create the following User-Defined Table Types:
+This means that the DDL generator has to create the following User-Defined Table Type:
 
 - Table of bigint (covers point 1. and 3. from the list above)
-- Table of uniqueidentifier (covers point 4.)
 
 ```sql
 CREATE TYPE dms.BigIntTable AS TABLE(
   Id BIGINT NOT NULL
-);
-
-CREATE TYPE dms.UniqueIdentifierTable AS TABLE(
- Id uniqueidentifier NOT NULL
 );
 ```
 
@@ -1151,7 +1209,7 @@ END;
 
 The example above is illustrative; the actual implementation should parameterize the namespaces.
 
-Note that ODS does this check in C# before hitting the DB. We will do it in SQL to keep it simple and consistent with the other authorization strategies. We can move this check to C# post v1.0 if performance tests show that SQL is too expensive.
+Note that ODS does this check in C# before hitting the DB. We will do it in SQL to keep it simple and consistent with the other authorization strategies. We can move this check to C# in the future if performance tests show that SQL is too expensive.
 
 The `*Relationships` strategies below aren't shown in the POC as they are very similar to the `RelationshipsWithEdOrgsAndPeople` and `RelationshipsWithEdOrgsAndPeopleInverted` strategies:
 
@@ -1217,7 +1275,9 @@ CREATE INDEX IX_EducationOrganizationIdToEducationOrganizationId ON auth.Educati
 
 We also need to bring the same triggers that update the Education Organization hierarchy, [defined in ODS here](https://github.com/Ed-Fi-Alliance-OSS/Ed-Fi-ODS/blob/main/Application/EdFi.Ods.Standard/Standard/5.2.0/Artifacts/PgSql/Structure/Ods/1302-CreateEdOrgToEdOrgTriggers.sql). These triggers should use denormalized EdOrgId columns (do not join with the EducationOrganization table), use the *unified* columns when available (i.e. we should use the *stored* columns).
 
-To avoid triggers, we could maintain the `auth.EducationOrganizationIdToEducationOrganizationId` table from C#. We will start with triggers similar to ODS for DMS v1.0 to save development time and migrate them to C# post v1.0 if necessary. At first glance, these triggers do not appear to be phantom-safe. Education Organizations likely change so rarely that phantoms are unlikely to occur in practice. However, if we migrate the triggers to C#, we should account for phantoms and consider introducing a locking table, because performing this logic in C# adds latency due to DB roundtrips.
+On SQL Server the hierarchical UPDATE trigger must be gated `IF UPDATE(<denormalized parent id>) OR …` over exactly the parent id columns its own predicates read. Every branch already requires a parent id to have changed, so a firing that wrote none can produce no tuple — but resolving both steps' joins to discover that takes update locks on rows the statement will never modify, on a table every Education Organization write contends for. The gate has to skip the trigger outright rather than let it evaluate to an empty tuple set, because the stamping trigger's mirror `UPDATE` on these tables is a real `UPDATE`: nested triggers re-fire this trigger on every insert and every stamp of an EducationOrganization. `UPDATE(column)` reports SET-clause membership rather than value change, so it is a performance pre-filter only — the null-safe predicates inside both steps remain authoritative, and the gate can only skip a firing whose tuple set would have been empty. PostgreSQL takes no comparable index-key or range locks and is emitted ungated.
+
+To avoid triggers, we could maintain the `auth.EducationOrganizationIdToEducationOrganizationId` table from C#. We will start with triggers similar to ODS to save development time and migrate them to C# in the future if necessary. At first glance, these triggers do not appear to be phantom-safe. Education Organizations likely change so rarely that phantoms are unlikely to occur in practice. However, if we migrate the triggers to C#, we should account for phantoms and consider introducing a locking table, because performing this logic in C# adds latency due to DB roundtrips.
 
 #### People auth views
 
@@ -1229,6 +1289,8 @@ We have to bring the following people auth views from ODS:
 - [EducationOrganizationIdToStudentDocumentIdThroughResponsibility](https://github.com/Ed-Fi-Alliance-OSS/Ed-Fi-ODS/blob/main/Application/EdFi.Ods.Standard/Standard/5.2.0/Artifacts/PgSql/Structure/Ods/1306-AuthViewEducationOrganizationIdToStudentUSIThroughResponsibility.sql)
 
 In DMS, these views should output the DocumentId instead of the USI (for example, `Student_DocumentId` instead of `StudentUSI`). For clarity, we should add the person type name as a prefix to the `DocumentId` column.
+
+DMS also emits these views without the deduplication the ODS artifacts apply: no arm uses `SELECT DISTINCT`, and the staff view combines its assignment and employment arms with `UNION ALL` rather than `UNION`. ODS needs the dedup because it joins the auth views; every DMS consumer instead probes them with the `IN`/`EXISTS` membership predicates described in "Sub-queries instead of joins" above, where duplicate `(EducationOrganizationId, person)` pairs cannot affect results. Deduplication is not merely unnecessary here but harmful: a `DISTINCT` arm or a deduplicating set-operator makes the view unflattenable on PostgreSQL, so join qualifications cannot be pushed into it and every probe materializes the caller's entire EdOrg-to-person set before the person filter applies. This applies to both PostgreSQL and SQL Server emitted DDL, so the shared definitions drop the dedup for both. The `ReadChanges` `*IncludingDeletes` views are a separate case and *do* deduplicate across their arms, for the reason given in the `Authorization` section of [change-queries.md](change-queries.md).
 
 Given that people types are rarely added or modified (in the DS or extensions) and their definitions are not easily generalizable (Staff joins against two association tables; Contact goes through Student), the view definitions should be *hard-coded*.
 
@@ -1273,8 +1335,8 @@ There should be an index on all resources that participate in a person join (see
 - `edfi.CourseTranscript` should have an index on the `StudentAcademicRecord_DocumentId` column, include its own `DocumentId`
 - `edfi.StudentAcademicRecord` should have an index on the `Student_DocumentId` column, include its own `DocumentId`
 
-**View-based strategy**
-Given that view-based views are created after MetaEd has generated the ApiSchema.json, there is no way to know what fields need to be indexed beforehand (other than indexing every possible reference), so implementers are responsible for creating the necessary indexes.
+**Custom view-based strategy**
+Given that custom view-based views are created after MetaEd has generated the ApiSchema.json, there is no way to know what fields need to be indexed beforehand (other than indexing every possible reference), so implementers are responsible for creating the necessary indexes.
 
 Indexing in ODS was relatively simple because it uses natural keys, so all the columns that participate in authorization decisions are always available in the resource being authorized. In DMS, the DocumentIds used for authorization aren't always available in the resource (as shown in `CourseTranscript`), meaning that implementers need to figure out what tables and columns participate in the join in order to create the necessary indexes.
 
@@ -1536,7 +1598,9 @@ These indicate a misconfiguration in the security metadata and should not occur 
 | Resource has no security metadata | `No security metadata has been configured for this resource.` |
 | No authorization strategies defined for the matching claim | `No authorization strategies were defined for the requested action '{action}' against resource URIs ['{uri1}', '{uri2}'] matched by the caller's claim '{claimName}'.` |
 | Authorization strategy implementation not found | `Could not find authorization strategy implementations for the following strategy names: '{strategyName1}', '{strategyName2}'.` |
-| Custom view basis entity property not found on the target entity | `Unable to find a property on the authorization subject entity type '{targetEntityName}' corresponding to the '{propertyName}' property on the custom authorization view's basis entity type '{basisEntityName}' in order to perform authorization. Should a different authorization strategy be used?` |
+| No DocumentId join path from the subject resource to the custom view basis resource | `Relational {operation} authorization metadata is invalid for resource '{project}.{resource}'. Strategy '{strategyName}' uses custom auth view 'auth.{strategyName}'. No DocumentId join path could be resolved from subject resource '{project}.{subjectResource}' to custom view basis resource '{project}.{basisResource}'. Should a different authorization strategy be used?` |
+
+> ODS words this failure as a missing basis-entity *property* on the subject entity, because it joins custom views on natural keys. DMS joins on DocumentId, so there is no single missing property to name — the failure is that no reference path reaches the basis resource. The DMS wording states that, and keeps ODS's closing question. The diagnostic kind is `RelationshipAuthorization.NoCustomViewJoinPath`.
 
 ### Extensions
 
@@ -1557,14 +1621,16 @@ DMS uses JWT Bearer tokens validated against an OpenID Connect (OIDC) identity p
 The following auth metadata is stored in the Configuration Service (CMS):
 - Claim Sets (i.e., what strategies apply for a given endpoint, and the order in which `AND` strategies execute).
   - Cached during DMS startup, TTL is 600s by default, configurable in appsettings.json: `CacheSettings.ClaimSetsCacheExpirationSeconds`
-- Granted EducationOrganizationIds, Namespace prefixes, and Ownership tokens.
+- Granted EducationOrganizationIds and Namespace prefixes.
   - These get encoded in the JWT during token generation, token TTL is 30m by default, configurable in CMS appsettings.json `IdentitySettings.TokenExpirationMinutes`
+- API-client creator and read/modify ownership tokens.
+  - DMS retrieves these from the CMS application-context contract (`GET /v3/apiClients/{clientId}`) and caches successful contexts according to `CacheSettings.ApplicationContextCacheExpirationSeconds`.
 
 DMS's current authentication implementation is mostly unaffected by this redesign.
 
 ### Row-level security
 
-Both SQL Server and PostgreSQL support row-level security; however, the recommendation is not to use it for DMS v1.0 given the short development timeline and the uncertainty surrounding the feature. If we adopt it and it turns out to have show-stopping limitations or unacceptable performance, it could jeopardize the release.
+Both SQL Server and PostgreSQL support row-level security; however, the recommendation is not to use it for DMS given the short development timeline and the uncertainty surrounding the feature. If we adopt it and it turns out to have show-stopping limitations or unacceptable performance, it could jeopardize the release.
 
 ### Out of scope
 

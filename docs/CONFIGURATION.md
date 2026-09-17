@@ -24,10 +24,26 @@ file.
 | IdentityProvider                 | Specifies the authentication provider. Valid values are `keycloak` (to use Keycloak's authentication) and `self-contained` (to use self-contained authentication). When using `self-contained`, you must also provide a value for `IdentitySettings:EncryptionKey`. Default: self-contained |
 | RouteQualifierSegments           | Comma separated list of route qualifier context segments as defined by `dataStoreContexts` in Configuration Service. Example: "districtId,schoolYear" |
 | MultiTenancy                     | When `true`, enables multi-tenancy mode where the tenant identifier is extracted from the URL route. Default: `false` |
+| EnableManagementEndpoints       | When `true`, allows the DMS claimset management endpoint surface to be registered. When `false`, `/management/reload-claimsets` and `/management/view-claimsets` are not mapped. Environment override: `AppSettings__EnableManagementEndpoints`. Default: `false` |
+| ManagementEndpoints:RequiredRole | Single literal role token a bearer must carry, under `JwtAuthentication:RoleClaimType`, to reach `reload-claimsets` and `view-claimsets`. Empty by default, which leaves those endpoints unmapped. Environment override: `AppSettings__ManagementEndpoints__RequiredRole`. Recommended: `dms-management-operator` |
+| MaximumPageSize                  | Upper bound for the `limit` and `pageSize` query parameters on GET-many requests, and the page size applied when neither is supplied. Also the `default` and `maximum` published for those parameters in the OpenAPI specification. Must be greater than `0`; the service refuses to start otherwise. Environment override: `AppSettings__MaximumPageSize`. Default: `500` |
+| DefaultPartitionCount            | Number of partitions returned by a resource or descriptor `/partitions` request that omits the `number` query parameter. Also the `default` published for `numberOfPartitions` in the OpenAPI specification. Must be between `1` and `200`, the same range accepted for `number`; the service refuses to start otherwise. Environment override: `AppSettings__DefaultPartitionCount`. See [Cursor Paging](./CURSOR-PAGING.md). Default: `10` |
+| UseLegacyDocumentIdOrderingForChangeQueries | When `true`, restores unconditional `DocumentId` ordering and anchoring for change-version-filtered collection reads, disabling the conditional `ContentVersion` ordering and anchoring used for bounded and max-only change-version windows, and for any change-version-filtered read served from a snapshot. Governs all three paging shapes of a GET-many collection: `limit`/`offset` page selection, `pageToken` cursor pages, and `/partitions` boundary calculation. **Changing this setting invalidates the cursor and partition tokens already issued for the shapes whose anchor it governs**: those issued for a max-bearing window, and those issued for any change-version-filtered read served from a snapshot. Those tokens are `ContentVersion`-anchored while the setting is `false` and `DocumentId`-anchored while it is `true`, which is why a flip in either direction invalidates them. A client replaying one is answered with the invalid-page-token response and must restart its walk, so expect in-flight walks and distributed partition tokens of those shapes to fail after a flip in either direction. Tokens anchored on `DocumentId` — every unfiltered walk, and every min-only walk against current data — resolve that same anchor under either setting and keep working across a flip. Deployment-wide rollback switch for incident response; not per-client. See [Cursor Paging](./CURSOR-PAGING.md). Default: `false` |
 | ReverseProxy:UseForwardedHeaders | When `true`, the application respects reverse proxy `X-Forwarded-*` headers for URL generation, but only from trusted sources configured in `ReverseProxy`. Default: `false`. See [Reverse Proxy and Forwarded Headers](#reverse-proxy-and-forwarded-headers). |
 | ReverseProxy:KnownProxies        | Comma-separated list of exact trusted reverse-proxy IP addresses (IPv4 or IPv6) whose `X-Forwarded-*` headers are honored. Used only when `ReverseProxy:UseForwardedHeaders` is `true`. Example: `10.0.0.5,10.0.0.6` |
 | ReverseProxy:KnownNetworks       | Comma-separated list of trusted reverse-proxy networks in CIDR notation whose `X-Forwarded-*` headers are honored. Used only when `ReverseProxy:UseForwardedHeaders` is `true`. Example: `10.0.0.0/8,172.16.0.0/12` |
 | EnableApplicationResetEndpoint   | When `true`, enables the `/v3/applications/{id}/reset-credential` endpoint in the Configuration Service, allowing application credentials to be reset via API. When `false`, the endpoint is not registered and will return a 404 (Not Found) response. <br>**Recommended:** Set to `false` if you need to support multiple API clients per application, as enabling this endpoint may interfere with multi-client scenarios. Default: `false` |
+
+Claimset management endpoints use three separate controls. `EnableManagementEndpoints` is the
+global exposure switch; when it is `false`, the claimset management routes are not mapped.
+When it is `true`, `ManagementEndpoints:RequiredRole` must be one untrimmed token no longer
+than 256 characters, and `JwtAuthentication:RoleClaimType` must be present. Values containing
+ASCII whitespace, commas, semicolons, quotes, brackets, braces, or control characters are
+invalid and leave the claimset management endpoints unmapped, as does a missing or blank
+`JwtAuthentication:RoleClaimType`. A request to a mapped endpoint without a valid bearer token
+receives `401`; a valid token whose claims do not include this exact role under the configured
+role claim type receives `403`. `EnableClaimsetReload` is checked later by the claimset
+operation handlers; it does not control route registration.
 
 ## MappingPacks
 
@@ -48,6 +64,50 @@ is `false`. See the
 | AllowRuntimeCompileFallback | When `true` (default), allow runtime compilation when a pack is enabled but not found.                                                      |
 | FailureCooldownSeconds      | Seconds a faulted cache entry is retained before eviction. `0` (default) evicts immediately.                                                |
 | CacheMode                   | Cache strategy for compiled mapping sets. Currently only `InMemory` (default).                                                              |
+
+## DataManagement:DocumentCache
+
+`DataManagement:DocumentCache` configures optional DocumentCache projection and
+cache-backed read acceleration. The fixed database inventory is always provisioned, but
+runtime cache reads are opt-in and target-gated: DMS considers cached bodies only when
+`ReadAcceleration:Enabled` is `true`, the request is an external resource or descriptor
+GET/read, and the request's tenant/data-store pair has an exact `Targets` entry.
+
+The relational read path remains the correctness path. Cache misses, stale cache rows,
+lifecycle fences, target ineligibility, expected cache-read availability failures, and
+direct-fill failures fall back to relational reads without changing the public response.
+For the authoritative behavior, see the
+[cache-backed read story](../reference/design/backend-redesign/epics/18-document-cache/05-cache-backed-read-path.md),
+[cache-backed reads and lifecycle](../reference/design/backend-redesign/design-docs/cdc/0001-relational-cdc-projector-and-sources.md#cache-backed-reads-and-domain-lifecycle),
+and
+[configuration and projection target selection](../reference/design/backend-redesign/design-docs/cdc/cdc-streaming.md#configuration-and-projection-target-selection).
+For operational workflows, use the
+[DocumentCache operations runbook](../reference/document-cache-documentation/operations-runbook.md).
+
+| Parameter                               | Description                                                                                                                                                  |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Targets                                 | Explicit cache target list. Each entry contains `TenantKey` and positive `DataStoreId`; duplicate entries after tenant normalization are invalid.             |
+| ReadAcceleration:Enabled                | When `true`, eligible external GET-by-id and GET-many responses may use fresh `dms.DocumentCache` rows. Default: `false`.                                    |
+| ReadAcceleration:DirectFillTimeout      | Positive duration that bounds optional best-effort direct fill after a successful relational fallback. Default: `00:00:00.250`.                              |
+| Projector:PollInterval                  | Positive projector polling interval. Default: `00:00:05`.                                                                                                    |
+| Projector:PageSize                      | Positive projector page size. Default: `100`.                                                                                                                |
+| Projector:MaxConcurrentTargets          | Positive maximum number of cache targets a process may project concurrently. Default: `2`.                                                                    |
+| Projector:FailureBackoff                | Positive delay before retrying projector work after a target-level failure. Default: `00:00:30`.                                                             |
+| Projector:BaselineHighWaterMark         | Positive high-water mark used during baseline projection. Must be less than `int.MaxValue`. Default: `1000`.                                                  |
+| Administration:WorkflowTimeout          | Positive timeout for cache administrative workflows. Default: `1.00:00:00`.                                                                                   |
+| Status:StatusObservationTimeout         | Positive per-target timeout for observing durable DocumentCache status facts. Default: `00:00:05`.                                                           |
+| Status:EndpointTimeout                  | Positive timeout budget for the `GET /health/document-cache` status endpoint. Default: `00:00:30`.                                                           |
+| Status:RequiredRole                     | Single literal role token required to map and authorize `GET /health/document-cache`. Empty by default, leaving the endpoint unmapped. Recommended: `dms-document-cache-operator`. |
+
+Direct fill uses the shared cache materializer/writer with purpose `DirectFill`; it does
+not build cache rows from the shaped API response and it does not replace the response
+already selected by relational fallback. Snapshot and read-replica requests are read-only
+for this purpose, so direct fill is skipped for those targets when derivative routing is
+available.
+
+`Status:RequiredRole` must be one untrimmed token no longer than 256 characters. Values
+containing ASCII whitespace, commas, semicolons, quotes, brackets, braces, or control
+characters are invalid and leave the DocumentCache status endpoint unmapped.
 
 ## Configuration Service AppSettings
 
@@ -137,7 +197,7 @@ These settings configure how the DMS API connects to the Configuration Service t
 | BaseUrl                | The base URL of the Configuration Service. Example: `http://ed-fi-api-config:8081`                                                                                     |
 | ClientId               | The client identifier (client ID) used to access the Configuration Service endpoints.                                                                                    |
 | ClientSecret           | The client secret associated with the client ID for accessing the Configuration Service endpoints. Set via the `CONFIG_SERVICE_CLIENT_SECRET` environment variable. Must satisfy the CMS client-secret rules described in [IdentitySettings.ClientSecretValidation](#identitysettingsclientsecretvalidation). |
-| EncryptionKey         | Key used to encrypt and decrypt Configuration Service connection strings. Set via the `DMS_CONFIG_DATABASE_ENCRYPTION_KEY` environment variable and must match CMS `DatabaseSettings:EncryptionKey`. Used by `provision-dms-schema.ps1` to decrypt protected CMS datastore connection strings. Must be non-empty; see the note below for valid-value semantics. |
+| EncryptionKey         | Key used to encrypt and decrypt Configuration Service connection strings. Set via the `DMS_CONFIG_DATABASE_ENCRYPTION_KEY` environment variable and must match CMS `DatabaseSettings:EncryptionKey`. Used by `provision-dms-schema.ps1` to decrypt protected CMS datastore connection strings. DMS requires only a non-empty value; CMS rejects its `DatabaseSettings:EncryptionKey` at startup unless the value is at least 32 characters, ASCII, and does not derive the same key as the former shipped `appsettings.json` default. See the note below for valid-value semantics. |
 | Scope                  | The authorization scope required for accessing the Configuration Service endpoints. Example: `edfi_admin_api/authMetadata_readonly_access`                               |
 
 > [!NOTE]
@@ -149,18 +209,47 @@ These settings configure how the DMS API connects to the Configuration Service t
 > `provision-dms-schema.ps1` decrypts with it too), so all three must be configured
 > with an identical value.
 >
-> **Valid values.** The value must be non-empty. The AES-256 key is derived from the
-> UTF-8 bytes of the configured text, right-padded with `0` to 32 characters and then
-> truncated to the first 32 characters (see CMS `ConnectionStringEncryptionService`,
-> DMS `ConnectionStringDecryptionService`, and `provision-dms-schema.ps1`).
-> Consequences operators must account for:
-> - Only the first 32 characters are significant; any characters beyond 32 are ignored.
-> - Values shorter than 32 characters are zero-padded — accepted, but weakens the key.
-> - Use ASCII characters. A 32-character ASCII string yields exactly 32 key bytes;
->   multi-byte (non-ASCII) characters push the UTF-8 length past 32 bytes and break
->   AES key initialization.
+> **Valid values.** The Configuration Service validates its `DatabaseSettings` at
+> startup and refuses to start when `DatabaseConnection` is blank, or when
+> `EncryptionKey` is blank, shorter than 32 characters, contains a non-ASCII
+> character within the first 32 characters, or derives the same key as the former
+> shipped `appsettings.json` default — that is, its first 32 characters match the
+> default's first 32 characters, whatever follows them. DMS enforces only that
+> its `ConfigurationServiceSettings:EncryptionKey` is non-empty, so it must be
+> given the same value the Configuration Service accepted.
 >
-> Recommended: a 32-character ASCII string.
+> The AES-256 key is derived from the UTF-8 bytes of the configured text,
+> right-padded with `0` to 32 characters and then truncated to the first 32
+> characters (see CMS `ConnectionStringEncryptionService`, DMS
+> `ConnectionStringDecryptionService`, and `provision-dms-schema.ps1`). That
+> derivation is unchanged, so its consequences still apply wherever the startup
+> rules are not enforced — a DMS configured on its own, or one reading connection
+> strings written by a Configuration Service that predates this validation:
+> - Only the first 32 characters are significant; any characters beyond 32 are ignored.
+> - Values shorter than 32 characters are zero-padded, which weakens the key. A
+>   weak value that both sides share still decrypts successfully, with no warning.
+> - Multi-byte (non-ASCII) characters within the first 32 push the UTF-8 length
+>   past 32 bytes and break AES key initialization.
+>
+> Required by the Configuration Service, and therefore the value to use
+> everywhere: a 32-character ASCII string.
+>
+> **Changing the encryption key.** Connection strings already stored by the
+> Configuration Service were encrypted with the previous key and are not
+> re-encrypted automatically. After setting a new key, re-submit each data store
+> and data store derivative connection string through the Admin API; an update
+> stores the value encrypted under the currently configured key. Until a
+> connection string has been re-submitted, DMS cannot decrypt it and reports a
+> decryption failure.
+>
+> This applies to local Docker Compose stacks as well, where the environment
+> files under `eng/docker-compose/` supply the key. Picking up an updated
+> environment file changes the derived key, so a database volume created before
+> the change still holds connection strings encrypted under the previous one.
+> `provision-dms-schema.ps1` then fails with a decryption error even though CMS
+> and DMS agree on the new value — the mismatch is with the stored data, not
+> between the services. Recreate the database volume, or apply the re-submission
+> procedure above.
 
 ## CacheSettings
 
@@ -174,6 +263,37 @@ These settings configure DMS in-memory cache behavior. Expiration values are in 
 | ProfileCacheExpirationSeconds            | The duration before cached profile metadata expires and is refreshed from the Configuration Service. Default: `1800`       |
 | DataStoreCacheRefreshEnabled             | When `true`, enables TTL-based refresh of cached data store configuration from the Configuration Service. Default: `true`  |
 | DataStoreCacheExpirationSeconds          | The duration between automatic refreshes of cached data store configuration. Default: `600`                                |
+| DerivativeValidationCacheExpirationSeconds | The duration a validation verdict for a read replica or snapshot database stays cached. Default: `600`, accepted range `1`–`3600` |
+
+### DerivativeValidationCacheExpirationSeconds
+
+A read replica or snapshot is validated the first time a request is routed to it, and that verdict is
+cached for this duration.
+
+- **Default `600`.** Used when the setting is absent from configuration.
+- **Accepted range `1` to `3600`.** A value inside the range is used as configured, with no log entry.
+- **A value above `3600` is clamped to `3600`**, and the clamp is logged as a warning naming both the
+  configured and the effective value.
+- **A value of `0` or below falls back to the default `600`**, not to the minimum `1`, and that
+  fallback is logged as a warning naming both the configured and the effective value. This is not a
+  clamp: clamping to the accepted range would give `1`, which would re-validate on nearly every
+  request.
+- **A non-positive value means "use the default", not "never expire."** This deliberately inverts the
+  convention of `DataStoreCacheExpirationSeconds`, where `0` or a negative value keeps the cached
+  configuration until an explicit reload. There is no way to ask for a derivative verdict that never
+  expires: a derivative is a database an operator can rebuild or repoint without telling DMS, so a
+  verdict about one that never expired would outlive the database it describes.
+- **It is further bounded by the data store cache TTL.** A derivative's connection string comes from
+  the cached data store configuration, so when `DataStoreCacheRefreshEnabled` is `true` and
+  `DataStoreCacheExpirationSeconds` is positive, the effective expiration is the smaller of the two —
+  a verdict never outlives the connection string it was reached for. When refresh is disabled, or
+  `DataStoreCacheExpirationSeconds` is `0` or negative, that configuration is held until an explicit
+  reload, so there is no shorter lifetime to bound by and the resolved value is used as is. The result
+  is bounded either way.
+
+Set it through the environment as
+`CacheSettings__DerivativeValidationCacheExpirationSeconds`, or in Docker Compose through
+`DMS_DERIVATIVE_VALIDATION_CACHE_EXPIRATION_SECONDS`.
 
 ## IdentitySettings.ClientSecretValidation
 
@@ -213,12 +333,161 @@ These settings configure the allowed client-secret length range used by CMS regi
 > run `teardown-local-dms.ps1` and set up again, or drop the Keycloak realm / `dmscs` OpenIddict
 > tables — then start with the new secret.
 
+## Plugins
+
+Plugins are directories of already-published assemblies that DMS loads at startup
+and lets contribute to its service composition. This section is the **only**
+configuration surface for them: it says what may load, and nothing about where the
+bytes came from. DMS ships no fetcher; getting a plugin directory under the root is
+a deployment step that happens before the process starts. See
+[Plugins](./OPERATIONS.md#plugins) for the two acquisition recipes, the trust model,
+and what a startup failure means, and
+[eng/docker-compose/README.md](../eng/docker-compose/README.md) for running them
+against a local development stack.
+
+| Parameter | Description                                                                                                                                                                                                                  |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Directory | The plugin root. Defaults to `/app/plugins`, and a relative value is resolved against the application's base directory. A root that does not exist is not an error when `Allowed` is empty.                                   |
+| Allowed   | A comma-delimited, ordered list of plugin directory names under `Directory`. **Ships empty**, which loads nothing. Each name must be a single path segment; a repeated name, including one that repeats only after trimming, fails startup. |
+
+`appsettings.json` ships `"Plugins": { "Directory": "/app/plugins", "Allowed": "" }`,
+so a deployment that adopts no plugin boots exactly as it did before the mechanism
+existed.
+
+`Allowed` is the only switch. A plugin runs if and only if its directory name
+appears here, and there is no per-feature switch of any kind. A directory present
+under the root but absent from `Allowed` is never opened. When `Allowed` names at
+least one plugin, those directories produce **one aggregate warning** listing all of
+them, not one warning each; where the root cannot be listed at all, a different
+warning says so instead. An empty `Allowed` asks for nothing and does not inspect
+the root, so it produces neither. See
+[When a plugin does not load](./OPERATIONS.md#when-a-plugin-does-not-load-dms-does-not-start)
+for how to read the two.
+
+**The value is split on commas once, and each entry is trimmed.** Whitespace around
+a name is removed before the name is used for anything, an empty entry is dropped
+rather than rejected, and what is left must be a single path segment. Duplicate
+detection is the one comparison that folds case: two entries differing only in case
+would name one directory on a case-insensitive filesystem and two on the Linux
+image, so the allowlist is treated as ambiguous and startup fails. Every other
+comparison the loader makes on a name is ordinal.
+
+Loading runs before the logging pipeline exists, so the loader writes its own lines
+to standard error. Its warnings are also replayed through the configured application
+logger once one exists, as `Plugin loader warning` events, so a deployment that
+collects application logs rather than container output still sees them.
+
+The order written is the invocation order, so it is what decides the order in which
+plugins contribute.
+
+Both keys bind from environment variables in the standard way, which is how a
+container deployment sets them:
+
+```text
+Plugins__Directory=/app/plugins
+Plugins__Allowed=Sea.Dms.StudentIdValidator,Acme.Dms.Identity
+```
+
+### Configuration precedence
+
+For a key read **after** DMS has registered its services, the sources rank as
+follows, highest first:
+
+| Rank | Source | Notes |
+| ---- | ------ | ----- |
+| 1 | Environment variables | The unprefixed environment source DMS appends itself. See below for why this outranks the command line. |
+| 2 | Command-line arguments | Installed only when the host is started with arguments, which the stock container is not. |
+| 3 | Plugin-contributed configuration sources, in `Allowed` order | **Reserved; not supported.** See below. |
+| 4 | `appsettings.json` and the other JSON sources | Including `appsettings.{Environment}.json`. |
+
+**Rank 3 is reserved and unreachable.** The plugin contract exposes `Name` and
+`ContributeServices`, neither of which can add a configuration source, so no
+deployment can populate that rank. It appears in the table because the ordering rules
+for it are fixed rather than open: a plugin's sources are placed at rank 3 by the
+loader rather than wherever the plugin appended them, a later plugin in `Allowed`
+order outranks an earlier one, and no plugin source is placed above the operator's own
+environment or command-line surface.
+
+**Why the environment outranks the command line.** ASP.NET Core's own builder
+installs the command-line source above the unprefixed environment source, so on its
+own the command line would win. DMS then appends one more environment source of its
+own, in `AddServices`
+([`Infrastructure/WebApplicationBuilderExtensions.cs`](../src/dms/frontend/EdFi.DataManagementService.Frontend.AspNetCore/Infrastructure/WebApplicationBuilderExtensions.cs)),
+and an appended source outranks everything already installed.
+
+**That appended source carries a qualifier, and the qualifier is not cosmetic: it
+outranks the command line only for keys read after `AddServices` has run.** Two
+reads happen before it, and for those two the command line wins:
+
+- **Serilog's configuration.** `AddServices` calls `ConfigureLogging()`, which reads
+  `webAppBuilder.Configuration`, before it calls `AddEnvironmentVariables()`, so the
+  `Serilog` section is resolved without the appended source.
+- **The whole `Plugins` section, not just `Allowed`.** The plugin-loading bootstrap
+  phase binds the section in one go, `Allowed` and `Directory` alike, and it runs
+  before the phase that calls `AddServices` at all. That ordering is deliberate for
+  `Allowed`: the allowlist decides what may execute, so it is resolved from the
+  host's own sources rather than from any source a plugin could contribute.
+  `Directory` comes from the same bind and is resolved there whenever the allowlist
+  names anything, so it is a bootstrap read too. A deployment that sets
+  `Plugins__Directory` in the environment and also passes `--Plugins:Directory` on
+  the command line loads from the **command-line** root, which is not necessarily the
+  one it provisioned.
+
+**In the shipped container this is narrow, because there is no command-line source
+to lose to.** `src/dms/run.sh` starts the application as
+`dotnet EdFi.DataManagementService.Frontend.AspNetCore.dll` with nothing after it,
+so the builder installs no command-line source and ranks 1 and 2 collapse to rank 1.
+Only a deployment that starts the host with arguments of its own is affected by the
+qualifier above.
+
+> [!IMPORTANT]
+> **One key is read before the plugin phase exists at all.**
+> `AppSettings:StartupStatusFilePath` is read immediately after the builder is
+> created, before plugins are loaded, because the startup status file is how a plugin
+> loading failure is reported and it cannot depend on anything a plugin supplied. No
+> plugin-contributed source can provide it, whatever rank 3 above holds.
+>
+> This is a bootstrap exception and **not** an exception to the
+> environment-versus-command-line rule above. The environment and command-line sources
+> both exist by the time this key is read, so for it the command line wins when a
+> deployment supplies one, exactly as it does for the two reads named above. What is
+> missing at that moment is a plugin source, not an operator-owned one.
+
 ## RateLimit
 
 Basic rate limiting can be applied by supplying a `RateLimit` object in the
 `appsettings.json` file. If no `RateLimit` object is supplied, rate limiting is
 not configured for the application. Rate limiting (when applied) will be set
 globally and apply to all application endpoints.
+
+The shipped default is `PermitLimit: 20000`, `Window: 10`, `QueueLimit: 0`,
+an average of 2,000 requests per second; a fixed window permits the full
+20,000 as a burst at any point within each 10-second window, then rejects
+until the window resets. `RateLimit__*` environment variables
+shadow `appsettings.json`; the Docker Compose stacks set these from
+`DMS_RATE_LIMIT_PERMIT_LIMIT`, `DMS_RATE_LIMIT_QUEUE_LIMIT`, and
+`DMS_RATE_LIMIT_WINDOW` (see `.env.example`).
+
+Omitting the `RateLimit` object disables limiting entirely, but that only
+applies to a deployment configured purely through `appsettings.json`. The
+provided compose stacks always set the `RateLimit__*` variables, and their
+`${VAR:-default}` fallback supplies the shipped default even when the
+variable is set but empty, so in those stacks the limiter is always on - it
+can be raised, but not disabled.
+
+Bulk and seed loads driven by `BulkLoadClient` are bursty, and a
+`PermitLimit` set below the load's peak 10-second demand fails the load
+outright with a storm of `429` responses rather than merely slowing it
+down. Operators running a load larger than the `Populated` seed template
+should raise `DMS_RATE_LIMIT_PERMIT_LIMIT` for the duration of the load.
+
+The limiter partitions on the raw value of the request's `Host` header, so
+every client sending the same hostname shares one bucket. It caps load per
+distinct `Host` value, not per client, and because the default
+`AllowedHosts` is `*`, a client that varies the `Host` header obtains
+additional buckets, so it is not a strict cap on total backend load either.
+Treat it as a coarse backstop; per-client isolation and DoS protection
+belong at the application gateway.
 
 The `RateLimit` object should have the following parameters.
 
@@ -227,6 +496,178 @@ The `RateLimit` object should have the following parameters.
 | PermitLimit | The number of requests permitted within the window time span. This will be the number of requests, per hostname permitted per timeframe (`Window`). Must be > 0.                                                                                                           |
 | Window      | The number of seconds before the `PermitLimit` is reset. Must be > 0.                                                                                                                                                                                                      |
 | QueueLimit  | The maximum number of requests that can be Queued once `PermitLimit`s are exhausted. These requests will wait until the `Window` expires and will be processed FIFO. When the queue is exhausted, clients will receive a `429` `Too Many Requests` response. Must be >= 0. |
+
+### Rejection response
+
+A rejected request receives a `429 Too Many Requests` response with a
+`Retry-After` header and an Ed-Fi problem-details body served as
+`application/problem+json`. `Retry-After` carries the limiter-supplied
+recommended retry delay, rounded up to whole seconds. It is a suggested
+wait, not an exact countdown to the current window's reset — queue depth
+can make the recommended delay longer than one configured `Window`. The
+header is omitted in the unusual case that the limiter supplies no
+retry-after metadata, and the body is served either way. The
+`correlationId` is taken from the request header named by
+`AppSettings:CorrelationIdHeader` when that setting and header are
+present, otherwise from the server-generated trace identifier — the same
+selection the API's other error responses use.
+
+```json
+{
+  "detail": "The number of allowed requests has been exceeded. Retry the request later.",
+  "type": "urn:ed-fi:api:too-many-requests",
+  "title": "Too Many Requests",
+  "status": 429,
+  "correlationId": "0HNCTN1IRQMDG:00000001",
+  "validationErrors": {},
+  "errors": []
+}
+```
+
+## CircuitBreaker
+
+DMS routes its document CRUD calls - GET by id, query, POST, PUT, DELETE, and
+tracked-change queries - through a Polly resilience pipeline whose outermost
+strategy is a circuit breaker.
+Endpoints that do not read or write documents, such as
+`availableChangeVersions`, bypass the pipeline and keep answering while the
+breaker is open.
+It counts backend calls that *return* an unknown-failure result - the outcome
+DMS uses for a failure it cannot turn into a specific answer for the client.
+Recognized outcomes such as a deadlock victim, a constraint violation or a
+validation failure never count toward it, because each maps to its own result.
+Two consequences are worth knowing:
+
+- On SQL Server, a write failure whose outcome is indeterminate - a command
+  timeout, which expires on the client and leaves it unknown whether the server
+  applied the write - is recognized by the classifier yet still reported as an
+  unknown failure, so it does count toward the breaker.
+  That is deliberate: a sustained run of them is the signal that the backend is
+  unhealthy.
+  The PostgreSQL classifier does not currently recognize this case; an Npgsql
+  client-side timeout is not a `PostgresException`, so it escapes as an
+  exception instead and falls under the next point.
+  Either way it is never retried and never answered as a client error.
+- A failure that escapes as an exception rather than a result does not count.
+  The breaker's predicate inspects returned results only.
+
+When the breaker opens, every request that reaches the pipeline is refused for
+`BreakDurationSeconds`.
+That includes reads: the pipeline is shared by GET, query, POST, PUT and
+DELETE alike, so an open breaker pauses document reads as well as writes.
+
+| Parameter               | Description                                                                                                                                                                  |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| FailureRatio            | Fraction of sampled calls that must fail before the breaker opens. Greater than 0 and at most 1; `0.1` means 10%.                                                             |
+| SamplingDurationSeconds | Length of the rolling window over which the failure ratio is assessed. From 0.5 to 86400 (one day), inclusive.                                                                |
+| MinimumThroughput       | Minimum number of calls that must occur inside the sampling window before the breaker may open at all. At least 2.                                                            |
+| BreakDurationSeconds    | How long the breaker stays open before it admits a trial call. From 0.5 to 86400 (one day), inclusive.                                                                        |
+
+DMS refuses to start when a value falls outside those bounds, naming the
+offending setting rather than letting the resilience pipeline fail later.
+The duration bounds are inclusive at both ends, matching the range the pipeline
+enforces rather than its prose, which describes the lower bound as exclusive.
+`FailureRatio` is the one place DMS is stricter than the pipeline: a ratio of
+exactly `0` is accepted there but rejected here, because it asks the breaker to
+open on a window containing no failures at all.
+
+Beyond those hard bounds, two independent rules bound these values, and the
+shipped defaults (`0.1` / `120` / `20` / `30`) satisfy both.
+A configuration that violates either still starts and still works, but the
+breaker will not behave usefully:
+
+- `FailureRatio * MinimumThroughput` must exceed 1.
+  Otherwise a single anomalous failure satisfies the ratio and opens the
+  breaker on its own.
+- `MinimumThroughput / SamplingDurationSeconds` must sit below the
+  deployment's quietest sustained request rate.
+  The throughput floor is a hard gate: until the window holds
+  `MinimumThroughput` calls the breaker cannot open no matter how many of
+  them failed, so a value set too high silently disables load shedding for a
+  low-traffic deployment even when its database is completely down.
+  At the defaults that floor is 20 / 120 = 0.17 requests per second.
+
+DMS logs a startup warning when the first rule is violated, and when the
+throughput floor exceeds one request per second.
+It cannot check the second rule properly: only the operator knows the
+deployment's quietest sustained rate, so the warning fires on an obviously
+high floor rather than on a genuinely unreachable one.
+Compare the floor against your own traffic.
+
+### Rejection response
+
+A request refused by an open breaker receives a `503 Service Unavailable`
+response with a `Retry-After` header and an Ed-Fi problem-details body served
+as `application/problem+json`.
+`Retry-After` carries the configured `BreakDurationSeconds`, rounded up to
+whole seconds.
+It is the full break duration rather than the time remaining in the current
+break, so a client that is refused partway through a break is told to wait
+longer than it strictly needs to.
+That errs deliberately: the value can never send a client back early, and
+retrying early is what turns one break into a queue of retries arriving the
+moment it lifts.
+The request never reached the backend, so it is safe for a client to reissue
+it unchanged.
+
+```json
+{
+  "detail": "The service is temporarily unable to handle the request. Retry the request later.",
+  "type": "urn:ed-fi:api:service-unavailable",
+  "title": "Service Unavailable",
+  "status": 503,
+  "correlationId": "0HNCTN1IRQMDG:00000001",
+  "validationErrors": {},
+  "errors": []
+}
+```
+
+### Unclassified backend failure response
+
+A document request whose backend failure DMS could not turn into a specific
+answer receives a `500 Internal Server Error` carrying the standard Ed-Fi
+problem-details envelope as `application/problem+json`, on every verb:
+
+```json
+{
+  "detail": "An unexpected problem has occurred.",
+  "type": "urn:ed-fi:api:system",
+  "title": "System Error",
+  "status": 500,
+  "correlationId": "0HNCTN1IRQMDG:00000001",
+  "validationErrors": {},
+  "errors": []
+}
+```
+
+Earlier releases answered this case with `{"error": "...", "correlationId": "..."}`
+as `application/json`, where the `error` value was an internal diagnostic
+message naming DMS components.
+That message is now written to the log instead of the response, so a client
+parsing the old `error` field will no longer find it.
+Failures that escape as exceptions rather than results are answered by a
+separate generic 500 that still uses a `{"message", "traceId"}` body.
+
+## OtlpLogging
+
+CMS and DMS compile in `Serilog.Sinks.OpenTelemetry` as a single
+vendor-neutral OTLP log exporter. It is configured through the top-level
+`OtlpLogging` section, disabled by default, and can be enabled without
+recompilation using the environment-variable convention described in the note
+above (for example, `OtlpLogging__Enabled=true`). See
+[LOGGING.md](./LOGGING.md#otlp-export) for the full description of supported
+log routing paths, including OTLP export and deployment recipes.
+
+| Parameter              | Description                                                                                                                                                              |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Enabled                | When `true`, log events are also exported over OTLP. Default: `false`.                                                                                                   |
+| Endpoint                | The OTLP collector endpoint, as an absolute `http://` or `https://` URL. Required when `Enabled` is `true`: if omitted or not such a URL, OTLP export is not applied and a warning is written to stderr. Prefer `https://` for any endpoint outside a trusted network boundary (see [LOGGING.md](./LOGGING.md#security-considerations-for-otlp-export)). Example: `http://collector:4318`. |
+| Protocol                | The OTLP wire protocol. Valid values are `Grpc` and `HttpProtobuf` (case-insensitive); OTLP-convention spellings such as `http/protobuf` are rejected at startup. Default: `HttpProtobuf`. |
+| ServiceName             | The `service.name` resource attribute. Default: `EdFi.DataManagementService` (DMS) or `EdFi.DmsConfigurationService` (CMS).                                              |
+| ServiceVersion          | The `service.version` resource attribute. Default: the application's informational version.                                                                             |
+| DeploymentEnvironment   | Optional deployment environment, emitted as both the `deployment.environment` and `deployment.environment.name` resource attributes. Omitted when unset.                 |
+| ServiceInstanceId       | Optional `service.instance.id` resource attribute. Omitted when unset.                                                                                                   |
+| Headers                 | Optional headers sent with every export request, e.g. `OtlpLogging__Headers__Authorization` for an authenticated collector receiver. Header values are secrets: source them from a secret store or environment variable, never a committed configuration file. An invalid header name or value (e.g. a trailing newline in the value) means OTLP export is not applied: a warning is written to stderr that deliberately omits the offending value. |
 
 ## Identity Provider Configuration
 
@@ -249,6 +690,8 @@ relevant environment variables or appsettings to set `IdentityProvider` to
 | `AppSettings.IdentityProvider` | Selects the identity provider                                    | `keycloak`                                           | `self-contained`                              |
 | `IdentitySettings.Authority`        | URL of the identity provider's authority (issuer)                | `http://dms-keycloak:8080/realms/edfi`              | `http://ed-fi-api-config:8081`              |
 | `IdentitySettings.EncryptionKey`    | Key used for token encryption (self-contained only)              | _(not used)_                                         | `QWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo0NTY3ODkwMTIz` |
+| `IdentitySettings.TokenCleanupEnabled` | Enables the background sweep that deletes expired OpenIddict access tokens (self-contained only) | _(not used)_                                         | `true`              |
+| `IdentitySettings.TokenCleanupIntervalMinutes` | Interval, in minutes, between expired-token cleanup sweeps (self-contained only)           | _(not used)_                                         | `30`              |
 
 ### JwtAuthentication parameters in `appsettings.json` (DMS API Service)
 
@@ -257,5 +700,12 @@ relevant environment variables or appsettings to set `IdentityProvider` to
 | `AppSettings.AuthenticationService`       | URL of the identity provider's authority (issuer)   | `http://dms-keycloak:8080/realms/edfi/protocol/openid-connect/token`              | `http://ed-fi-api-config:8081/connect/token`              |
 | `JwtAuthentication.Authority`       | URL of the identity provider's authority (issuer)   | `http://dms-keycloak:8080/realms/edfi`              | `http://ed-fi-api-config:8081`              |
 | `JwtAuthentication.MetadataAddress` | OpenID Connect metadata endpoint                    | `http://dms-keycloak:8080/realms/edfi/.well-known/openid-configuration` | `http://ed-fi-api-config:8081/.well-known/openid-configuration` |
+| `JwtAuthentication.RoleClaimType` | Exact inbound claim type used by endpoints that require a specifically configured role | `http://schemas.microsoft.com/ws/2008/06/identity/claims/role` | `http://schemas.microsoft.com/ws/2008/06/identity/claims/role` |
 
 Refer to the API service's `appsettings.json` for additional options and defaults.
+
+DMS preserves JWT claim types as emitted by the identity provider. Configure
+`JwtAuthentication.RoleClaimType` to that exact claim type for endpoints that require an explicitly
+configured role claim. The ordinary `JwtAuthentication.ClientRole` gate remains backward compatible
+with the configured type and the standard `role`, `roles`, and
+`http://schemas.microsoft.com/ws/2008/06/identity/claims/role` representations.

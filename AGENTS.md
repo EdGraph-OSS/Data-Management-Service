@@ -1,19 +1,43 @@
 This repository contains the **Ed-Fi Data Management Service (DMS) Platform**, which consists of two main applications:
 
-1. **Ed-Fi Data Management Service (DMS)** - A functional implementation of Ed-Fi Resources API, Ed-Fi Descriptors API, and Ed-Fi Discovery API
- - Code and solution file in `./src/dms`
-2. **Ed-Fi DMS Configuration Service (CMS)** - A functional implementation of the Ed-Fi Management API specification
- - Code and solution file in `./src/config`
+1. **Ed-Fi Data Management Service (DMS)** - An implementation of Ed-Fi Resources API, Ed-Fi Descriptors API, and Ed-Fi Discovery API, in `./src/dms`
+2. **Ed-Fi DMS Configuration Service (CMS)** - An implementation of the Ed-Fi Management API specification, in `./src/config`
 
 ### Code Style
 
 - Only use .NET 10 code style, including modern C# language features (e.g., primary constructors, pattern matching, records, target-typed new, collection expressions, and file-scoped namespaces).
 - Declare variables non-nullable.
 - Always use `is null` or `is not null` instead of `== null` or `!= null`.
+- Use `System.Text.Json` for JSON serialization and parsing in .NET application code and build tooling. Do not introduce new `Newtonsoft.Json` dependencies or usages.
 
 ### Format Code
 
 - `dotnet csharpier format <directory or file>`
+
+## RelationalMappingVersion Release Cadence
+
+`SchemaHashConstants.RelationalMappingVersion` in
+`src/dms/core/EdFi.DataManagementService.Core/Utilities/SchemaHashConstants.cs`
+tracks the **DMS release line**, not individual changes.
+
+- Bump it at most **once per release**, and only if relational mapping actually changed during that release cycle.
+- Once the current release line's value has been bumped, further relational mapping changes landing before that release ships keep the same value. Do not bump again.
+- Never lower or revert the value.
+
+Current mapping:
+
+- DMS 8.0 released with `v1`.
+- DMS 8.1 releases with `v3`. The 8.1 cycle bumped twice (`v1` -> `v2` -> `v3`), which is more than the convention allows; `v3` stands as the value 8.1 releases with and must not be reverted.
+- Any relational mapping change landing before the 8.1 release keeps `v3`.
+- The next legitimate bump is `v4`, at the first qualifying relational mapping change after 8.1 ships.
+
+Do not infer the current release line from `src/dms/Directory.Build.props`; it is not kept in step with the release line. To review the constant's actual change history:
+
+```powershell
+git log --oneline --date=short --format="%h %cd %s" -G "public const string RelationalMappingVersion" -- src\dms\core\EdFi.DataManagementService.Core\Utilities\SchemaHashConstants.cs
+```
+
+Why the cadence matters: `EffectiveSchemaHashProvider` includes the constant in the hashed manifest, so changing it changes `EffectiveSchemaHash` for every dialect. Databases provisioned against the previous hash then fail startup validation in `ValidateStartupInstancesTask` and receive HTTP 503 at request time until they are re-provisioned. Every bump is a forced re-provision of every existing database, so each extra bump within one release cycle forces an extra one. Holding the value also has a cost: `EffectiveSchemaHash` does not include generated DDL or mapping-set output, so a mapping-only physical change made without a bump can leave validation unable to detect a database provisioned before that change; those databases must be deliberately reprovisioned. See `docs/RELATIONAL-BACKEND.md` for the full schema-fingerprint validation flow.
 
 ## Working with Data Management Service E2E Tests
 
@@ -21,7 +45,7 @@ The Data Management Service E2E tests directory is `src/dms/tests/EdFi.DataManag
 
 The Data Management Service E2E tests interact with a Docker stack named dms-local. Examine the docker log files to assist in debugging E2E tests.
 
-If docker is not running, on Linux start it with `systemctl --user start docker-desktop`
+On Linux with Docker Engine, check `systemctl status docker --no-pager` and, if stopped, start it with `sudo systemctl start docker`. Docker Desktop is not required. Verify `docker ps` succeeds in the current execution session.
 
 You must teardown and setup when you switch branches or change debugging code in DMS.
 
@@ -79,19 +103,19 @@ For SQL Server/MSSQL tests, `ConnectionStrings__MssqlAdmin` must point to a runn
 ```powershell
 Get-ChildItem Env:ConnectionStrings__MssqlAdmin -ErrorAction SilentlyContinue
 Test-NetConnection -ComputerName localhost -Port 14333
-docker ps --filter name=dms-mssql-integration
-docker logs dms-mssql-integration --tail 80
+docker ps --filter name=dms-mssql-integration-2025
+docker logs dms-mssql-integration-2025 --tail 80
 ```
 
 Known-good local MSSQL setup:
 
 ```powershell
-docker run --name dms-mssql-integration -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='EdFi_Dms1!' -p 14333:1433 -d mcr.microsoft.com/mssql/server:2022-latest
+docker run --name dms-mssql-integration-2025 -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='EdFi_Dms1!' -p 14333:1433 -d mcr.microsoft.com/mssql/server:2025-latest
 $env:ConnectionStrings__MssqlAdmin = "Server=localhost,14333;User Id=sa;Password=EdFi_Dms1!;TrustServerCertificate=true"
 dotnet test src/dms/tests/EdFi.DataManagementService.Tests.Integration/EdFi.DataManagementService.Tests.Integration.csproj --filter "Category=MssqlIntegration"
 ```
 
-If the container already exists, use `docker start dms-mssql-integration`. If port `14333` is busy, map another host port and use the same port in `ConnectionStrings__MssqlAdmin`.
+If the container already exists, use `docker start dms-mssql-integration-2025`. The version-suffixed name keeps SQL Server 2025 separate from any `dms-mssql-integration` container created from the earlier SQL Server 2022 instructions; do not reuse that legacy container, because tests gated on SQL Server 2025 (such as the native-json evaluation fixture) silently skip on it. Remove it with `docker rm -f dms-mssql-integration` once anything you need from it is saved. If port `14333` is busy, map another host port and use the same port in `ConnectionStrings__MssqlAdmin`.
 
 ## Working with DMS Configuration Management Service E2E Tests
 
@@ -106,7 +130,7 @@ Before running MSSQL backend integration tests, verify that a SQL Server instanc
 Example local container setup:
 
 1. Start SQL Server:
-   - `docker run --rm --name dms-codex-mssql -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='<StrongPassword>' -p 1434:1433 -d mcr.microsoft.com/mssql/server:2022-latest`
+   - `docker run --rm --name dms-codex-mssql -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='<StrongPassword>' -p 1434:1433 -d mcr.microsoft.com/mssql/server:2025-latest`
 2. Wait until SQL Server is ready before running tests.
 3. Run MSSQL integration tests with:
    - `ConnectionStrings__MssqlAdmin='Server=localhost,1434;User Id=sa;Password=<StrongPassword>;TrustServerCertificate=True;Encrypt=True' dotnet test <mssql test project or solution> --filter <filter>`
@@ -118,4 +142,3 @@ Example local container setup:
 - Use NUnit with FluentAssertions, and FakeItEasy for mocks when necessary.
 - NUnit tests should follow the existing style, which is filenames named like the code area being tested,
   TestFixture classes named with prefix "Given_", a Setup method which does arrange and act, and Test methods with "It_" prefixes for each individual assert.
-

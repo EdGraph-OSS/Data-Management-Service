@@ -540,6 +540,10 @@ public static class DerivedModelSetManifestEmitter
                 writer.WriteStartObject();
                 writer.WriteString("person_join_name", join.PersonJoinName);
                 writer.WriteString("person_kind", join.PersonKind.ToString());
+                writer.WritePropertyName("person_table");
+                WriteTableReference(writer, join.PersonTable);
+                writer.WriteString("person_identity_column", join.PersonIdentityColumn.Value);
+                writer.WriteString("source_binding_column", join.SourceBindingColumn.Value);
                 writer.WritePropertyName("join_path");
                 writer.WriteStartArray();
                 foreach (var step in join.JoinPath)
@@ -898,6 +902,8 @@ public static class DerivedModelSetManifestEmitter
     {
         writer.WriteStartObject();
         writer.WriteBoolean("is_identity_component", binding.IsIdentityComponent);
+        writer.WriteBoolean("is_required", binding.IsRequired);
+        writer.WriteBoolean("is_role_named", binding.IsRoleNamed);
         writer.WriteString("reference_object_path", binding.ReferenceObjectPath.Canonical);
         writer.WritePropertyName("table");
         WriteTableReference(writer, binding.Table);

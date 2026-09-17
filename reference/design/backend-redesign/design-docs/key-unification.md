@@ -77,7 +77,7 @@ For each document reference site, the relational mapping stores:
 - `{RefBaseName}_DocumentId` (stable key)
 - `{RefBaseName}_{IdentityPart}` propagated identity columns (one per identity part)
 
-Composite FKs target `(DocumentId, <IdentityParts...>)` on the referenced table, using `ON UPDATE CASCADE` when the
+Composite FKs target `(<IdentityParts...>, DocumentId)` on the referenced table, using `ON UPDATE CASCADE` when the
 referenced target is abstract or transitively mutable.
 
 Core validates `equalityConstraints` on API writes (see `EdFi.DataManagementService.Core/Validation`), but the database
@@ -591,10 +591,18 @@ For each table row being materialized, and for each `KeyUnificationClass` on tha
      used for normal scalar columns (coercions are Core-owned; backend should treat incoming values as already
      canonicalized).
    - For `DescriptorFk` members: resolve the JSON descriptor URI string to the descriptor `DocumentId` (BIGINT) using:
-     - normalization consistent with descriptor resolution (baseline: `ToLowerInvariant()`), and
+     - the shared descriptor well-formedness assertion, which requires a previously validated
+       well-formed-without-NUL URI and never lowercases (case folding is engine-owned; the probe
+       folds the value in SQL), and
      - the member’s `DbColumnModel.TargetResource` as part of the lookup key.
-     - recommended key shape: `DescriptorKey(NormalizedUri, DescriptorResource)` as defined in
-       `flattening-reconstitution.md` (`ResolvedReferenceSet.DescriptorIdByKey`).
+     - recommended key shape: `DescriptorKey(RawUri, DescriptorResource)` compared ordinally, as
+       defined in `flattening-reconstitution.md` (`ResolvedReferenceSet.DescriptorIdByKey`);
+       case-variant spellings remain separate keys that resolve to the same `DocumentId`.
+     Core descriptor extraction MUST reject a NUL-bearing URI at its concrete request JSON path
+     before the resolver or this coalescing step runs (an unpaired-surrogate JSON escape cannot
+     reach a C# string; `ParseBodyMiddleware` rejects it body-wide at parse). It is a
+     path-attributed 400 validation failure, not an unresolved-reference failure. This step MUST
+     assert the well-formed-without-NUL invariant and MUST NOT lowercase the value.
      If a descriptor URI is present but cannot be resolved to a `DocumentId`, the write MUST fail closed (descriptor
      reference validation failure).
 3. Apply conflict detection:
@@ -1612,13 +1620,13 @@ and adds `NullOrTrue` hardening constraints for synthetic presence flags.
 For a reference site, the composite FK uses canonical storage columns for unified identity parts:
 
 - Local FK columns:
-  - `{RefBaseName}_DocumentId`
   - `<CanonicalIdentityParts...>` (in the referenced target’s identity path order; derived by mapping each identity
     part binding column through `DbColumnModel.Storage`)
+  - `{RefBaseName}_DocumentId`
 - Target columns:
-  - `DocumentId`
   - `<TargetIdentityColumns...>` (derived by mapping each target identity binding column through
     `DbColumnModel.Storage`)
+  - `DocumentId`
 
 Referential actions:
 
@@ -1673,8 +1681,8 @@ Example (illustrative only):
 
 Under this shape, `A` can end up with multiple composite FKs that share the same canonical identity-part column:
 
-- `FK_A_B`: `(B_DocumentId, StudentUniqueId_Unified) → B(DocumentId, StudentUniqueId_Unified)`
-- `FK_A_C`: `(C_DocumentId, StudentUniqueId_Unified) → C(DocumentId, StudentUniqueId_Unified)`
+- `FK_A_B`: `(StudentUniqueId_Unified, B_DocumentId) → B(StudentUniqueId_Unified, DocumentId)`
+- `FK_A_C`: `(StudentUniqueId_Unified, C_DocumentId) → C(StudentUniqueId_Unified, DocumentId)`
 
 If `B` and `C` themselves depend on the same upstream identity and that upstream identity is updated with
 `allowIdentityUpdates=true`, the cascade graph may contain **multiple update paths** that reach `A`.
@@ -1772,8 +1780,8 @@ Authorization note:
 
 Composite foreign keys require the referenced column set to be UNIQUE. In this redesign, many composite FKs target:
 
-- `(DocumentId, <IdentityParts...>)` on a concrete root table, or
-- `(DocumentId, <AbstractIdentityParts...>)` on an abstract identity table.
+- `(<IdentityParts...>, DocumentId)` on a concrete root table, or
+- `(<AbstractIdentityParts...>, DocumentId)` on an abstract identity table.
 
 Under key unification, composite reference FKs are defined over **canonical storage columns** for unified identity
 parts (see “Composite reference foreign keys” above). Therefore, any UNIQUE constraints whose sole purpose is “make
@@ -1782,10 +1790,10 @@ the composite FK legal” MUST be defined over the same canonical storage column
 Normative rules:
 
 1. When deriving a referenced-key UNIQUE for a composite FK target, the target column list MUST be:
-   - `DocumentId`, plus
    - the target identity-part columns mapped to their **canonical storage columns**:
      - `Stored` → itself
      - `UnifiedAlias` → `UnifiedAlias.CanonicalColumn`
+   - `DocumentId`, last.
 2. If two or more identity parts map to the same canonical column (because the identity schema contains duplicated
    endpoints that are equality-constrained), the derivation MUST de-duplicate the repeated canonical column name
    deterministically:
@@ -1883,12 +1891,13 @@ Implementation guidance (dialect-neutral semantics):
 - Fire on `INSERT`, `UPDATE`, and `DELETE` for each schema-derived table (as described in `update-tracking.md`).
 - Compute `affectedDocumentIds` from `inserted ∪ deleted` (dedupe).
 - Always bump **Content** stamps for `affectedDocumentIds` (representation changed).
-- Compute `identityChangedDocumentIds` by diffing the document’s identity projection values between `inserted` and
-  `deleted` (null-safe comparison). For unified members, diff the **presence-gated canonical expression** above (not
-  the alias column name).
-- Bump **Identity** stamps only for `identityChangedDocumentIds`.
+- Record key-change rows for documents whose persisted identity projection values differ between `inserted` and
+  `deleted` under the ODS-compatible canonical storage semantics described in
+  [change-queries.md](change-queries.md). This key-change workset is intentionally separate from the
+  presence-gated identity-propagation compare set above.
+- Representation-changing identity propagation still follows the content-stamp rules for `affectedDocumentIds`.
 
-#### `TriggerKindParameters.ReferentialIdentityMaintenance` + `TriggerKindParameters.AbstractIdentityMaintenance`
+#### `TriggerKindParameters.AbstractIdentityMaintenance`
 
 These triggers must use the same value-diff gating:
 
@@ -1896,8 +1905,7 @@ These triggers must use the same value-diff gating:
   values differ between `inserted` and `deleted` (null-safe).
 - For unified identity members, the identity value is the presence-gated canonical expression above.
 
-This guarantees that cascade updates to canonical columns correctly cause referential-id and abstract-identity
-maintenance, even though alias columns are read-only.
+This guarantees that cascade updates to canonical columns correctly cause abstract-identity maintenance, even though alias columns are read-only.
 
 Design note (applies to `07-index-and-trigger-inventory.md` and any DDL emission docs):
 
@@ -1914,23 +1922,36 @@ compilation, manifests, and DDL generation) see a unified model.
 
 ### Recommended placement in `RelationalModelSetPasses` order
 
-Recommended set-level pass order (relative to the current default implementation in
-`src/dms/backend/EdFi.DataManagementService.Backend.RelationalModel/Build/RelationalModelSetPasses.cs`):
+The executable set-level pass order, as built by
+`src/dms/backend/EdFi.DataManagementService.Backend.RelationalModel/Build/RelationalModelSetPasses.cs`
+(the strict pass list additionally inserts `ValidateCollectionSemanticIdentityPass` where noted):
 
 1. `BaseTraversalAndDescriptorBindingPass`
 2. `DescriptorResourceMappingPass`
 3. `ExtensionTableDerivationPass`
 4. `ReferenceBindingPass`
-5. **`KeyUnificationPass` (new)** ← applies canonical columns + presence-gated aliases + `KeyUnificationClasses`
+5. `KeyUnificationPass` ← applies canonical columns + presence-gated aliases + `KeyUnificationClasses`
 6. `AbstractIdentityTableAndUnionViewDerivationPass`
-7. `RootIdentityConstraintPass`
-8. `ReferenceConstraintPass`
-9. `ArrayUniquenessConstraintPass`
-10. `ApplyConstraintDialectHashingPass`
-11. *(When implemented in E01)* `DeriveIndexInventoryPass` (DMS-945)
-12. *(When implemented in E01)* `DeriveTriggerInventoryPass` (DMS-945)
-13. `ApplyDialectIdentifierShorteningPass`
-14. `CanonicalizeOrderingPass`
+7. `ValidateUnifiedAliasMetadataPass`
+8. `RootIdentityConstraintPass`
+9. `TransitiveIdentityMutabilityPass`
+10. `ReferenceConstraintPass`
+11. `SemanticIdentityCompilationPass`
+12. `ValidateCollectionSemanticIdentityPass` *(strict pass list only)*
+13. `ArrayUniquenessConstraintPass`
+14. `StableCollectionConstraintPass`
+15. `DescriptorForeignKeyConstraintPass`
+16. `MssqlForeignKeyPruningPass`
+17. `ApplyConstraintDialectHashingPass`
+18. `ValidateForeignKeyStorageInvariantPass`
+19. `DeriveContentVersionMirrorPass`
+20. `DeriveIndexInventoryPass`
+21. `DeriveTriggerInventoryPass`
+22. `DeriveTrackedChangeInventoryPass`
+23. `DeriveAuthHierarchyPass`
+24. `DeriveAuthorizationIndexInventoryPass`
+25. `ApplyDialectIdentifierShorteningPass`
+26. `CanonicalizeOrderingPass`
 
 Notes:
 
@@ -1942,9 +1963,11 @@ Notes:
 - `KeyUnificationPass` MUST run **before** any constraint derivation pass that needs to target canonical storage
   columns (notably reference composite FKs), and before any pass that builds SourceJsonPath-based lookups that must see
   the post-unification table/column inventory.
-- If E01 derives index/trigger inventories (DMS-945), `DeriveIndexInventoryPass` and `DeriveTriggerInventoryPass`
-  SHOULD run **after** `ApplyConstraintDialectHashingPass` so PK/UK-implied index names that mirror constraint names
-  reflect the final hashed constraint identifiers.
+- `DeriveIndexInventoryPass` and `DeriveTriggerInventoryPass` run **after**
+  `ApplyConstraintDialectHashingPass` so PK/UK-implied index names that mirror constraint names
+  reflect the final hashed constraint identifiers, and **before**
+  `ApplyDialectIdentifierShorteningPass`, which rewrites all identifiers including those in the
+  inventories.
 
 ### Required postconditions for downstream passes
 

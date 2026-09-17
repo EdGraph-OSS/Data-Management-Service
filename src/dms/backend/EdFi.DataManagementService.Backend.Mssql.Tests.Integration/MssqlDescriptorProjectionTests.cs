@@ -8,6 +8,7 @@ using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Backend.External.Plans;
 using EdFi.DataManagementService.Backend.Plans;
 using EdFi.DataManagementService.Backend.Tests.Integration.Common;
+using EdFi.DataManagementService.Core.External.Model;
 using FluentAssertions;
 using Microsoft.Data.SqlClient;
 using NUnit.Framework;
@@ -131,9 +132,7 @@ internal static class MssqlDescriptorProjectionFixture
                 [DocumentUuid] uniqueidentifier NOT NULL,
                 [ResourceKeyId] smallint NOT NULL DEFAULT 0,
                 [ContentVersion] bigint NOT NULL DEFAULT 1,
-                [IdentityVersion] bigint NOT NULL DEFAULT 1,
                 [ContentLastModifiedAt] datetimeoffset NOT NULL DEFAULT sysdatetimeoffset(),
-                [IdentityLastModifiedAt] datetimeoffset NOT NULL DEFAULT sysdatetimeoffset(),
                 [CreatedAt] datetimeoffset NOT NULL DEFAULT sysdatetimeoffset()
             );
 
@@ -162,11 +161,11 @@ internal static class MssqlDescriptorProjectionFixture
         await ExecuteSqlAsync(
             connection,
             $"""
-            INSERT INTO [dms].[Document] ([DocumentId], [DocumentUuid], [ResourceKeyId], [ContentVersion], [IdentityVersion]) VALUES
-                (700, '70000000-0000-0000-0000-000000000700', 0, 1, 1),
-                (701, '70100000-0000-0000-0000-000000000701', 0, 1, 1),
-                (702, '70200000-0000-0000-0000-000000000702', 0, 1, 1),
-                (703, '70300000-0000-0000-0000-000000000703', 0, 1, 1);
+            INSERT INTO [dms].[Document] ([DocumentId], [DocumentUuid], [ResourceKeyId], [ContentVersion]) VALUES
+                (700, '70000000-0000-0000-0000-000000000700', 0, 1),
+                (701, '70100000-0000-0000-0000-000000000701', 0, 1),
+                (702, '70200000-0000-0000-0000-000000000702', 0, 1),
+                (703, '70300000-0000-0000-0000-000000000703', 0, 1);
 
             INSERT INTO [dms].[Descriptor] ([DocumentId], [Namespace], [CodeValue], [ShortDescription], [Discriminator], [Uri]) VALUES
                 (901, 'uri://ed-fi.org/GradeLevelDescriptor', 'Ninth grade', 'Ninth grade', 'edfi.GradeLevelDescriptor', '{Uri901}'),
@@ -746,7 +745,8 @@ public class Given_Multi_Document_Page_Created_Via_Query_Keyset_Returns_All_Desc
                 ],
                 TotalCountParametersInOrder: null
             ),
-            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L }
+            new Dictionary<string, object?> { ["offset"] = 0L, ["limit"] = 25L },
+            PageOrderingMode.DocumentId
         );
 
         await using var execConn = new SqlConnection(_connectionString);
@@ -831,7 +831,8 @@ file static class MssqlDescriptorProjectionPageKeysetHelper
                 PageParametersInOrder: [],
                 TotalCountParametersInOrder: null
             ),
-            new Dictionary<string, object?>()
+            new Dictionary<string, object?>(),
+            PageOrderingMode.DocumentId
         );
     }
 }

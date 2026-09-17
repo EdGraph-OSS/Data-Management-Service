@@ -43,6 +43,13 @@ if (useReverseProxyHeaders)
     );
 }
 
+// A Minimal API binding failure (malformed JSON body, unparsable route/query/header parameter) can be
+// written as a bodiless 400 that never reaches GlobalExceptionHandler. The default behavior varies by
+// environment (Development throws via its auto-registered exception page; Test/Production leave it
+// bodiless), so this makes binding failures reach the handler consistently in every environment. Safe
+// because GlobalExceptionHandler never surfaces exception.Message — only fixed, sanitized text.
+builder.Services.Configure<RouteHandlerOptions>(o => o.ThrowOnBadRequest = true);
+
 var app = builder.Build();
 
 var pathBase = app.Configuration.GetValue<string>("AppSettings:PathBase");
@@ -59,7 +66,25 @@ if (useReverseProxyHeaders)
 app.UseMiddleware<SecurityHeadersMiddleware>();
 
 app.UseMiddleware<RequestLoggingMiddleware>();
+
+// The exception boundary must wrap tenant resolution and the invalid-configuration short-circuit so
+// that any unexpected exception in those middlewares is shaped by GlobalExceptionHandler instead of
+// surfacing as an unshaped framework 500. RequestLoggingMiddleware stays outermost, so a handled 500
+// is still logged exactly once as HttpRequestFailed via IExceptionHandlerFeature.
+app.UseExceptionHandler(o => { });
+
 app.UseMiddleware<TenantResolutionMiddleware>();
+
+// Deliberately validated outside ReportInvalidConfiguration: that gate installs reporting middleware
+// and lets the host keep running, whereas a rejected connection-string encryption key must stop
+// startup before any schema deployment. Resolving it here also means a rejected key stops startup
+// even when another configuration section is invalid as well, and it runs every DatabaseSettings
+// rule, so a blank DatabaseConnection stops startup too. The unhandled OptionsValidationException
+// exits non-zero and carries the validator's failure text. It is left unhandled rather than following
+// the LogCritical + Environment.Exit(-1) pattern used further down this file because
+// DatabaseOptionsStartupTests asserts on that exception, and terminating the process instead would
+// make the behavior untestable under WebApplicationFactory.
+_ = app.Services.GetRequiredService<IOptions<DatabaseOptions>>().Value;
 
 if (!ReportInvalidConfiguration(app))
 {
@@ -67,11 +92,22 @@ if (!ReportInvalidConfiguration(app))
     await InitializeClaimsData(app);
 }
 
-app.UseExceptionHandler(o => { });
 app.UseRouting();
+
+// Shape framework-generated bodiless error responses into the Ed-Fi contract. Placed after routing
+// but before CORS/authentication/authorization so it wraps the auth short-circuits and the endpoint
+// terminal, independent of route and authentication scheme.
+app.UseMiddleware<FrameworkErrorResponseMiddleware>();
+
 app.UseCors("AllowSwaggerUI");
 app.UseAuthentication();
 app.UseAuthorization();
+
+// Reject JSON requests declaring an unsupported charset with the Ed-Fi 415 contract before body
+// binding reads them. Placed after authorization so authentication and authorization failures keep
+// their 401/403 responses.
+app.UseMiddleware<JsonCharsetValidationMiddleware>();
+
 app.MapRouteEndpoints();
 app.MapOpenApi();
 await app.RunAsync();
@@ -134,7 +170,12 @@ async Task InitializeClaimsData(WebApplication app)
         app.Logger.LogInformation("Checking if initial claims data needs to be loaded");
         try
         {
-            IClaimsDataLoader claimsLoader = app.Services.GetRequiredService<IClaimsDataLoader>();
+            // IClaimsDataLoader is scoped (it reaches the scoped ITenantContextProvider through its
+            // repositories), so startup resolution needs its own scope: the root provider rejects
+            // scoped services when scope validation is on.
+            using IServiceScope claimsLoaderScope = app.Services.CreateScope();
+            IClaimsDataLoader claimsLoader =
+                claimsLoaderScope.ServiceProvider.GetRequiredService<IClaimsDataLoader>();
             ClaimsDataLoadResult result = await claimsLoader.LoadInitialClaimsAsync();
 
             switch (result)

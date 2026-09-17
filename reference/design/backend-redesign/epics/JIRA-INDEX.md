@@ -112,9 +112,9 @@ This index links design documents under `reference/design/backend-redesign/epics
   - `DMS-1000` — Invalidate Identity Resolution Caches After Commit — `reference/design/backend-redesign/epics/09-identity-concurrency/04-cache-invalidation.md`
 
 - `DMS-1001` — Update Tracking (`_etag/_lastModifiedDate`) + Change Queries (`ChangeVersion`) — `reference/design/backend-redesign/epics/10-update-tracking-change-queries/EPIC.md`
-  - `DMS-1002` — Emit Stamping Triggers for `dms.Document` (Content + Identity Stamps) — `reference/design/backend-redesign/epics/10-update-tracking-change-queries/00-token-stamping.md`
+  - `DMS-1002` — Emit Stamping Triggers for `dms.Document` Content Stamps — `reference/design/backend-redesign/epics/10-update-tracking-change-queries/00-token-stamping.md`
   - `DMS-1003` — Journaling Contract (Triggers Own Journal Writes) — `reference/design/backend-redesign/epics/10-update-tracking-change-queries/01-journaling-contract.md`
-  - `DMS-1004` — Serve `_etag`, `_lastModifiedDate`, and `ChangeVersion` from Stored Stamps — `reference/design/backend-redesign/epics/10-update-tracking-change-queries/02-derived-metadata.md`
+  - `DMS-1004` — Compose `_etag`; Serve `_lastModifiedDate` and `ChangeVersion` from Stored Stamps — `reference/design/backend-redesign/epics/10-update-tracking-change-queries/02-derived-metadata.md`
   - `DMS-1005` — Enforce `If-Match` Using Stored Representation Stamps — `reference/design/backend-redesign/epics/10-update-tracking-change-queries/03-if-match.md`
   - `DMS-1006` — Change Query Candidate Selection (Journal-Driven) — `reference/design/backend-redesign/epics/10-update-tracking-change-queries/04-change-query-selection.md`
   - `DMS-1007` — Change Query API Endpoints (Optional / Future-Facing) — `reference/design/backend-redesign/epics/10-update-tracking-change-queries/05-change-query-api.md`
@@ -155,7 +155,8 @@ This index links design documents under `reference/design/backend-redesign/epics
   - `DMS-1057` — Implement Namespace-based Authorization Strategy — `reference/design/backend-redesign/epics/14-authorization/08-namespace-auth-strategy.md`
   - `DMS-1058` — Design Ownership-token maintenance in CMS — `reference/design/backend-redesign/epics/14-authorization/09-design-ownership-token-maintenance.md`
   - `DMS-1059` — Emit the CreatedByOwnershipTokenId column and index — `reference/design/backend-redesign/epics/14-authorization/10-emit-ownership-column-and-index.md`
-  - `DMS-1060` — Implement Ownership-based Authorization Strategy — `reference/design/backend-redesign/epics/14-authorization/11-ownership-auth-strategy.md`
+  - `DMS-1060` — Implement Ownership-based Authorization for GET-by-id, POST, PUT, and DELETE — `reference/design/backend-redesign/epics/14-authorization/11-ownership-auth-strategy.md`
+  - `DMS-1410` — Implement Ownership-based Authorization for GET-many — `reference/design/backend-redesign/epics/14-authorization/11b-ownership-auth-get-many.md`
   - `DMS-1061` — Add support for View-based strategy in the ResolveSecurableElementColumnPath function — `reference/design/backend-redesign/epics/14-authorization/12-view-based-resolve-column-path.md`
   - `DMS-1062` — Implement View-based Authorization Strategy for GET-many — `reference/design/backend-redesign/epics/14-authorization/13-view-based-auth-get-many.md`
   - `DMS-1063` — Implement View-based Authorization Strategy for GET-by-id, POST, PUT, and DELETE — `reference/design/backend-redesign/epics/14-authorization/14-view-based-auth-crud.md`
@@ -165,6 +166,11 @@ This index links design documents under `reference/design/backend-redesign/epics
   - `DMS-1091` — Formalize Auth Startup as IDmsStartupTask — `reference/design/backend-redesign/epics/14-authorization/18-formalize-auth-startup-task.md`
   - `DMS-1096` — Verification harness for emitted auth DB objects — `reference/design/backend-redesign/epics/14-authorization/19-auth-verification-harness.md`
   - `DMS-1099` — Implement Security Configuration ProblemDetails — `reference/design/backend-redesign/epics/14-authorization/20-configuration-problem-details.md`
+  - `DMS-1207` — Convert token_info Education Organization Lookup to Relational Auth Schema — `reference/design/backend-redesign/epics/14-authorization/21-token-info-edorg-relational-auth-schema.md`
+  - `DMS-1362` — Make Namespace Authorization Indexes Serve Prefix LIKE on PostgreSQL — `reference/design/backend-redesign/epics/14-authorization/22-namespace-auth-index-prefix-like.md`
+  - `DMS-1372` — Store and Maintain API-client Ownership Tokens in CMS — `reference/design/backend-redesign/epics/14-authorization/23-store-api-client-ownership-tokens-in-cms.md`
+  - `DMS-1373` — Load and Cache API-client Ownership Tokens from CMS in DMS — `reference/design/backend-redesign/epics/14-authorization/24-load-and-cache-api-client-ownership-tokens-from-cms.md`
+  - `DMS-1374` — Define Ownership-token Operational Lifecycle and Administration — `reference/design/backend-redesign/epics/14-authorization/25-ownership-token-operational-lifecycle-spike.md`
 
 - `DMS-1027` — Runtime Plan Compilation + Caching (Shared with AOT Packs) — `reference/design/backend-redesign/epics/15-plan-compilation/EPIC.md`
   - `DMS-1043` — Plan SQL Foundations (Shared Canonical Writer + Dialect Helpers) — `reference/design/backend-redesign/epics/15-plan-compilation/01-plan-sql-foundations.md`
@@ -194,3 +200,54 @@ This index links design documents under `reference/design/backend-redesign/epics
   - `DMS-1285` — Close MSSQL Relational Write-Path Correctness and Resilience Coverage Gaps — `reference/design/backend-redesign/epics/17-mssql-gap-closure/05-mssql-write-path-coverage.md`
   - `DMS-1286` — Add Real-MSSQL Integration Coverage for NamespaceBased CRUD Authorization — `reference/design/backend-redesign/epics/17-mssql-gap-closure/06-mssql-namespace-authorization-coverage.md`
   - `DMS-1289` — Add MSSQL Coverage to Scheduled Smoke Tests — `reference/design/backend-redesign/epics/17-mssql-gap-closure/07-mssql-scheduled-smoke.md`
+
+- `DMS-1308` — `dms.DocumentCache` Projection — `reference/design/backend-redesign/epics/18-document-cache/EPIC.md`
+  - `DMS-1310` — Finalize DocumentCache schema and provider DDL — `reference/design/backend-redesign/epics/18-document-cache/00-documentcache-schema-and-provider-ddl.md`
+  - `DMS-1311` — Add DocumentCache configuration and target selection — `reference/design/backend-redesign/epics/18-document-cache/01-documentcache-configuration-and-target-selection.md`
+  - `DMS-1312` — Add reusable caller-agnostic document materialization — `reference/design/backend-redesign/epics/18-document-cache/02-document-materializer-service.md`
+  - `DMS-1313` — Implement monotonic cache upsert and post-delete fencing — `reference/design/backend-redesign/epics/18-document-cache/03-monotonic-cache-upsert-and-delete-fencing.md`
+  - `DMS-1314` — Add the asynchronous DocumentCache reconciliation loop — `reference/design/backend-redesign/epics/18-document-cache/04-async-projector-reconciliation-loop.md`
+  - `DMS-1315` — Add fresh-cache reads with relational fallback — `reference/design/backend-redesign/epics/18-document-cache/05-cache-backed-read-path.md`
+  - `DMS-1316` — Add DocumentCache health, readiness, and telemetry — `reference/design/backend-redesign/epics/18-document-cache/06-documentcache-health-readiness-and-telemetry.md`
+  - `DMS-1317` — Add DocumentCache integration coverage and runbooks — `reference/design/backend-redesign/epics/18-document-cache/07-documentcache-integration-tests-and-runbooks.md`
+  - `DMS-1318` — Add an out-of-band representation-restamp utility — `reference/design/backend-redesign/epics/18-document-cache/08-representation-restamp-utility.md`
+
+- `DMS-1309` — Relational CDC/Kafka Streaming — `reference/design/backend-redesign/epics/19-cdc-kafka/EPIC.md`
+  - `DMS-1319` — Add deployment-owned CDC binding and readiness — `reference/design/backend-redesign/epics/19-cdc-kafka/00-documentcache-cdc-prerequisites.md`
+  - `DMS-1320` — Emit/provision provider CDC key and database support — `reference/design/backend-redesign/epics/19-cdc-kafka/01-cdc-ddl-support.md`
+  - `DMS-1321` — Generate PostgreSQL and SQL Server connector templates — `reference/design/backend-redesign/epics/19-cdc-kafka/02-connector-template-generation.md`
+  - `DMS-1322` — Add the relational DocumentState Kafka Connect transform — `reference/design/backend-redesign/epics/19-cdc-kafka/03-document-state-transform.md`
+  - `DMS-1323` — Add explicit local/bootstrap connector registration — `reference/design/backend-redesign/epics/19-cdc-kafka/04-bootstrap-enable-kafka-cdc.md`
+  - `DMS-1324` — Add Kafka message and source-routing contract tests — `reference/design/backend-redesign/epics/19-cdc-kafka/05-message-contract-tests.md`
+  - `DMS-1325` — Replace legacy Kafka E2E expectations — `reference/design/backend-redesign/epics/19-cdc-kafka/06-e2e-kafka-scenarios.md`
+  - `DMS-1326` — Add CDC setup, monitoring, recovery, and security runbooks — `reference/design/backend-redesign/epics/19-cdc-kafka/07-ops-docs-runbooks.md`
+
+- `DMS-1348` — Partitioned Cursor Paging — `reference/design/backend-redesign/epics/20-partitioned-cursor-paging/EPIC.md`
+  - `DMS-1349` — Design Partitioned Cursor Paging — `reference/design/backend-redesign/design-docs/partitioned-cursor-paging.md`
+  - `DMS-1383` — Cursor Contract Primitives — `reference/design/backend-redesign/epics/20-partitioned-cursor-paging/00a-cursor-contract-primitives.md`
+  - `DMS-1384` — Request Validation and Typed Paths — `reference/design/backend-redesign/epics/20-partitioned-cursor-paging/00b-cursor-and-partition-validation.md`
+  - `DMS-1385` — Candidate Planning and Provider Cursor SQL — `reference/design/backend-redesign/epics/20-partitioned-cursor-paging/02-shared-candidate-planning.md`
+  - `DMS-1386` — Cursor Execution — `reference/design/backend-redesign/epics/20-partitioned-cursor-paging/04-regular-resource-cursor-execution.md`
+  - `DMS-1387` — Partition Pipeline and SQL — `reference/design/backend-redesign/epics/20-partitioned-cursor-paging/06-partition-pipeline-and-sql.md`
+  - `DMS-1388` — OpenAPI and Client Contract — `reference/design/backend-redesign/epics/20-partitioned-cursor-paging/07-openapi-and-client-contract.md`
+  - `DMS-1389` — Cursor and Partition Authorization Matrix — `reference/design/backend-redesign/epics/20-partitioned-cursor-paging/08a-authorization-matrix.md`
+  - `DMS-1390` — Public Contract, Parity, and E2E Suite — `reference/design/backend-redesign/epics/20-partitioned-cursor-paging/08b-public-contract-parity-and-e2e.md`
+  - `DMS-1391` — Performance Harness and Traditional Baseline — `reference/design/backend-redesign/epics/20-partitioned-cursor-paging/09-performance-harness-and-baseline.md`
+  - `DMS-1392` — Performance Final Gate — `reference/design/backend-redesign/epics/20-partitioned-cursor-paging/10-performance-and-observability-final-gate.md`
+  - `DMS-1393` — Bounded Cursor and Partition Telemetry — `reference/design/backend-redesign/epics/20-partitioned-cursor-paging/12-bounded-cursor-and-partition-telemetry.md`
+
+- `DMS-1402` — DMS Storage Reduction — `reference/design/backend-redesign/epics/21-storage-reduction/EPIC.md`
+  - `DMS-1443` — Pin the SQL Server Identity Collation and Runtime Equality Contract — `reference/design/backend-redesign/epics/21-storage-reduction/01-sql-server-identity-collation-contract.md`
+  - `DMS-1444` — Add the Document/Resource Invariant and Abstract ResourceKeyId — `reference/design/backend-redesign/epics/21-storage-reduction/02-document-resource-invariant-and-abstract-resource-key.md`
+  - `DMS-1445` — Compile Natural-Key Probe Metadata — `reference/design/backend-redesign/epics/21-storage-reduction/03-natural-key-probe-metadata.md`
+  - `DMS-1446` — Move Duplicate-Identity and Constraint Diagnostics to Compiled Probes — `reference/design/backend-redesign/epics/21-storage-reduction/04-probe-based-duplicate-identity-and-constraint-diagnostics.md`
+  - `DMS-1447` — Raise the PostgreSQL Floor and Publish the Descriptor-Collation Upgrade Contract — `reference/design/backend-redesign/epics/21-storage-reduction/05-postgresql-17-and-descriptor-collation-upgrade.md`
+  - `DMS-1448` — Add Descriptor Validation, Index, and Foreign-Key Foundations — `reference/design/backend-redesign/epics/21-storage-reduction/06-descriptor-validation-index-and-fk-foundations.md`
+  - `DMS-1449` — Implement Natural-Key SQL Builders and Cardinality Contracts — `reference/design/backend-redesign/epics/21-storage-reduction/07-natural-key-sql-builders-and-cardinality-contracts.md`
+  - `DMS-1450` — Implement the Natural-Key Resolver Behind an Internal Seam — `reference/design/backend-redesign/epics/21-storage-reduction/08-natural-key-resolver-internal-seam.md`
+  - `DMS-1451` — Cut Over the Resolver, Core Contracts, and Raw Descriptor URI Handling — `reference/design/backend-redesign/epics/21-storage-reduction/09-natural-key-resolver-and-core-contract-cutover.md`
+  - `DMS-1452` — Cut Over POST Upsert Detection and Rebind SQL Server Stored Identity — `reference/design/backend-redesign/epics/21-storage-reduction/10-post-upsert-natural-key-cutover-and-stored-identity-rebind.md`
+  - `DMS-1453` — Extend Collection Duplicate Detection and Add the Generic Conflict Fallback — `reference/design/backend-redesign/epics/21-storage-reduction/11-collection-duplicate-detection-and-conflict-fallback.md`
+  - `DMS-1454` — Cut Over Descriptor Writes and Remove Core UUIDv5 Contracts — `reference/design/backend-redesign/epics/21-storage-reduction/12-descriptor-write-cutover-and-uuidv5-cleanup.md`
+  - `DMS-1455` — Cut Over Change Query Descriptor Identity Resolution — `reference/design/backend-redesign/epics/21-storage-reduction/13-change-query-descriptor-identity-cutover.md`
+  - `DMS-1456` — Remove ReferentialIdentity Fixtures, Maintenance, and Infrastructure — `reference/design/backend-redesign/epics/21-storage-reduction/14-remove-referential-identity-infrastructure.md`

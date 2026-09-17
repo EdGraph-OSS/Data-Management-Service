@@ -45,8 +45,11 @@ internal class GetByIdHandler(ILogger _logger, ResiliencePipeline _resiliencePip
             requestInfo.FrontendRequest.TraceId,
             r => IsRetryableResult(r),
             r => r is GetSuccess,
-            async ct => await documentStoreRepository.GetDocumentById(CreateGetRequest(requestInfo)),
-            requestInfo
+            async ct => await documentStoreRepository.GetDocumentById(CreateGetRequest(requestInfo), ct),
+            requestInfo,
+            // A read is safe to abandon when the client disconnects: nothing is persisted,
+            // so stopping the retry loop only stops work nobody is waiting for.
+            requestInfo.RequestCancellationToken
         );
         _logger.LogDebug(
             "Document store GetDocumentById returned {GetResult}- {TraceId}",
@@ -74,7 +77,8 @@ internal class GetByIdHandler(ILogger _logger, ResiliencePipeline _resiliencePip
             GetFailureRetryable => new FrontendResponse(
                 StatusCode: 500,
                 Body: FailureResponse.ForSystemError(requestInfo.FrontendRequest.TraceId),
-                Headers: []
+                Headers: [],
+                ContentType: "application/problem+json"
             ),
             GetFailureNotAuthorized notAuthorized => new FrontendResponse(
                 StatusCode: 403,
@@ -103,10 +107,28 @@ internal class GetByIdHandler(ILogger _logger, ResiliencePipeline _resiliencePip
                 Headers: [],
                 ContentType: "application/problem+json"
             ),
-            UnknownFailure failure => new FrontendResponse(
-                StatusCode: 500,
-                Body: ToJsonError(failure.FailureMessage, requestInfo.FrontendRequest.TraceId),
-                Headers: []
+            GetFailureCustomViewNotAuthorized notAuthorized => new FrontendResponse(
+                StatusCode: 403,
+                Body: CustomViewAuthorizationFailureResponse.ForFailure(
+                    notAuthorized.CustomViewFailure,
+                    requestInfo.FrontendRequest.TraceId
+                ),
+                Headers: [],
+                ContentType: "application/problem+json"
+            ),
+            GetFailureOwnershipNotAuthorized notAuthorized => new FrontendResponse(
+                StatusCode: 403,
+                Body: OwnershipAuthorizationFailureResponse.ForFailure(
+                    notAuthorized.OwnershipFailure,
+                    requestInfo.FrontendRequest.TraceId
+                ),
+                Headers: [],
+                ContentType: "application/problem+json"
+            ),
+            UnknownFailure failure => CreateUnknownFailureResponse(
+                _logger,
+                requestInfo,
+                failure.FailureMessage
             ),
             _ => new(
                 StatusCode: 500,
@@ -225,9 +247,14 @@ internal class GetByIdHandler(ILogger _logger, ResiliencePipeline _resiliencePip
             DocumentUuid: requestInfo.PathComponents.DocumentUuid,
             ResourceInfo: requestInfo.ResourceInfo,
             MappingSet: mappingSet,
-            AuthorizationContext: RelationalAuthorizationContext.Create(requestInfo.ClientAuthorizations),
+            AuthorizationContext: RelationalAuthorizationContext.Create(
+                requestInfo.ClientAuthorizations,
+                requestInfo.ApplicationContext?.CreatorOwnershipTokenId,
+                requestInfo.ApplicationContext?.OwnershipTokenIds
+            ),
             AuthorizationStrategyEvaluators: requestInfo.AuthorizationStrategyEvaluators,
             TraceId: requestInfo.FrontendRequest.TraceId,
+            TenantKey: requestInfo.FrontendRequest.Tenant ?? string.Empty,
             ReadableProfileProjectionContext: CreateReadableProfileProjectionContext(requestInfo),
             ResponseContentCoding: GetServedEtagContentCoding(requestInfo)
         );

@@ -85,6 +85,22 @@ internal static class RelationshipAuthorizationProviderFailureMapper
             return false;
         }
 
+        // A payload belonging to another AUTH1 family shares the transport but is not ours. Yield with no
+        // diagnostic so the codec that owns the discriminator claims it. Without this, a command carrying
+        // both relationship and custom-view statements would report a custom-view 403 as a relationship
+        // invalid-payload 500, because an unparseable payload below is treated as our own malformed one.
+        // Only *known* foreign discriminators yield: text the dispatcher recognizes no family for still
+        // takes the parse-failure path, so a genuinely corrupt payload stays a loud
+        // security-configuration error.
+        if (
+            RelationalAuthorizationAuth1Dispatcher.RecognizeFamily(payloadText)
+            is not null
+                and not RelationalAuthorizationAuth1PayloadFamily.Relationship
+        )
+        {
+            return false;
+        }
+
         if (
             !RelationshipAuthorizationAuth1FailurePayloadCodec.TryParsePayload(payloadText, out var payload)
             || payload is null

@@ -285,6 +285,15 @@ public class UpsertHandlerTests
                 ],
                 DataStoreIds: []
             );
+            _requestInfo.ApplicationContext = new(
+                Id: 1,
+                ApplicationId: 2,
+                ClientId: "client",
+                ClientUuid: Guid.Parse("11111111-1111-1111-1111-111111111111"),
+                DataStoreIds: [],
+                CreatorOwnershipTokenId: 303,
+                OwnershipTokenIds: [202, 404]
+            );
 
             var (upsertHandler, serviceProvider) = Handler(_repository);
             _requestInfo.ScopedServiceProvider = serviceProvider;
@@ -309,6 +318,8 @@ public class UpsertHandlerTests
             _repository
                 .CapturedRequest.AuthorizationContext.NamespacePrefixes.Should()
                 .Equal("uri://ed-fi.org", "uri://sample.org");
+            _repository.CapturedRequest.AuthorizationContext.CreatorOwnershipTokenId.Should().Be(303);
+            _repository.CapturedRequest.AuthorizationContext.OwnershipTokenIds.Should().Equal(202, 404);
         }
     }
 
@@ -719,6 +730,16 @@ public class UpsertHandlerTests
             requestInfo.FrontendResponse.Headers.Should().BeEmpty();
             requestInfo.FrontendResponse.LocationHeaderPath.Should().BeNull();
         }
+
+        /// <summary>
+        /// The body is problem details, so the content type has to say so; serving it as plain
+        /// application/json leaves a client content-negotiating on the wrong media type.
+        /// </summary>
+        [Test]
+        public void It_serves_the_problem_details_content_type()
+        {
+            requestInfo.FrontendResponse.ContentType.Should().Be("application/problem+json");
+        }
     }
 
     [TestFixture]
@@ -779,6 +800,69 @@ public class UpsertHandlerTests
         [Test]
         public void It_returns_insert_success()
         {
+            _requestInfo.FrontendResponse.StatusCode.Should().Be(201);
+        }
+    }
+
+    [TestFixture]
+    [Parallelizable]
+    public class Given_A_Repository_With_An_Already_Cancelled_Request_Token : UpsertHandlerTests
+    {
+        internal class Repository : NotImplementedDocumentStoreRepository
+        {
+            public bool WasCalled { get; private set; }
+
+            public override Task<UpsertResult> UpsertDocument(IUpsertRequest upsertRequest)
+            {
+                WasCalled = true;
+                return Task.FromResult<UpsertResult>(
+                    new InsertSuccess(upsertRequest.DocumentUuid, "\"test-etag\"")
+                );
+            }
+        }
+
+        private readonly RequestInfo _requestInfo = RequestInfoWithRelationalMappingSet();
+        private readonly Repository _repository = new();
+
+        [SetUp]
+        public async Task Setup()
+        {
+            using var cancellationTokenSource = new CancellationTokenSource();
+            await cancellationTokenSource.CancelAsync();
+            _requestInfo.RequestCancellationToken = cancellationTokenSource.Token;
+
+            // A resilience pipeline that actually performs retry work (rather than
+            // ResiliencePipeline.Empty) is required here: Polly only honors a resilience
+            // context's cancellation token when a real strategy is present, so this is what
+            // makes the test capable of catching a regression back to seeding the context from
+            // requestInfo.RequestCancellationToken.
+            var resiliencePipeline = new ResiliencePipelineBuilder()
+                .AddRetry(
+                    new RetryStrategyOptions
+                    {
+                        MaxRetryAttempts = 1,
+                        Delay = TimeSpan.Zero,
+                        ShouldHandle = new PredicateBuilder().HandleResult(Utility.IsRetryableResult),
+                    }
+                )
+                .Build();
+            var (upsertHandler, serviceProvider) = Handler(_repository, resiliencePipeline);
+            _requestInfo.ScopedServiceProvider = serviceProvider;
+
+            await upsertHandler.Execute(_requestInfo, NullNext);
+        }
+
+        /// <summary>
+        /// A client disconnect must not abandon a non-idempotent write that would otherwise have
+        /// been retried and applied, so the write's resilience context is seeded with
+        /// CancellationToken.None rather than the request's own cancellation token. Proven here by
+        /// an already-cancelled request token: if the resilience context were seeded from it
+        /// instead, Polly would throw OperationCanceledException before the operation ever ran.
+        /// </summary>
+        [Test]
+        public void It_still_runs_the_write_operation_to_completion()
+        {
+            _repository.WasCalled.Should().BeTrue();
             _requestInfo.FrontendResponse.StatusCode.Should().Be(201);
         }
     }
@@ -987,6 +1071,131 @@ public class UpsertHandlerTests
             Repository
                 .Response.RelationshipFailure.ValueSource.Should()
                 .Be(RelationshipAuthorizationFailureValueSource.Proposed);
+        }
+    }
+
+    [TestFixture]
+    [Parallelizable]
+    public class Given_A_Repository_That_Returns_Custom_View_Not_Authorized : UpsertHandlerTests
+    {
+        internal static readonly CustomViewAuthorizationFailure CustomViewFailure = new(
+            CustomViewAuthorizationFailureKind.ProposedValueMissing,
+            CustomViewAuthorizationFailureValueSource.Proposed,
+            EmittedAuth1Index: 0,
+            StrategyName: "StudentWithCTECourseEnrollments",
+            ReadableSecurableElements: ["StudentUniqueId"],
+            Hint: "You may need a Student with CTE Course Enrollments."
+        );
+
+        internal class Repository : NotImplementedDocumentStoreRepository
+        {
+            public override Task<UpsertResult> UpsertDocument(IUpsertRequest upsertRequest)
+            {
+                return Task.FromResult<UpsertResult>(
+                    new UpsertFailureCustomViewNotAuthorized(CustomViewFailure)
+                );
+            }
+        }
+
+        private static readonly string _customViewTraceId = "custom-view-post-403";
+        private readonly RequestInfo _customViewRequestInfo = RequestInfoWithRelationalMappingSet(
+            _customViewTraceId
+        );
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var (upsertHandler, serviceProvider) = Handler(new Repository());
+            _customViewRequestInfo.ScopedServiceProvider = serviceProvider;
+
+            await upsertHandler.Execute(_customViewRequestInfo, NullNext);
+        }
+
+        [Test]
+        public void It_maps_the_custom_view_denial_to_the_canonical_problem_details_403()
+        {
+            _customViewRequestInfo.FrontendResponse.StatusCode.Should().Be(403);
+            _customViewRequestInfo.FrontendResponse.ContentType.Should().Be("application/problem+json");
+
+            var expected = CustomViewAuthorizationFailureResponse.ForFailure(
+                CustomViewFailure,
+                new TraceId(_customViewTraceId)
+            );
+
+            _customViewRequestInfo.FrontendResponse.Body.Should().NotBeNull();
+            JsonNode
+                .DeepEquals(_customViewRequestInfo.FrontendResponse.Body, expected)
+                .Should()
+                .BeTrue(
+                    $"""
+                    expected: {expected}
+
+                    actual: {_customViewRequestInfo.FrontendResponse.Body}
+                    """
+                );
+        }
+    }
+
+    /// <summary>
+    /// Only reachable for a POST that resolved to an upsert-as-update. A POST resolving to a create has no
+    /// stored ownership token to authorize against, so it is never denied by this strategy.
+    /// </summary>
+    [TestFixture]
+    [Parallelizable]
+    public class Given_A_Repository_That_Returns_Ownership_Not_Authorized : UpsertHandlerTests
+    {
+        internal static readonly OwnershipAuthorizationFailure OwnershipFailure = new(
+            OwnershipAuthorizationFailureKind.OwnershipTokenMismatch,
+            ConfiguredStrategyIndex: 0,
+            StrategyName: AuthorizationStrategyNameConstants.OwnershipBased
+        );
+
+        internal class Repository : NotImplementedDocumentStoreRepository
+        {
+            public override Task<UpsertResult> UpsertDocument(IUpsertRequest upsertRequest)
+            {
+                return Task.FromResult<UpsertResult>(
+                    new UpsertFailureOwnershipNotAuthorized(OwnershipFailure)
+                );
+            }
+        }
+
+        private static readonly string _ownershipTraceId = "ownership-post-403";
+        private readonly RequestInfo _ownershipRequestInfo = RequestInfoWithRelationalMappingSet(
+            _ownershipTraceId
+        );
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var (upsertHandler, serviceProvider) = Handler(new Repository());
+            _ownershipRequestInfo.ScopedServiceProvider = serviceProvider;
+
+            await upsertHandler.Execute(_ownershipRequestInfo, NullNext);
+        }
+
+        [Test]
+        public void It_maps_the_ownership_denial_to_the_canonical_problem_details_403()
+        {
+            _ownershipRequestInfo.FrontendResponse.StatusCode.Should().Be(403);
+            _ownershipRequestInfo.FrontendResponse.ContentType.Should().Be("application/problem+json");
+
+            var expected = OwnershipAuthorizationFailureResponse.ForFailure(
+                OwnershipFailure,
+                new TraceId(_ownershipTraceId)
+            );
+
+            _ownershipRequestInfo.FrontendResponse.Body.Should().NotBeNull();
+            JsonNode
+                .DeepEquals(_ownershipRequestInfo.FrontendResponse.Body, expected)
+                .Should()
+                .BeTrue(
+                    $"""
+                    expected: {expected}
+
+                    actual: {_ownershipRequestInfo.FrontendResponse.Body}
+                    """
+                );
         }
     }
 
@@ -1253,15 +1462,26 @@ public class UpsertHandlerTests
             await upsertHandler.Execute(requestInfo, NullNext);
         }
 
+        /// <summary>
+        /// The failure message names internal components and is written by the backend for
+        /// diagnosis, not for a client. It is logged instead, and the response carries the same
+        /// problem-details envelope every other server-side failure uses.
+        /// </summary>
         [Test]
         public void It_has_the_correct_response()
         {
             requestInfo.FrontendResponse.StatusCode.Should().Be(500);
+            requestInfo.FrontendResponse.ContentType.Should().Be("application/problem+json");
 
             var expected = $$"""
 {
-  "error": "FailureMessage",
-  "correlationId": "{{_traceId}}"
+  "detail": "An unexpected problem has occurred.",
+  "type": "urn:ed-fi:api:system",
+  "title": "System Error",
+  "status": 500,
+  "correlationId": "{{_traceId}}",
+  "validationErrors": {},
+  "errors": []
 }
 """;
 
@@ -1276,6 +1496,12 @@ expected: {expected}
 actual: {requestInfo.FrontendResponse.Body}
 """
                 );
+        }
+
+        [Test]
+        public void It_does_not_disclose_the_failure_message()
+        {
+            requestInfo.FrontendResponse.Body!.ToJsonString().Should().NotContain("FailureMessage");
         }
     }
 }

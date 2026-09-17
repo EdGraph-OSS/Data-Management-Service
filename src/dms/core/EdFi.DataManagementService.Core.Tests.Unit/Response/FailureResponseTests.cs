@@ -84,6 +84,130 @@ public class Given_FailureResponse_For_Data_Conflict
 
 [TestFixture]
 [Parallelizable]
+public class Given_FailureResponse_For_Too_Many_Requests
+{
+    private static readonly TraceId _traceId = new("rate-limit-trace");
+
+    private System.Text.Json.Nodes.JsonNode _response = default!;
+
+    [SetUp]
+    public void Setup()
+    {
+        _response = FailureResponse.ForTooManyRequests(_traceId);
+    }
+
+    [Test]
+    public void It_has_the_too_many_requests_type()
+    {
+        _response["type"]!.ToString().Should().Be("urn:ed-fi:api:too-many-requests");
+    }
+
+    [Test]
+    public void It_has_the_too_many_requests_title()
+    {
+        _response["title"]!.ToString().Should().Be("Too Many Requests");
+    }
+
+    [Test]
+    public void It_has_status_429()
+    {
+        _response["status"]!.GetValue<int>().Should().Be(429);
+    }
+
+    [Test]
+    public void It_renders_a_detail_that_does_not_depend_on_the_retry_after_header()
+    {
+        _response["detail"]!
+            .ToString()
+            .Should()
+            .Be("The number of allowed requests has been exceeded. Retry the request later.");
+    }
+
+    [Test]
+    public void It_carries_the_supplied_correlation_id()
+    {
+        _response["correlationId"]!.ToString().Should().Be(_traceId.Value);
+    }
+
+    [Test]
+    public void It_has_empty_validation_errors()
+    {
+        _response["validationErrors"]!.AsObject().Count.Should().Be(0);
+    }
+
+    [Test]
+    public void It_has_an_empty_errors_array()
+    {
+        _response["errors"]!.AsArray().Count.Should().Be(0);
+    }
+}
+
+[TestFixture]
+[Parallelizable]
+public class Given_FailureResponse_For_Service_Unavailable
+{
+    private static readonly TraceId _traceId = new("circuit-open-trace");
+
+    private System.Text.Json.Nodes.JsonNode _response = default!;
+
+    [SetUp]
+    public void Setup()
+    {
+        _response = FailureResponse.ForServiceUnavailable(_traceId);
+    }
+
+    [Test]
+    public void It_has_the_service_unavailable_type()
+    {
+        _response["type"]!.ToString().Should().Be("urn:ed-fi:api:service-unavailable");
+    }
+
+    [Test]
+    public void It_has_the_service_unavailable_title()
+    {
+        _response["title"]!.ToString().Should().Be("Service Unavailable");
+    }
+
+    [Test]
+    public void It_has_status_503()
+    {
+        _response["status"]!.GetValue<int>().Should().Be(503);
+    }
+
+    /// <summary>
+    /// The break duration travels in the Retry-After header, so the body stays constant and a
+    /// client that reads only the detail is not told a wait that the header may disagree with.
+    /// </summary>
+    [Test]
+    public void It_renders_a_detail_that_does_not_depend_on_the_break_duration()
+    {
+        _response["detail"]!
+            .ToString()
+            .Should()
+            .Be("The service is temporarily unable to handle the request. Retry the request later.");
+    }
+
+    [Test]
+    public void It_carries_the_supplied_correlation_id()
+    {
+        _response["correlationId"]!.ToString().Should().Be(_traceId.Value);
+    }
+
+    [Test]
+    public void It_has_empty_validation_errors()
+    {
+        _response["validationErrors"]!.AsObject().Count.Should().Be(0);
+    }
+
+    [Test]
+    public void It_has_an_empty_errors_array()
+    {
+        _response["errors"]!.AsArray().Count.Should().Be(0);
+    }
+}
+
+[TestFixture]
+[Parallelizable]
 public class Given_FailureResponse_For_Security_Configuration
 {
     private static readonly TraceId _traceId = new("security-trace");
@@ -164,22 +288,6 @@ public class Given_FailureResponse_For_Security_Configuration
             .Should()
             .Be(
                 "Could not find authorization strategy implementations for the following strategy names: 'StudentScope', 'CalendarScope'."
-            );
-    }
-
-    [Test]
-    public void It_formats_the_canonical_custom_view_basis_property_message()
-    {
-        string message = SecurityConfigurationFailureMessages.CustomViewBasisPropertyUnavailable(
-            "edfi.CourseTranscript",
-            "StudentUniqueId",
-            "edfi.Student"
-        );
-
-        message
-            .Should()
-            .Be(
-                "Unable to find a property on the authorization subject entity type 'edfi.CourseTranscript' corresponding to the 'StudentUniqueId' property on the custom authorization view's basis entity type 'edfi.Student' in order to perform authorization. Should a different authorization strategy be used?"
             );
     }
 }

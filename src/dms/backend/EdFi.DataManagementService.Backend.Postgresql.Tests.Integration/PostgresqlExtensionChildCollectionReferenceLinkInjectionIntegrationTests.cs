@@ -161,7 +161,7 @@ public class Given_A_Postgresql_School_With_Extension_Child_Collection_Bus_Refer
         services.Configure<DatabaseOptions>(options => options.IsolationLevel = IsolationLevel.ReadCommitted);
         services.AddTestReadableProfileProjector();
         services.AddScoped<RelationalDocumentStoreRepository>();
-        services.AddPostgresqlReferenceResolver();
+        services.AddPostgresqlBackendIntegrationTestServices();
 
         short busResourceKeyId = _mappingSet.ResourceKeyIdByResource[BusResource];
         Dictionary<short, DocumentLinkSlugTriple> slugByResourceKeyId = new()
@@ -357,13 +357,16 @@ public class Given_A_Postgresql_School_With_Extension_Child_Collection_Bus_Refer
             MappingSet: _mappingSet,
             QueryElements: [],
             AuthorizationStrategyEvaluators: [],
-            PaginationParameters: new PaginationParameters(
-                Limit: 25,
-                Offset: 0,
-                TotalCount: false,
-                MaximumPageSize: MaximumPageSize
+            Paging: new CollectionPaging.Traditional(
+                new PaginationParameters(
+                    Limit: 25,
+                    Offset: 0,
+                    TotalCount: false,
+                    MaximumPageSize: MaximumPageSize
+                )
             ),
-            TraceId: new TraceId("pg-29e-query-school")
+            TraceId: new TraceId("pg-29e-query-school"),
+            PageOrderingMode: PageOrderingMode.DocumentId
         );
 
         return await scope
@@ -516,6 +519,7 @@ public class Given_A_Postgresql_School_With_Extension_Child_Collection_Bus_Refer
             """
             INSERT INTO "dms"."Descriptor" (
                 "DocumentId",
+                "ResourceKeyId",
                 "Namespace",
                 "CodeValue",
                 "ShortDescription",
@@ -525,6 +529,7 @@ public class Given_A_Postgresql_School_With_Extension_Child_Collection_Bus_Refer
             )
             VALUES (
                 @documentId,
+                @resourceKeyId,
                 @namespace,
                 @codeValue,
                 @shortDescription,
@@ -534,6 +539,7 @@ public class Given_A_Postgresql_School_With_Extension_Child_Collection_Bus_Refer
             );
             """,
             new NpgsqlParameter("documentId", documentId),
+            new NpgsqlParameter("resourceKeyId", resourceKeyId),
             new NpgsqlParameter("namespace", @namespace),
             new NpgsqlParameter("codeValue", codeValue),
             new NpgsqlParameter("shortDescription", shortDescription),

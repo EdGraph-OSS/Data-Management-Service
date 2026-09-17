@@ -60,6 +60,10 @@ public class Given_A_Host_Using_The_Relational_Backend
             "educationOrganizationHierarchy": {},
             "educationOrganizationTypes": [],
             "domains": [],
+            "openApiBaseDocuments": {
+              "resources": { "paths": {}, "components": { "schemas": {}, "parameters": { "limit": { "name": "limit", "in": "query", "schema": {} }, "pageToken": { "name": "pageToken", "in": "query", "schema": {} }, "pageSize": { "name": "pageSize", "in": "query", "schema": {} }, "numberOfPartitions": { "name": "number", "in": "query", "schema": {} } } } },
+              "descriptors": { "paths": {}, "components": { "schemas": {}, "parameters": { "limit": { "name": "limit", "in": "query", "schema": {} }, "pageToken": { "name": "pageToken", "in": "query", "schema": {} }, "pageSize": { "name": "pageSize", "in": "query", "schema": {} }, "numberOfPartitions": { "name": "number", "in": "query", "schema": {} } } } }
+            },
             "resourceSchemas": {
               "widgets": {
                 "resourceName": "Widget",
@@ -335,10 +339,12 @@ public class Given_A_Host_Using_The_Relational_Backend
         var body = JsonNode.Parse(responseBody)!.AsObject();
 
         response.StatusCode.Should().Be(HttpStatusCode.InternalServerError, responseBody);
-        body["error"]!
-            .GetValue<string>()
-            .Should()
-            .Contain("Write plan lookup failed for resource 'TestProject.Widget'");
+
+        // The diagnostic text names internal components, so it is logged rather than served; the
+        // client sees the standard system-error problem details.
+        body["type"]!.GetValue<string>().Should().Be("urn:ed-fi:api:system");
+        body["status"]!.GetValue<int>().Should().Be(500);
+        responseBody.Should().NotContain("Write plan lookup failed");
         writeExecutor.Requests.Should().BeEmpty();
         flattener.Inputs.Should().BeEmpty();
     }
@@ -407,10 +413,25 @@ public class Given_A_Host_Using_The_Relational_Backend
                     );
 
                 var applicationContextProvider = A.Fake<IApplicationContextProvider>();
-                A.CallTo(() => applicationContextProvider.GetApplicationByClientIdAsync(A<string>._))
-                    .Returns(Task.FromResult<ApplicationContext?>(null));
-                A.CallTo(() => applicationContextProvider.ReloadApplicationByClientIdAsync(A<string>._))
-                    .Returns(Task.FromResult<ApplicationContext?>(null));
+                var applicationContextResult = new ApplicationContextResult.Success(
+                    new ApplicationContext(
+                        Id: 1,
+                        ApplicationId: 1,
+                        ClientId: "smoke-client",
+                        ClientUuid: Guid.Parse("11111111-1111-1111-1111-111111111111"),
+                        DataStoreIds: [1],
+                        CreatorOwnershipTokenId: null,
+                        OwnershipTokenIds: []
+                    )
+                );
+                A.CallTo(() =>
+                        applicationContextProvider.GetApplicationByClientIdAsync(A<string>._, tenant: null)
+                    )
+                    .Returns(applicationContextResult);
+                A.CallTo(() =>
+                        applicationContextProvider.ReloadApplicationByClientIdAsync(A<string>._, tenant: null)
+                    )
+                    .Returns(applicationContextResult);
 
                 var resourceKeyValidator = A.Fake<IResourceKeyValidator>();
                 A.CallTo(() =>
@@ -419,7 +440,7 @@ public class Given_A_Host_Using_The_Relational_Backend
                             A<short>._,
                             A<ImmutableArray<byte>>._,
                             A<IReadOnlyList<ResourceKeyRow>>._,
-                            A<string>._,
+                            A<EffectiveDataStoreTarget>._,
                             A<CancellationToken>._
                         )
                     )
@@ -479,7 +500,7 @@ public class Given_A_Host_Using_The_Relational_Backend
         IEffectiveSchemaSetProvider effectiveSchemaSetProvider
     ) : IDatabaseFingerprintReader
     {
-        public Task<DatabaseFingerprint?> ReadFingerprintAsync(string connectionString)
+        public Task<DatabaseFingerprint?> ReadFingerprintAsync(EffectiveDataStoreTarget target)
         {
             var effectiveSchema = effectiveSchemaSetProvider.EffectiveSchemaSet.EffectiveSchema;
 
@@ -539,24 +560,36 @@ public class Given_A_Host_Using_The_Relational_Backend
         private readonly ResolvedReferenceSet _resolvedReferences =
             resolvedReferences ?? throw new ArgumentNullException(nameof(resolvedReferences));
 
-        public List<RelationalWriteExecutorRequest> Requests { get; } = [];
+        public List<RelationalWriteExecutorInput> Requests { get; } = [];
 
         public Task<RelationalWriteExecutorResult> ExecuteAsync(
-            RelationalWriteExecutorRequest request,
+            RelationalWriteExecutorInput input,
             CancellationToken cancellationToken = default
         )
         {
-            Requests.Add(request);
-            var targetContext = request.TargetContext;
+            Requests.Add(input);
+
+            // The real executor resolves its own target inside the write session it opens; this fake
+            // stands in for that resolution with the same fixed outcomes the host smoke test expects.
+            RelationalWriteTargetContext targetContext = input.TargetRequest switch
+            {
+                RelationalWriteTargetRequest.Post(_, var candidateDocumentUuid) =>
+                    new RelationalWriteTargetContext.CreateNew(candidateDocumentUuid),
+                RelationalWriteTargetRequest.Put(var documentUuid) =>
+                    new RelationalWriteTargetContext.ExistingDocument(345L, documentUuid, 44L),
+                _ => throw new InvalidOperationException(
+                    $"Unsupported target request type '{input.TargetRequest.GetType().Name}'."
+                ),
+            };
 
             try
             {
                 _ = _flattener.Flatten(
                     new FlatteningInput(
-                        request.OperationKind,
+                        input.OperationKind,
                         targetContext,
-                        request.WritePlan,
-                        request.SelectedBody,
+                        input.WritePlan,
+                        input.SelectedBody,
                         _resolvedReferences
                     )
                 );

@@ -52,16 +52,22 @@ internal class UpdateByIdHandler(ILogger _logger, ResiliencePipeline _resilience
                         EdfiDoc: requestInfo.ParsedBody,
                         Headers: requestInfo.FrontendRequest.Headers,
                         TraceId: requestInfo.FrontendRequest.TraceId,
+                        TenantKey: requestInfo.FrontendRequest.Tenant ?? string.Empty,
                         BackendProfileWriteContext: requestInfo.BackendProfileWriteContext
                     )
                     {
                         AuthorizationStrategyEvaluators = requestInfo.AuthorizationStrategyEvaluators,
                         AuthorizationContext = RelationalAuthorizationContext.Create(
-                            requestInfo.ClientAuthorizations
+                            requestInfo.ClientAuthorizations,
+                            requestInfo.ApplicationContext?.CreatorOwnershipTokenId,
+                            requestInfo.ApplicationContext?.OwnershipTokenIds
                         ),
                     }
                 ),
-            requestInfo
+            requestInfo,
+            // A client disconnect must not abandon a non-idempotent write that would otherwise
+            // have been retried and applied, so the resilience context stays uncancellable here.
+            CancellationToken.None
         );
         _logger.LogDebug(
             "Document store UpdateDocumentById returned {UpdateResult}- {TraceId}",
@@ -135,7 +141,8 @@ internal class UpdateByIdHandler(ILogger _logger, ResiliencePipeline _resilience
             UpdateFailureWriteConflict => new FrontendResponse(
                 StatusCode: 500,
                 Body: FailureResponse.ForSystemError(requestInfo.FrontendRequest.TraceId),
-                Headers: []
+                Headers: [],
+                ContentType: "application/problem+json"
             ),
             UpdateFailureImmutableIdentity failure => new FrontendResponse(
                 StatusCode: 400,
@@ -172,6 +179,24 @@ internal class UpdateByIdHandler(ILogger _logger, ResiliencePipeline _resilience
                 Headers: [],
                 ContentType: "application/problem+json"
             ),
+            UpdateFailureCustomViewNotAuthorized notAuthorized => new FrontendResponse(
+                StatusCode: 403,
+                Body: CustomViewAuthorizationFailureResponse.ForFailure(
+                    notAuthorized.CustomViewFailure,
+                    requestInfo.FrontendRequest.TraceId
+                ),
+                Headers: [],
+                ContentType: "application/problem+json"
+            ),
+            UpdateFailureOwnershipNotAuthorized notAuthorized => new FrontendResponse(
+                StatusCode: 403,
+                Body: OwnershipAuthorizationFailureResponse.ForFailure(
+                    notAuthorized.OwnershipFailure,
+                    requestInfo.FrontendRequest.TraceId
+                ),
+                Headers: [],
+                ContentType: "application/problem+json"
+            ),
             UpdateFailureNotImplemented failure => new FrontendResponse(
                 StatusCode: 501,
                 Body: ToJsonError(failure.FailureMessage, requestInfo.FrontendRequest.TraceId),
@@ -195,10 +220,10 @@ internal class UpdateByIdHandler(ILogger _logger, ResiliencePipeline _resilience
                 ),
                 Headers: []
             ),
-            UnknownFailure failure => new FrontendResponse(
-                StatusCode: 500,
-                Body: ToJsonError(failure.FailureMessage, requestInfo.FrontendRequest.TraceId),
-                Headers: []
+            UnknownFailure failure => CreateUnknownFailureResponse(
+                _logger,
+                requestInfo,
+                failure.FailureMessage
             ),
             _ => new FrontendResponse(
                 StatusCode: 500,

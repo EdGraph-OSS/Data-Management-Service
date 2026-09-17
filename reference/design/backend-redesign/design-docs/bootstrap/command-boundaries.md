@@ -108,7 +108,7 @@ bootstrap manifest records stable prepared inputs and fingerprints only:
   "schema": {
     "selectionMode": "Standard",
     "selectedExtensions": [],
-    "selectedPackages": ["EdFi.DataStandard52.ApiSchema@1.0.333"],
+    "selectedPackages": ["EdFi.DataStandard52.ApiSchema@1.0.335"],
     "effectiveSchemaHash": "...",
     "workspaceFingerprint": "...",
     "apiSchemaManifestPath": "ApiSchema/bootstrap-api-schema-manifest.json"
@@ -152,6 +152,18 @@ state. DMS compose services do not consume claimset fragment files, so `local-dm
 | **Side effects** | Docker Compose up/down; runs provider-specific local identity setup, including the fixed `CMSReadOnlyAccess` read-only client; activates manifest-selected staged claims and staged schema at startup when a valid bootstrap manifest is present (Story 04, delivered); calls `setup-openiddict.ps1 -InitDb` after PostgreSQL health; calls `setup-openiddict.ps1 -InsertData` after Config Service readiness (self-contained path); in bootstrap mode, skips default Debezium connector registration because the bootstrap relational schema does not include the legacy CDC tables the default connector targets; `-DbOnly` performs only `docker compose up db` and the matching readiness wait, with no identity, Config Service, Keycloak, or DMS side effects |
 | **Failure conditions** | Docker compose start failure; health-wait timeout for any service; malformed or incomplete bootstrap manifest when present |
 | **Must NOT do** | Resolve or validate ApiSchema files; inspect or write the staged-schema or staged-claims workspace; provision databases; enable the legacy `NEED_DATABASE_SETUP` / `EdFi.DataManagementService.Backend.Installer.dll` startup provisioning path; accept schema or claims parameters; configure data stores; create smoke-test or seed-loading CMS application credentials; load seed data. `-DbOnly` must not start Keycloak, run identity setup, start the Config Service, run the claims-ready gate, or start Kafka - it starts and waits on the database container only. **Note:** `start-published-dms.ps1` retains `-NoDataStore`, `-SchoolYearRange`, and `-AddSmokeTestCredentials` as transitional flags for the published-image workflow; the local `start-local-dms.ps1` is infrastructure-lifecycle-only as of DMS-1153. `start-published-dms.ps1` no longer accepts a `-LoadSeedData` switch of its own (removed; seed delivery on the published flow uses the same wrapper-level, API-based `-LoadSeedData` opt-in as the local flow); it also accepts `-DatabaseEngine`, mirroring the local flow's engine selection. |
+
+The future `-EnableKafkaCdc` workflow may accept `-CdcBindingStatePath`, defaulting to the
+separate persistent `.cdc-state` root defined by the CDC design. It must not add mutable
+projection lifecycle, projection work, binding, connector, topic, or readiness state to
+`.bootstrap/bootstrap-manifest.json`. E19-S04 owns that opt-in orchestration, not the
+ordinary infrastructure-start command. While canonical write admission remains closed it
+must reject any nonempty canonical/cache/work target, atomically create or exact-match the
+immutable binding, then invoke the guarded new-empty `Disabled -> Tracking` transition
+before seed/API writes. It configures the matching DMS projection target, starts queue
+processing, waits for work drain, crosses the provider heartbeat barrier, and rechecks
+caught-up status. Binding/lifecycle crash-state classification and retry remain owned by
+E19-S04 and the CDC design. Starting DMS is not authority to enable tracking.
 
 **Boundary note:** Story 00 makes staged schema/security the prepared bootstrap contract. Story 04 (DMS-1154,
 delivered) makes it the Docker runtime source of truth by activating staged schema and staged claims together
@@ -217,10 +229,19 @@ re-runnable without hidden disk artifacts.
 | **Failure conditions** | Zero matching instances found; multiple matching instances found without an explicit `-DataStoreId` or `-SchoolYear` selector; SchemaTools/runtime provisioning exits non-zero, including when target stored schema state is incompatible with the staged schema set; connection to target database fails; CMS data store connection string matches neither engine's dialect markers; a target's resolved dialect contradicts the effective environment's `DMS_DATASTORE` |
 | **Must NOT do** | Accept user-facing schema-selection parameters; repair or work around a failed SchemaTools path; run inside DMS startup via `AppSettings__DeployDatabaseOnStartup`, `NEED_DATABASE_SETUP`, `EdFi.DataManagementService.Backend.Installer.dll`, or any container entrypoint/pre-launch hook; silently reuse a database provisioned for a different schema selection; resolve schema files; create or mutate instance records in CMS |
 
-**Boundary note:** `AppSettings__DeployDatabaseOnStartup=false` is always set, and the legacy
-`NEED_DATABASE_SETUP` / `EdFi.DataManagementService.Backend.Installer.dll` startup path is disabled or
-removed for the DMS-916 bootstrap flow. Schema provisioning is entirely owned by this phase; DMS startup
-never performs it. Selector resolution rule: when exactly one DMS instance exists in CMS and no selector is
+**Boundary note:** The legacy `NEED_DATABASE_SETUP` /
+`EdFi.DataManagementService.Backend.Installer.dll` startup path is disabled or removed for the
+DMS-916 bootstrap flow, and DMS no longer exposes a `DeployDatabaseOnStartup` setting at all
+(removed by DMS-1239). Schema provisioning is entirely owned by this phase; DMS startup
+never performs it. (Ownership here means the DMS relational datastore DDL. It does not extend to the
+pre-existing OpenIddict identity bootstrap: in the self-contained flow, `setup-openiddict.ps1 -InitDb`
+runs during the start phase and creates, when absent, exactly the Configuration Service's database (the
+shared DMS datastore database by default, or the dedicated `edfi_configurationservice` database when the
+stack was started with `-SeparateConfigDatabase`, DMS-1270), the `dmscs` schema, and the `OpenIddictKey`
+table with its signing-key material (plus, on PostgreSQL, the `pgcrypto` extension that key encryption
+requires). CMS's own startup deploy owns every other `dmscs` object. That identity bootstrap predates this phase contract and is a start-phase concern; this
+phase neither performs nor validates it.) Selector resolution rule: when
+exactly one DMS instance exists in CMS and no selector is
 supplied, auto-select it; when multiple instances exist and no explicit `-DataStoreId` or `-SchoolYear` is
 provided, fail fast with guidance to supply an explicit selector. CMS lookup and database target resolution
 use the shared `-EnvironmentFile` local-settings resolver, so direct phase invocation and wrapper

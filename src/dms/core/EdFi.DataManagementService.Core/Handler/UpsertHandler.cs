@@ -55,18 +55,24 @@ internal class UpsertHandler(ILogger _logger, ResiliencePipeline _resiliencePipe
                         EdfiDoc: requestInfo.ParsedBody,
                         Headers: requestInfo.FrontendRequest.Headers,
                         TraceId: requestInfo.FrontendRequest.TraceId,
+                        TenantKey: requestInfo.FrontendRequest.Tenant ?? string.Empty,
                         DocumentUuid: candidateDocumentUuid,
                         BackendProfileWriteContext: requestInfo.BackendProfileWriteContext
                     )
                     {
                         AuthorizationStrategyEvaluators = requestInfo.AuthorizationStrategyEvaluators,
                         AuthorizationContext = RelationalAuthorizationContext.Create(
-                            requestInfo.ClientAuthorizations
+                            requestInfo.ClientAuthorizations,
+                            requestInfo.ApplicationContext?.CreatorOwnershipTokenId,
+                            requestInfo.ApplicationContext?.OwnershipTokenIds
                         ),
                     }
                 );
             },
-            requestInfo
+            requestInfo,
+            // A client disconnect must not abandon a non-idempotent write that would otherwise
+            // have been retried and applied, so the resilience context stays uncancellable here.
+            CancellationToken.None
         );
         _logger.LogDebug(
             "Document store UpsertDocument returned {UpsertResult}- {TraceId}",
@@ -135,7 +141,8 @@ internal class UpsertHandler(ILogger _logger, ResiliencePipeline _resiliencePipe
             UpsertFailureWriteConflict => new(
                 StatusCode: 500,
                 Body: ForSystemError(requestInfo.FrontendRequest.TraceId),
-                Headers: []
+                Headers: [],
+                ContentType: "application/problem+json"
             ),
             UpsertFailureETagMisMatch mismatch => new(
                 StatusCode: 412,
@@ -169,6 +176,24 @@ internal class UpsertHandler(ILogger _logger, ResiliencePipeline _resiliencePipe
                 Headers: [],
                 ContentType: "application/problem+json"
             ),
+            UpsertFailureCustomViewNotAuthorized notAuthorized => new(
+                StatusCode: 403,
+                Body: CustomViewAuthorizationFailureResponse.ForFailure(
+                    notAuthorized.CustomViewFailure,
+                    requestInfo.FrontendRequest.TraceId
+                ),
+                Headers: [],
+                ContentType: "application/problem+json"
+            ),
+            UpsertFailureOwnershipNotAuthorized notAuthorized => new(
+                StatusCode: 403,
+                Body: OwnershipAuthorizationFailureResponse.ForFailure(
+                    notAuthorized.OwnershipFailure,
+                    requestInfo.FrontendRequest.TraceId
+                ),
+                Headers: [],
+                ContentType: "application/problem+json"
+            ),
             UpsertFailureNotImplemented failure => new(
                 StatusCode: 501,
                 Body: ToJsonError(failure.FailureMessage, requestInfo.FrontendRequest.TraceId),
@@ -197,10 +222,10 @@ internal class UpsertHandler(ILogger _logger, ResiliencePipeline _resiliencePipe
                 Body: ForDataPolicyEnforced(failure.ProfileName, requestInfo.FrontendRequest.TraceId),
                 Headers: []
             ),
-            UnknownFailure failure => new(
-                StatusCode: 500,
-                Body: ToJsonError(failure.FailureMessage, requestInfo.FrontendRequest.TraceId),
-                Headers: []
+            UnknownFailure failure => CreateUnknownFailureResponse(
+                _logger,
+                requestInfo,
+                failure.FailureMessage
             ),
             _ => new(
                 StatusCode: 500,

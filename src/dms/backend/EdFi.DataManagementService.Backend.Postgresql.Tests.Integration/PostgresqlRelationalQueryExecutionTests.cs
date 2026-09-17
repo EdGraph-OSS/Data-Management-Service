@@ -296,6 +296,10 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
     [Test]
     public async Task It_pages_in_document_id_order_and_only_materializes_the_requested_page()
     {
+        // Re-read state so document assertions reflect current field values regardless of
+        // which tests (including ordering tests that update a school) ran first.
+        var currentSchools = await ReadPersistedSchoolsInDocumentOrderAsync();
+
         var firstPageResult = await ExecuteQueryAsync(
             [],
             limit: 2,
@@ -310,17 +314,11 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
         firstPageSuccess
             .EdfiDocs.Select(document => document!["id"]!.GetValue<string>())
             .Should()
-            .Equal(
-                _persistedSchoolsInDocumentOrder[0].DocumentUuid.ToString(),
-                _persistedSchoolsInDocumentOrder[1].DocumentUuid.ToString()
-            );
-        AssertSchoolQueryDocument(firstPageSuccess.EdfiDocs[0], _persistedSchoolsInDocumentOrder[0]);
-        AssertSchoolQueryDocument(firstPageSuccess.EdfiDocs[1], _persistedSchoolsInDocumentOrder[1]);
+            .Equal(currentSchools[0].DocumentUuid.ToString(), currentSchools[1].DocumentUuid.ToString());
+        AssertSchoolQueryDocument(firstPageSuccess.EdfiDocs[0], currentSchools[0]);
+        AssertSchoolQueryDocument(firstPageSuccess.EdfiDocs[1], currentSchools[1]);
         AssertSingleQueryHydration().Plan.TotalCountSql.Should().NotBeNull();
-        AssertPageMaterialization(
-            _persistedSchoolsInDocumentOrder[0].DocumentId,
-            _persistedSchoolsInDocumentOrder[1].DocumentId
-        );
+        AssertPageMaterialization(currentSchools[0].DocumentId, currentSchools[1].DocumentId);
 
         _recorder.Reset();
 
@@ -338,10 +336,10 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
         secondPageSuccess
             .EdfiDocs.Select(document => document!["id"]!.GetValue<string>())
             .Should()
-            .Equal(_persistedSchoolsInDocumentOrder[2].DocumentUuid.ToString());
-        AssertSchoolQueryDocument(secondPageSuccess.EdfiDocs[0], _persistedSchoolsInDocumentOrder[2]);
+            .Equal(currentSchools[2].DocumentUuid.ToString());
+        AssertSchoolQueryDocument(secondPageSuccess.EdfiDocs[0], currentSchools[2]);
         AssertSingleQueryHydration().Plan.TotalCountSql.Should().NotBeNull();
-        AssertPageMaterialization(_persistedSchoolsInDocumentOrder[2].DocumentId);
+        AssertPageMaterialization(currentSchools[2].DocumentId);
     }
 
     [Test]
@@ -374,9 +372,10 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
     [Test]
     public async Task It_returns_only_resources_inside_the_change_version_window()
     {
-        // The stamping triggers assign strictly increasing ContentVersion values in insert order,
-        // so a window spanning only the middle school's stamp excludes the first and last.
-        var middleSchool = _persistedSchoolsInDocumentOrder[1];
+        // Re-read state so the window anchors on current ContentVersions regardless of
+        // which tests (including ordering tests that update a school) ran first.
+        var currentSchools = await ReadPersistedSchoolsInDocumentOrderAsync();
+        var middleByContentVersion = currentSchools.OrderBy(s => s.ContentVersion).ElementAt(1);
 
         var result = await ExecuteQueryAsync(
             [],
@@ -385,8 +384,8 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
             totalCount: true,
             traceId: "pg-query-change-version-window",
             changeVersionRange: new ChangeVersionRange(
-                middleSchool.ContentVersion,
-                middleSchool.ContentVersion
+                middleByContentVersion.ContentVersion,
+                middleByContentVersion.ContentVersion
             )
         );
 
@@ -394,14 +393,18 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
 
         success.TotalCount.Should().Be(1);
         success.EdfiDocs.Should().HaveCount(1);
-        success.EdfiDocs[0]!["id"]!.GetValue<string>().Should().Be(middleSchool.DocumentUuid.ToString());
-        AssertPageMaterialization(middleSchool.DocumentId);
+        success.EdfiDocs[0]!["id"]!
+            .GetValue<string>()
+            .Should()
+            .Be(middleByContentVersion.DocumentUuid.ToString());
+        AssertPageMaterialization(middleByContentVersion.DocumentId);
     }
 
     [Test]
     public async Task It_returns_resources_at_or_above_min_change_version_and_excludes_older_resources()
     {
-        var lastSchool = _persistedSchoolsInDocumentOrder[^1];
+        var currentSchools = await ReadPersistedSchoolsInDocumentOrderAsync();
+        var middleSchool = currentSchools.OrderBy(s => s.ContentVersion).ElementAt(1);
 
         var result = await ExecuteQueryAsync(
             [],
@@ -409,20 +412,27 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
             offset: 0,
             totalCount: true,
             traceId: "pg-query-change-version-min-only",
-            changeVersionRange: new ChangeVersionRange(lastSchool.ContentVersion, null)
+            changeVersionRange: new ChangeVersionRange(middleSchool.ContentVersion, null)
         );
 
         var success = result.Should().BeOfType<QueryResult.QuerySuccess>().Subject;
 
-        success.TotalCount.Should().Be(1);
-        success.EdfiDocs.Should().HaveCount(1);
-        success.EdfiDocs[0]!["id"]!.GetValue<string>().Should().Be(lastSchool.DocumentUuid.ToString());
+        success.TotalCount.Should().Be(2);
+        success.EdfiDocs.Should().HaveCount(2);
+        success
+            .EdfiDocs.Select(document => document!["id"]!.GetValue<string>())
+            .Should()
+            .BeEquivalentTo(
+                middleSchool.DocumentUuid.ToString(),
+                currentSchools.OrderBy(s => s.ContentVersion).Last().DocumentUuid.ToString()
+            );
     }
 
     [Test]
     public async Task It_returns_an_empty_page_when_the_change_version_window_excludes_all_resources()
     {
-        var lastSchool = _persistedSchoolsInDocumentOrder[^1];
+        var currentSchools = await ReadPersistedSchoolsInDocumentOrderAsync();
+        var maxContentVersion = currentSchools.Max(s => s.ContentVersion);
 
         var result = await ExecuteQueryAsync(
             [],
@@ -430,7 +440,7 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
             offset: 0,
             totalCount: true,
             traceId: "pg-query-change-version-exclusion",
-            changeVersionRange: new ChangeVersionRange(lastSchool.ContentVersion + 1, null)
+            changeVersionRange: new ChangeVersionRange(maxContentVersion + 1, null)
         );
 
         var success = result.Should().BeOfType<QueryResult.QuerySuccess>().Subject;
@@ -442,16 +452,17 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
     [Test]
     public async Task It_composes_the_change_version_window_with_a_query_filter()
     {
-        // The window covers every seeded school; the scalar filter then narrows to one. A second
-        // query keeps the filter but shrinks the window below the match, proving both predicates apply.
-        var middleSchool = _persistedSchoolsInDocumentOrder[1];
+        // The window starts at a real row's version, and the scalar filter selects that same row.
+        // A second query keeps the filter but shrinks the window below the match, proving both
+        // predicates apply and that the lower bound is inclusive.
+        var firstSchool = _persistedSchoolsInDocumentOrder[0];
         var allVersionsWindow = new ChangeVersionRange(
-            _persistedSchoolsInDocumentOrder[0].ContentVersion,
+            firstSchool.ContentVersion,
             _persistedSchoolsInDocumentOrder[^1].ContentVersion
         );
 
         var matchingResult = await ExecuteQueryAsync(
-            [CreateQueryElement("nameOfInstitution", "$.nameOfInstitution", middleSchool.NameOfInstitution)],
+            [CreateQueryElement("nameOfInstitution", "$.nameOfInstitution", firstSchool.NameOfInstitution)],
             limit: 25,
             offset: 0,
             totalCount: true,
@@ -465,22 +476,593 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
         matchingSuccess.EdfiDocs[0]!["id"]!
             .GetValue<string>()
             .Should()
-            .Be(middleSchool.DocumentUuid.ToString());
+            .Be(firstSchool.DocumentUuid.ToString());
 
         _recorder.Reset();
 
         var excludedResult = await ExecuteQueryAsync(
-            [CreateQueryElement("nameOfInstitution", "$.nameOfInstitution", middleSchool.NameOfInstitution)],
+            [CreateQueryElement("nameOfInstitution", "$.nameOfInstitution", firstSchool.NameOfInstitution)],
             limit: 25,
             offset: 0,
             totalCount: true,
             traceId: "pg-query-change-version-composed-excluded",
-            changeVersionRange: new ChangeVersionRange(null, middleSchool.ContentVersion - 1)
+            changeVersionRange: new ChangeVersionRange(null, firstSchool.ContentVersion - 1)
         );
 
         var excludedSuccess = excludedResult.Should().BeOfType<QueryResult.QuerySuccess>().Subject;
         excludedSuccess.TotalCount.Should().Be(0);
         excludedSuccess.EdfiDocs.Should().BeEmpty();
+    }
+
+    /// <summary>
+    /// Re-upserts the first seeded school with a changed name so its ContentVersion becomes the
+    /// largest, making ContentVersion order diverge from DocumentId order, then returns fresh state.
+    /// </summary>
+    private async Task<IReadOnlyList<PersistedQuerySchool>> UpdateFirstSchoolAndReadStateAsync()
+    {
+        var seed = _schoolSeeds[0];
+        var updateResult = await ExecuteCreateAsync(
+            seed with
+            {
+                NameOfInstitution = $"{seed.NameOfInstitution} (updated)",
+            }
+        );
+        updateResult.Should().BeOfType<UpsertResult.UpdateSuccess>();
+
+        var refreshedSchools = await ReadPersistedSchoolsInDocumentOrderAsync();
+        refreshedSchools.Should().HaveCount(3);
+        refreshedSchools[0]
+            .ContentVersion.Should()
+            .BeGreaterThan(
+                refreshedSchools[^1].ContentVersion,
+                "the update must move the first school's ContentVersion past every other school's"
+            );
+
+        return refreshedSchools;
+    }
+
+    /// <summary>
+    /// Walks a windowed collection one document per page.
+    /// </summary>
+    /// <remarks>
+    /// The anchor is a required argument rather than derived from
+    /// <paramref name="changeVersionRange" />, because deriving it here would reimplement the Core
+    /// resolver these tests exist to check the consequences of. DocumentId is the enum's zero value, so
+    /// a defaulted anchor would also let a case that means to prove ContentVersion ordering pass
+    /// against DocumentId ordering it never asked for.
+    /// </remarks>
+    private async Task<IReadOnlyList<Guid>> WalkPagesAsync(
+        ChangeVersionRange changeVersionRange,
+        PageOrderingMode pageOrderingMode,
+        int pageCount,
+        string traceIdPrefix
+    )
+    {
+        var walkedDocumentUuids = new List<Guid>();
+
+        for (var offset = 0; offset < pageCount; offset++)
+        {
+            var result = await ExecuteQueryAsync(
+                [],
+                limit: 1,
+                offset: offset,
+                totalCount: offset == 0,
+                traceId: $"{traceIdPrefix}-{offset}",
+                changeVersionRange: changeVersionRange,
+                pageOrderingMode: pageOrderingMode
+            );
+
+            var success = result.Should().BeOfType<QueryResult.QuerySuccess>().Subject;
+
+            if (offset == 0)
+            {
+                success.TotalCount.Should().Be(pageCount);
+            }
+
+            success.EdfiDocs.Should().HaveCount(1);
+            walkedDocumentUuids.Add(Guid.Parse(success.EdfiDocs[0]!["id"]!.GetValue<string>()));
+        }
+
+        return walkedDocumentUuids;
+    }
+
+    [Test]
+    public async Task It_pages_a_bounded_change_version_window_by_content_version()
+    {
+        var refreshedSchools = await UpdateFirstSchoolAndReadStateAsync();
+        var byContentVersion = refreshedSchools.OrderBy(s => s.ContentVersion).ToArray();
+        var byDocumentId = refreshedSchools.Select(s => s.DocumentUuid).ToArray();
+        var expectedProgression = byContentVersion.Select(s => s.DocumentUuid).ToArray();
+        expectedProgression.Should().NotEqual(byDocumentId, "the scenario must discriminate the orders");
+
+        var walkedDocumentUuids = await WalkPagesAsync(
+            new ChangeVersionRange(byContentVersion[0].ContentVersion, byContentVersion[^1].ContentVersion),
+            PageOrderingMode.ContentVersion,
+            pageCount: refreshedSchools.Count,
+            traceIdPrefix: "pg-cv-ordering-bounded"
+        );
+
+        walkedDocumentUuids.Should().Equal(expectedProgression);
+        walkedDocumentUuids.Should().OnlyHaveUniqueItems();
+    }
+
+    [Test]
+    public async Task It_pages_a_max_only_change_version_window_by_content_version()
+    {
+        var refreshedSchools = await UpdateFirstSchoolAndReadStateAsync();
+        var byContentVersion = refreshedSchools.OrderBy(s => s.ContentVersion).ToArray();
+        var expectedProgression = byContentVersion.Select(s => s.DocumentUuid).ToArray();
+
+        var walkedDocumentUuids = await WalkPagesAsync(
+            new ChangeVersionRange(null, byContentVersion[^1].ContentVersion),
+            PageOrderingMode.ContentVersion,
+            pageCount: refreshedSchools.Count,
+            traceIdPrefix: "pg-cv-ordering-max-only"
+        );
+
+        walkedDocumentUuids.Should().Equal(expectedProgression);
+    }
+
+    [Test]
+    public async Task It_pages_a_min_only_change_version_window_by_document_id()
+    {
+        var refreshedSchools = await UpdateFirstSchoolAndReadStateAsync();
+        var minContentVersion = refreshedSchools.Min(s => s.ContentVersion);
+        var expectedProgression = refreshedSchools.Select(s => s.DocumentUuid).ToArray();
+
+        var walkedDocumentUuids = await WalkPagesAsync(
+            new ChangeVersionRange(minContentVersion, null),
+            PageOrderingMode.DocumentId,
+            pageCount: refreshedSchools.Count,
+            traceIdPrefix: "pg-cv-ordering-min-only"
+        );
+
+        walkedDocumentUuids.Should().Equal(expectedProgression);
+    }
+
+    /// <summary>
+    /// The combination a change-version read served from a frozen snapshot resolves: an open-ended
+    /// window paged under the ContentVersion anchor. Against live data this shape keeps DocumentId,
+    /// because an update can move a row later within the still-open window; nothing moves in a frozen
+    /// source, so the anchor that makes the window a range seek becomes safe to use.
+    /// </summary>
+    /// <remarks>
+    /// The expectation cannot be reached by accident. The fixture re-upserts the first school, so its
+    /// ContentVersion order and its DocumentId order differ — asserted here rather than assumed — and
+    /// the same window paged under the other anchor returns the other progression, which is exactly
+    /// what It_pages_a_min_only_change_version_window_by_document_id asserts.
+    /// </remarks>
+    [Test]
+    public async Task It_pages_a_min_only_change_version_window_by_content_version()
+    {
+        var refreshedSchools = await UpdateFirstSchoolAndReadStateAsync();
+        var byContentVersion = refreshedSchools.OrderBy(s => s.ContentVersion).ToArray();
+        var inDocumentOrder = refreshedSchools.Select(s => s.DocumentUuid).ToArray();
+        var expectedProgression = byContentVersion.Select(s => s.DocumentUuid).ToArray();
+
+        expectedProgression
+            .Should()
+            .NotEqual(inDocumentOrder, "the scenario must discriminate the two orders");
+
+        var walkedDocumentUuids = await WalkPagesAsync(
+            new ChangeVersionRange(byContentVersion[0].ContentVersion, null),
+            PageOrderingMode.ContentVersion,
+            pageCount: refreshedSchools.Count,
+            traceIdPrefix: "pg-cv-ordering-min-only-content-version"
+        );
+
+        walkedDocumentUuids.Should().Equal(expectedProgression);
+        walkedDocumentUuids.Should().OnlyHaveUniqueItems();
+    }
+
+    /// <summary>
+    /// The ordering a bounded window is paged in is the one the request carries, not one derived from
+    /// the window here: a request whose anchor is DocumentId over a bounded window — what a deployment
+    /// running with the legacy ordering switch produces — pages in DocumentId order.
+    /// </summary>
+    /// <remarks>
+    /// This is the case whose expectation cannot be reached by accident: the fixture's ContentVersion
+    /// order differs from its DocumentId order, so the same window paged under the other anchor returns
+    /// the other progression, which is what the bounded-window test above asserts.
+    /// </remarks>
+    [Test]
+    public async Task It_pages_a_bounded_window_by_document_id_when_the_request_anchors_on_it()
+    {
+        var refreshedSchools = await UpdateFirstSchoolAndReadStateAsync();
+        var byContentVersion = refreshedSchools.OrderBy(s => s.ContentVersion).ToArray();
+        var expectedProgression = refreshedSchools.Select(s => s.DocumentUuid).ToArray();
+
+        var walkedDocumentUuids = await WalkPagesAsync(
+            new ChangeVersionRange(byContentVersion[0].ContentVersion, byContentVersion[^1].ContentVersion),
+            PageOrderingMode.DocumentId,
+            pageCount: refreshedSchools.Count,
+            traceIdPrefix: "pg-cv-ordering-document-id-anchor"
+        );
+
+        walkedDocumentUuids.Should().Equal(expectedProgression);
+    }
+
+    // A cursor walk over the seeded collection: each page selects from the range the previous page's
+    // boundary opened, and the walk ends on a page that selects nothing. Every document is returned
+    // exactly once, which is the property a client depends on and the one an off-by-one boundary breaks.
+    [Test]
+    public async Task It_walks_every_document_exactly_once_across_cursor_pages()
+    {
+        var expectedDocumentIds = _persistedSchoolsInDocumentOrder
+            .Select(static school => school.DocumentId)
+            .ToArray();
+
+        List<long> walkedDocumentIds = [];
+        var range = CursorRange.From(1);
+        var pageCount = 0;
+
+        while (pageCount++ < expectedDocumentIds.Length + 1)
+        {
+            _recorder.Reset();
+            var success = (QueryResult.QuerySuccess)
+                await ExecuteCursorQueryAsync(range, pageSize: 2, traceId: $"pg-cursor-walk-{pageCount}");
+
+            // One command per page, and no count SQL on any of them.
+            var keyset = AssertSingleQueryHydration();
+            keyset.Plan.TotalCountSql.Should().BeNull();
+            success.TotalCount.Should().BeNull();
+
+            walkedDocumentIds.AddRange(_recorder.PageMaterializedDocumentIds);
+
+            if (success.HighestSelectedAnchor is not { } highestSelectedDocumentId)
+            {
+                success.EdfiDocs.Should().BeEmpty();
+                break;
+            }
+
+            range = new CursorRange(highestSelectedDocumentId + 1, range.InclusiveMaximum);
+        }
+
+        walkedDocumentIds.Should().Equal(expectedDocumentIds);
+    }
+
+    [Test]
+    public async Task It_selects_one_document_per_page_at_page_size_one()
+    {
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteCursorQueryAsync(CursorRange.From(1), pageSize: 1, traceId: "pg-cursor-size-1");
+
+        success.HighestSelectedAnchor.Should().Be(_persistedSchoolsInDocumentOrder[0].DocumentId);
+        AssertPageMaterialization(_persistedSchoolsInDocumentOrder[0].DocumentId);
+    }
+
+    [Test]
+    public async Task It_selects_the_whole_collection_at_the_configured_maximum_page_size()
+    {
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteCursorQueryAsync(
+                CursorRange.From(1),
+                pageSize: MaximumPageSize,
+                traceId: "pg-cursor-size-max"
+            );
+
+        success.HighestSelectedAnchor.Should().Be(_persistedSchoolsInDocumentOrder[^1].DocumentId);
+        AssertPageMaterialization([
+            .. _persistedSchoolsInDocumentOrder.Select(static school => school.DocumentId),
+        ]);
+    }
+
+    // A zero page size selects nothing and cannot advance a walk, by contract rather than by arithmetic.
+    [Test]
+    public async Task It_selects_nothing_at_page_size_zero()
+    {
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteCursorQueryAsync(CursorRange.From(1), pageSize: 0, traceId: "pg-cursor-size-0");
+
+        success.HighestSelectedAnchor.Should().BeNull();
+        success.EdfiDocs.Should().BeEmpty();
+    }
+
+    // An inverted range is the terminal condition of a bounded walk, not an error.
+    [Test]
+    public async Task It_selects_nothing_from_an_inverted_range()
+    {
+        var lastDocumentId = _persistedSchoolsInDocumentOrder[^1].DocumentId;
+
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteCursorQueryAsync(
+                new CursorRange(lastDocumentId + 1, lastDocumentId),
+                pageSize: 25,
+                traceId: "pg-cursor-inverted"
+            );
+
+        success.HighestSelectedAnchor.Should().BeNull();
+        success.EdfiDocs.Should().BeEmpty();
+    }
+
+    // Range bounds are seek positions, not identities. Neither bound here is a stored DocumentId, and
+    // the page still selects exactly the documents inside the range — which is what keeps a walk correct
+    // across the identity gaps deletes leave behind.
+    [Test]
+    public async Task It_seeks_within_bounds_that_are_not_stored_document_ids()
+    {
+        var firstDocumentId = _persistedSchoolsInDocumentOrder[0].DocumentId;
+        var lastDocumentId = _persistedSchoolsInDocumentOrder[^1].DocumentId;
+        var storedDocumentIds = _persistedSchoolsInDocumentOrder
+            .Select(static school => school.DocumentId)
+            .ToArray();
+
+        storedDocumentIds.Should().NotContain(firstDocumentId - 1).And.NotContain(lastDocumentId + 1);
+
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteCursorQueryAsync(
+                new CursorRange(firstDocumentId - 1, lastDocumentId + 1),
+                pageSize: 25,
+                traceId: "pg-cursor-unstored-bounds"
+            );
+
+        success.HighestSelectedAnchor.Should().Be(lastDocumentId);
+        AssertPageMaterialization(storedDocumentIds);
+    }
+
+    // A bound that excludes the first stored id starts the page at the next one, so a continuation that
+    // resumes at maximum+1 cannot re-return the document it already delivered.
+    [Test]
+    public async Task It_excludes_documents_below_the_inclusive_minimum()
+    {
+        var firstDocumentId = _persistedSchoolsInDocumentOrder[0].DocumentId;
+
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteCursorQueryAsync(
+                CursorRange.From(firstDocumentId + 1),
+                pageSize: 25,
+                traceId: "pg-cursor-excludes-below-minimum"
+            );
+
+        success.HighestSelectedAnchor.Should().Be(_persistedSchoolsInDocumentOrder[^1].DocumentId);
+        AssertPageMaterialization([
+            .. _persistedSchoolsInDocumentOrder.Skip(1).Select(static school => school.DocumentId),
+        ]);
+    }
+
+    [Test]
+    public async Task It_composes_a_query_filter_with_the_cursor_range()
+    {
+        var targetSchool = _persistedSchoolsInDocumentOrder[1];
+
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteCursorQueryAsync(
+                CursorRange.From(1),
+                pageSize: 25,
+                traceId: "pg-cursor-filter",
+                queryElements:
+                [
+                    new QueryElement(
+                        "nameOfInstitution",
+                        [new JsonPath("$.nameOfInstitution")],
+                        targetSchool.NameOfInstitution,
+                        "string"
+                    ),
+                ]
+            );
+
+        success.HighestSelectedAnchor.Should().Be(targetSchool.DocumentId);
+        AssertPageMaterialization(targetSchool.DocumentId);
+    }
+
+    // Against current data a min-only window still orders by DocumentId, so a cursor page inside it
+    // continues normally. The snapshot half of the rule is
+    // It_pages_a_min_only_change_version_window_by_content_version above.
+    [Test]
+    public async Task It_composes_a_min_only_change_version_window_with_the_cursor_range()
+    {
+        var lowestContentVersion = _persistedSchoolsInDocumentOrder.Min(static school =>
+            school.ContentVersion
+        );
+
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteCursorQueryAsync(
+                CursorRange.From(1),
+                pageSize: 25,
+                traceId: "pg-cursor-min-window",
+                changeVersionRange: new ChangeVersionRange(lowestContentVersion, null)
+            );
+
+        success.HighestSelectedAnchor.Should().Be(_persistedSchoolsInDocumentOrder[^1].DocumentId);
+    }
+
+    // The ordering is supplied to the planner here rather than resolved from the window, so what this
+    // pins is composition: a max-bearing window has to narrow the rows a DocumentId-anchored cursor
+    // page selects without silently re-ordering it, and the page must still anchor a continuation in
+    // the units it was planned for. Which anchor a max-bearing window resolves to in production is
+    // ChangeQueryPageOrderingPolicy's decision, not this fixture's.
+    [Test]
+    public async Task It_composes_a_max_bearing_change_version_window_with_the_cursor_range()
+    {
+        var highestContentVersion = _persistedSchoolsInDocumentOrder.Max(static school =>
+            school.ContentVersion
+        );
+
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteCursorQueryAsync(
+                CursorRange.From(1),
+                pageSize: 25,
+                traceId: "pg-cursor-max-window",
+                changeVersionRange: new ChangeVersionRange(null, highestContentVersion)
+            );
+
+        success.HighestSelectedAnchor.Should().Be(_persistedSchoolsInDocumentOrder[^1].DocumentId);
+        AssertSingleQueryHydration().Plan.PageDocumentIdSql.Should().Contain("@cursorMin");
+    }
+
+    // A traditional page over the same window is ordered by ContentVersion, so the maximum it reports is
+    // that window's highest ContentVersion and not a DocumentId at all.
+    [Test]
+    public async Task It_reports_a_content_version_boundary_for_a_windowed_traditional_page()
+    {
+        // Read fresh rather than from the seeded snapshot: other cases in this fixture update a school,
+        // which moves its ContentVersion without moving its DocumentId, so only the live values bound
+        // the window this page is selected over.
+        var currentSchools = await ReadPersistedSchoolsInDocumentOrderAsync();
+        var highestContentVersion = currentSchools.Max(static school => school.ContentVersion);
+
+        var success = (QueryResult.QuerySuccess)
+            await ExecuteQueryAsync(
+                [],
+                limit: MaximumPageSize,
+                offset: 0,
+                totalCount: false,
+                traceId: "pg-traditional-max-window",
+                changeVersionRange: new ChangeVersionRange(null, highestContentVersion),
+                pageOrderingMode: PageOrderingMode.ContentVersion
+            );
+
+        success.HighestSelectedAnchor.Should().Be(highestContentVersion);
+    }
+
+    // The boundary set must be anchored on identifiers the caller can actually reach, and every range
+    // but the last must close one before the next begins, or a client walking the partitions in parallel
+    // would miss or repeat documents.
+    [Test]
+    public async Task It_partitions_the_school_candidate_set_into_contiguous_ranges_on_real_document_ids()
+    {
+        var currentSchools = await ReadPersistedSchoolsInDocumentOrderAsync();
+
+        var result = await ExecutePartitionsAsync(
+            _resourceInfo,
+            [],
+            requestedPartitionCount: 3,
+            minimumPartitionSize: 1,
+            traceId: "pg-partitions-all"
+        );
+
+        var success = result.Should().BeOfType<PartitionResult.PartitionSuccess>().Subject;
+
+        success
+            .Ranges.Select(range => range.InclusiveMinimum)
+            .Should()
+            .Equal(currentSchools.Select(school => school.DocumentId));
+        success.Ranges[^1].InclusiveMaximum.Should().Be(long.MaxValue);
+
+        for (var index = 0; index + 1 < success.Ranges.Count; index++)
+        {
+            success
+                .Ranges[index]
+                .InclusiveMaximum.Should()
+                .Be(success.Ranges[index + 1].InclusiveMinimum - 1);
+        }
+
+        _recorder.HydrationKeysets.Should().BeEmpty("a boundary calculation hydrates nothing");
+        _recorder.PageMaterializationCallCount.Should().Be(0);
+    }
+
+    [Test]
+    public async Task It_partitions_only_the_filtered_candidate_set()
+    {
+        var currentSchools = await ReadPersistedSchoolsInDocumentOrderAsync();
+        var targetSchool = currentSchools[1];
+
+        var result = await ExecutePartitionsAsync(
+            _resourceInfo,
+            [CreateQueryElement("nameOfInstitution", "$.nameOfInstitution", targetSchool.NameOfInstitution)],
+            requestedPartitionCount: 5,
+            minimumPartitionSize: 1,
+            traceId: "pg-partitions-filtered"
+        );
+
+        result
+            .Should()
+            .BeOfType<PartitionResult.PartitionSuccess>()
+            .Which.Ranges.Should()
+            .Equal(new CursorRange(targetSchool.DocumentId, long.MaxValue));
+    }
+
+    [Test]
+    public async Task It_returns_no_partitions_when_the_change_version_window_excludes_every_school()
+    {
+        var currentSchools = await ReadPersistedSchoolsInDocumentOrderAsync();
+        var maxContentVersion = currentSchools.Max(static school => school.ContentVersion);
+
+        var result = await ExecutePartitionsAsync(
+            _resourceInfo,
+            [],
+            requestedPartitionCount: 4,
+            minimumPartitionSize: 1,
+            traceId: "pg-partitions-empty-window",
+            changeVersionRange: new ChangeVersionRange(maxContentVersion + 1, null)
+        );
+
+        result.Should().BeOfType<PartitionResult.PartitionSuccess>().Which.Ranges.Should().BeEmpty();
+    }
+
+    [Test]
+    public async Task It_partitions_descriptors_over_the_shared_descriptor_table()
+    {
+        var (descriptorProjectSchema, descriptorResourceSchema) = GetResourceSchema(
+            _fixture.EffectiveSchemaSet,
+            "ed-fi",
+            "GradeLevelDescriptor"
+        );
+        var descriptorResourceInfo = CreateResourceInfo(descriptorProjectSchema, descriptorResourceSchema);
+        var expectedDocumentIds = await ReadDescriptorDocumentIdsAsync("GradeLevelDescriptor");
+
+        expectedDocumentIds
+            .Should()
+            .HaveCount(2, "the seeded grade levels are what the descriptor boundaries are calculated over");
+
+        var result = await ExecutePartitionsAsync(
+            descriptorResourceInfo,
+            [],
+            requestedPartitionCount: 2,
+            minimumPartitionSize: 1,
+            traceId: "pg-partitions-descriptor"
+        );
+
+        var success = result.Should().BeOfType<PartitionResult.PartitionSuccess>().Subject;
+
+        success.Ranges.Select(range => range.InclusiveMinimum).Should().Equal(expectedDocumentIds);
+        success.Ranges[^1].InclusiveMaximum.Should().Be(long.MaxValue);
+    }
+
+    private async Task<PartitionResult> ExecutePartitionsAsync(
+        ResourceInfo resourceInfo,
+        QueryElement[] queryElements,
+        int requestedPartitionCount,
+        long minimumPartitionSize,
+        string traceId,
+        ChangeVersionRange? changeVersionRange = null
+    )
+    {
+        await using var scope = _serviceProvider.CreateAsyncScope();
+        SetSelectedInstance(scope.ServiceProvider);
+
+        var request = new RelationalPartitionRequest(
+            ResourceInfo: resourceInfo,
+            AuthorizationContext: new RelationalAuthorizationContext([]),
+            MappingSet: _mappingSet,
+            QueryElements: queryElements,
+            AuthorizationStrategyEvaluators: [],
+            RequestedPartitionCount: requestedPartitionCount,
+            MinimumPartitionSize: minimumPartitionSize,
+            TraceId: new TraceId(traceId),
+            PageOrderingMode: PageOrderingMode.DocumentId,
+            ChangeVersionRange: changeVersionRange
+        );
+
+        return await scope
+            .ServiceProvider.GetRequiredService<RelationalDocumentStoreRepository>()
+            .QueryPartitions(request);
+    }
+
+    private async Task<IReadOnlyList<long>> ReadDescriptorDocumentIdsAsync(string resourceName)
+    {
+        var resourceKeyId = await GetResourceKeyIdAsync("Ed-Fi", resourceName);
+        var rows = await _database.QueryRowsAsync(
+            """
+            SELECT "DocumentId"
+            FROM "dms"."Descriptor"
+            WHERE "ResourceKeyId" = @resourceKeyId
+            ORDER BY "DocumentId";
+            """,
+            new NpgsqlParameter("resourceKeyId", resourceKeyId)
+        );
+
+        return [.. rows.Select(row => GetRequiredInt64(row, "DocumentId"))];
     }
 
     private static ServiceProvider CreateServiceProvider()
@@ -495,7 +1077,7 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
         services.AddTestReadableProfileProjector();
         services.AddScoped<RelationalDocumentStoreRepository>();
         services.AddSingleton<PostgresqlRelationalQueryExecutionRecorder>();
-        services.AddPostgresqlReferenceResolver();
+        services.AddPostgresqlBackendIntegrationTestServices();
         services.Replace(ServiceDescriptor.Scoped<IDocumentHydrator, RecordingPostgresqlDocumentHydrator>());
         services.Replace(
             ServiceDescriptor.Scoped<IRelationalReadMaterializer, RecordingRelationalReadMaterializer>()
@@ -675,7 +1257,44 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
         int? offset,
         bool totalCount,
         string traceId,
+        ChangeVersionRange? changeVersionRange = null,
+        PageOrderingMode pageOrderingMode = PageOrderingMode.DocumentId
+    ) =>
+        await ExecuteQueryAsync(
+            new CollectionPaging.Traditional(
+                new PaginationParameters(
+                    Limit: limit,
+                    Offset: offset,
+                    TotalCount: totalCount,
+                    MaximumPageSize: MaximumPageSize
+                )
+            ),
+            queryElements,
+            traceId,
+            changeVersionRange,
+            pageOrderingMode
+        );
+
+    private async Task<QueryResult> ExecuteCursorQueryAsync(
+        CursorRange range,
+        int pageSize,
+        string traceId,
+        QueryElement[]? queryElements = null,
         ChangeVersionRange? changeVersionRange = null
+    ) =>
+        await ExecuteQueryAsync(
+            new CollectionPaging.Cursor(range, new PageSize(pageSize)),
+            queryElements ?? [],
+            traceId,
+            changeVersionRange
+        );
+
+    private async Task<QueryResult> ExecuteQueryAsync(
+        CollectionPaging paging,
+        QueryElement[] queryElements,
+        string traceId,
+        ChangeVersionRange? changeVersionRange = null,
+        PageOrderingMode pageOrderingMode = PageOrderingMode.DocumentId
     )
     {
         await using var scope = _serviceProvider.CreateAsyncScope();
@@ -687,14 +1306,10 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
             MappingSet: _mappingSet,
             QueryElements: queryElements,
             AuthorizationStrategyEvaluators: [],
-            PaginationParameters: new PaginationParameters(
-                Limit: limit,
-                Offset: offset,
-                TotalCount: totalCount,
-                MaximumPageSize: MaximumPageSize
-            ),
+            Paging: paging,
             TraceId: new TraceId(traceId),
-            ChangeVersionRange: changeVersionRange
+            ChangeVersionRange: changeVersionRange,
+            PageOrderingMode: pageOrderingMode
         );
 
         return await scope
@@ -904,6 +1519,7 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
             """
             INSERT INTO "dms"."Descriptor" (
                 "DocumentId",
+                "ResourceKeyId",
                 "Namespace",
                 "CodeValue",
                 "ShortDescription",
@@ -913,6 +1529,7 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
             )
             VALUES (
                 @documentId,
+                @resourceKeyId,
                 @namespace,
                 @codeValue,
                 @shortDescription,
@@ -922,6 +1539,7 @@ public class Given_A_Postgresql_Relational_Query_With_The_Authoritative_Ds52_Sch
             );
             """,
             new NpgsqlParameter("documentId", documentId),
+            new NpgsqlParameter("resourceKeyId", resourceKeyId),
             new NpgsqlParameter("namespace", @namespace),
             new NpgsqlParameter("codeValue", codeValue),
             new NpgsqlParameter("shortDescription", shortDescription),

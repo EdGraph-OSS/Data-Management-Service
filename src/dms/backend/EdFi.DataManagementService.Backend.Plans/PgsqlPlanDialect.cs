@@ -25,6 +25,9 @@ internal sealed class PgsqlPlanDialect : IPlanSqlDialect
     /// <inheritdoc />
     public bool SupportsSingleDocumentHydration => true;
 
+    /// <inheritdoc />
+    public string CorrelatedRowSetJoinKeyword => "CROSS JOIN LATERAL";
+
     /// <summary>
     /// Appends a PostgreSQL <c>LIMIT</c>/<c>OFFSET</c> paging clause.
     /// </summary>
@@ -43,8 +46,69 @@ internal sealed class PgsqlPlanDialect : IPlanSqlDialect
             .AppendLine();
     }
 
+    /// <summary>
+    /// Emits nothing: PostgreSQL limits cursor pages in a trailing <c>LIMIT</c> clause.
+    /// </summary>
+    /// <param name="writer">The SQL writer to append to.</param>
+    /// <param name="pageSizeParameterName">The bare cursor page size parameter name.</param>
+    public void AppendCursorSelectRowLimitPrefix(SqlWriter writer, string pageSizeParameterName)
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+    }
+
+    /// <summary>
+    /// Appends a PostgreSQL <c>LIMIT</c> clause with no offset operation.
+    /// </summary>
+    /// <param name="writer">The SQL writer to append to.</param>
+    /// <param name="pageSizeParameterName">The bare cursor page size parameter name.</param>
+    public void AppendCursorPagingClause(SqlWriter writer, string pageSizeParameterName)
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+
+        writer.Append("LIMIT ").AppendParameter(pageSizeParameterName).AppendLine();
+    }
+
     /// <inheritdoc />
-    public void AppendCreateKeysetTempTable(SqlWriter writer, KeysetTableContract keyset)
+    public string CandidateCountOverWindowSql => "COUNT(*) OVER ()";
+
+    /// <summary>
+    /// Appends the PostgreSQL partition-size expression.
+    /// </summary>
+    /// <remarks>
+    /// <c>numeric</c> is arbitrary-precision, so the division cannot truncate or overflow at any
+    /// candidate count a <c>bigint</c> identity can reach. The ceiling is converted to <c>bigint</c>
+    /// before <c>GREATEST</c> so both arguments, and therefore the result, are integers: casting a
+    /// <c>numeric</c> to <c>bigint</c> rounds rather than truncates, which is exact here only because
+    /// <c>CEIL</c> has already produced an integral value.
+    /// </remarks>
+    /// <param name="writer">The SQL writer to append to.</param>
+    /// <param name="candidateCountExpression">The already-qualified candidate count expression.</param>
+    /// <param name="partitionCountParameterName">The bare requested partition count parameter name.</param>
+    /// <param name="minimumPartitionSizeParameterName">The bare minimum partition size parameter name.</param>
+    public void AppendPartitionSizeExpression(
+        SqlWriter writer,
+        string candidateCountExpression,
+        string partitionCountParameterName,
+        string minimumPartitionSizeParameterName
+    )
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+        ArgumentException.ThrowIfNullOrWhiteSpace(candidateCountExpression);
+
+        writer
+            .Append($"GREATEST(CAST(CEIL(CAST({candidateCountExpression} AS numeric) / CAST(")
+            .AppendParameter(partitionCountParameterName)
+            .Append(" AS numeric)) AS bigint), ")
+            .AppendParameter(minimumPartitionSizeParameterName)
+            .Append(")");
+    }
+
+    /// <inheritdoc />
+    public void AppendCreateKeysetTempTable(
+        SqlWriter writer,
+        KeysetTableContract keyset,
+        bool includeAnchorColumn = false
+    )
     {
         ArgumentNullException.ThrowIfNull(writer);
         ArgumentNullException.ThrowIfNull(keyset);
@@ -57,7 +121,56 @@ internal sealed class PgsqlPlanDialect : IPlanSqlDialect
             .AppendRelation(keyset.Table)
             .Append(" (")
             .AppendQuoted(keyset.DocumentIdColumnName.Value)
-            .AppendLine(" bigint PRIMARY KEY) ON COMMIT DROP;");
+            .Append(" bigint PRIMARY KEY, ")
+            .AppendQuoted(HydrationSqlConventions.SelectedPageOrdinalColumnName)
+            .Append(" int NULL");
+
+        if (includeAnchorColumn)
+        {
+            writer
+                .Append(", ")
+                .AppendQuoted(HydrationSqlConventions.SelectedAnchorColumnName)
+                .Append(" bigint NULL");
+        }
+
+        writer.AppendLine(") ON COMMIT DROP;");
+    }
+
+    /// <summary>
+    /// Emits nothing: PostgreSQL returns inserted keyset ids from a trailing <c>RETURNING</c> clause.
+    /// </summary>
+    /// <param name="writer">The SQL writer to append to.</param>
+    /// <param name="keyset">The keyset table contract specifying table and column names.</param>
+    public void AppendKeysetSelectedIdOutputClause(
+        SqlWriter writer,
+        KeysetTableContract keyset,
+        bool includeAnchorColumn = false
+    )
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+        ArgumentNullException.ThrowIfNull(keyset);
+    }
+
+    /// <summary>
+    /// Appends a PostgreSQL <c>RETURNING</c> clause naming the keyset document-id column.
+    /// </summary>
+    /// <param name="writer">The SQL writer to append to.</param>
+    /// <param name="keyset">The keyset table contract specifying table and column names.</param>
+    public void AppendKeysetSelectedIdReturningClause(
+        SqlWriter writer,
+        KeysetTableContract keyset,
+        bool includeAnchorColumn = false
+    )
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+        ArgumentNullException.ThrowIfNull(keyset);
+
+        writer.Append(" RETURNING ").AppendQuoted(keyset.DocumentIdColumnName.Value);
+
+        if (includeAnchorColumn)
+        {
+            writer.Append(", ").AppendQuoted(HydrationSqlConventions.SelectedAnchorColumnName);
+        }
     }
 
     /// <inheritdoc />
@@ -66,7 +179,12 @@ internal sealed class PgsqlPlanDialect : IPlanSqlDialect
         ArgumentNullException.ThrowIfNull(writer);
         ArgumentNullException.ThrowIfNull(keyset);
 
-        DocumentMetadataColumns.AppendDocumentMetadataSelectBody(writer, keyset, DocumentTable);
+        DocumentMetadataColumns.AppendDocumentMetadataSelectBody(
+            writer,
+            keyset,
+            DocumentTable,
+            HydrationSqlConventions.SelectedPageOrdinalColumnName
+        );
     }
 
     /// <inheritdoc />

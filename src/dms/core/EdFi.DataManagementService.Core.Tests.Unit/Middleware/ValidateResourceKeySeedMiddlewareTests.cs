@@ -24,6 +24,27 @@ namespace EdFi.DataManagementService.Core.Tests.Unit.Middleware;
 [Parallelizable]
 public class ValidateResourceKeySeedMiddlewareTests
 {
+    private sealed class CapturingLogger : ILogger<ValidateResourceKeySeedMiddleware>
+    {
+        public List<(LogLevel Level, string Message, Exception? Exception)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state)
+            where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter
+        )
+        {
+            Entries.Add((logLevel, formatter(state, exception), exception));
+        }
+    }
+
     internal static (
         ValidateResourceKeySeedMiddleware middleware,
         IResourceKeyValidator validator,
@@ -31,13 +52,13 @@ public class ValidateResourceKeySeedMiddlewareTests
         IEffectiveSchemaSetProvider schemaSetProvider,
         IDataStoreSelection dataStoreSelection,
         IServiceProvider serviceProvider
-    ) CreateMiddleware()
+    ) CreateMiddleware(ILogger<ValidateResourceKeySeedMiddleware>? logger = null)
     {
         var validator = A.Fake<IResourceKeyValidator>();
-        var cacheProvider = new ResourceKeyValidationCacheProvider();
+        var cacheProvider = new ResourceKeyValidationCacheProvider(TimeProvider.System, new CacheSettings());
         var schemaSetProvider = A.Fake<IEffectiveSchemaSetProvider>();
         var dataStoreSelection = A.Fake<IDataStoreSelection>();
-        var logger = A.Fake<ILogger<ValidateResourceKeySeedMiddleware>>();
+        logger ??= A.Fake<ILogger<ValidateResourceKeySeedMiddleware>>();
 
         var serviceProvider = A.Fake<IServiceProvider>();
         A.CallTo(() => serviceProvider.GetService(typeof(IDataStoreSelection))).Returns(dataStoreSelection);
@@ -112,6 +133,8 @@ public class ValidateResourceKeySeedMiddlewareTests
                     RouteContext: []
                 )
             );
+        A.CallTo(() => dataStoreSelection.GetEffectiveTarget())
+            .Returns(EffectiveDataStoreTarget.Primary("Server=test;Database=testdb"));
     }
 
     [TestFixture]
@@ -180,7 +203,7 @@ public class ValidateResourceKeySeedMiddlewareTests
                         A<short>._,
                         A<ImmutableArray<byte>>._,
                         A<IReadOnlyList<ResourceKeyRow>>._,
-                        A<string>._,
+                        A<EffectiveDataStoreTarget>._,
                         A<CancellationToken>._
                     )
                 )
@@ -236,7 +259,7 @@ public class ValidateResourceKeySeedMiddlewareTests
                         A<short>._,
                         A<ImmutableArray<byte>>._,
                         A<IReadOnlyList<ResourceKeyRow>>._,
-                        A<string>._,
+                        A<EffectiveDataStoreTarget>._,
                         A<CancellationToken>._
                     )
                 )
@@ -334,7 +357,7 @@ public class ValidateResourceKeySeedMiddlewareTests
                         A<short>._,
                         A<ImmutableArray<byte>>._,
                         A<IReadOnlyList<ResourceKeyRow>>._,
-                        A<string>._,
+                        A<EffectiveDataStoreTarget>._,
                         A<CancellationToken>._
                     )
                 )
@@ -380,7 +403,7 @@ public class ValidateResourceKeySeedMiddlewareTests
                         A<short>._,
                         A<ImmutableArray<byte>>._,
                         A<IReadOnlyList<ResourceKeyRow>>._,
-                        A<string>._,
+                        A<EffectiveDataStoreTarget>._,
                         A<CancellationToken>._
                     )
                 )
@@ -421,7 +444,7 @@ public class ValidateResourceKeySeedMiddlewareTests
                         A<short>._,
                         A<ImmutableArray<byte>>._,
                         A<IReadOnlyList<ResourceKeyRow>>._,
-                        A<string>._,
+                        A<EffectiveDataStoreTarget>._,
                         A<CancellationToken>._
                     )
                 )
@@ -474,11 +497,122 @@ public class ValidateResourceKeySeedMiddlewareTests
                         A<short>._,
                         A<ImmutableArray<byte>>._,
                         A<IReadOnlyList<ResourceKeyRow>>._,
-                        A<string>._,
+                        A<EffectiveDataStoreTarget>._,
                         A<CancellationToken>._
                     )
                 )
                 .MustHaveHappenedOnceExactly();
+        }
+    }
+
+    /// <summary>
+    /// Resource keys are a property of the database being read, so a request routed to a derivative is
+    /// validated against that database. The parent carries a different connection string here, so a
+    /// middleware that still read the parent would fail this rather than pass by coincidence.
+    /// </summary>
+    [TestFixture]
+    [Parallelizable]
+    public class Given_The_Request_Was_Routed_To_A_Derivative : ValidateResourceKeySeedMiddlewareTests
+    {
+        private const string ParentConnectionString = "Server=parent;Database=edfi";
+        private const string SnapshotConnectionString = "Server=snapshot;Database=edfi";
+
+        private IResourceKeyValidator _validator = null!;
+        private bool _nextCalled;
+
+        [SetUp]
+        public async Task Setup()
+        {
+            var (middleware, validator, _, schemaSetProvider, dataStoreSelection, serviceProvider) =
+                CreateMiddleware();
+            _validator = validator;
+
+            A.CallTo(() => dataStoreSelection.IsSet).Returns(true);
+            A.CallTo(() => dataStoreSelection.GetSelectedDataStore())
+                .Returns(
+                    new DataStore(
+                        Id: 1,
+                        DataStoreType: "Test",
+                        Name: "Test Instance",
+                        ConnectionString: ParentConnectionString,
+                        RouteContext: []
+                    )
+                );
+            A.CallTo(() => dataStoreSelection.GetEffectiveTarget())
+                .Returns(
+                    new EffectiveDataStoreTarget(EffectiveTargetKind.Snapshot, SnapshotConnectionString)
+                );
+
+            A.CallTo(() => schemaSetProvider.EffectiveSchemaSet).Returns(CreateMinimalEffectiveSchemaSet());
+
+            A.CallTo(() =>
+                    validator.ValidateAsync(
+                        A<DatabaseFingerprint>._,
+                        A<short>._,
+                        A<ImmutableArray<byte>>._,
+                        A<IReadOnlyList<ResourceKeyRow>>._,
+                        A<EffectiveDataStoreTarget>._,
+                        A<CancellationToken>._
+                    )
+                )
+                .Returns(new ResourceKeyValidationResult.ValidationSuccess());
+
+            var requestInfo = CreateRequestInfoWithFingerprint(
+                serviceProvider,
+                new DatabaseFingerprint("1.0", "abc123", 42, new byte[32].ToImmutableArray())
+            );
+
+            await middleware.Execute(
+                requestInfo,
+                () =>
+                {
+                    _nextCalled = true;
+                    return Task.CompletedTask;
+                }
+            );
+        }
+
+        [Test]
+        public void It_validates_the_effective_target()
+        {
+            A.CallTo(() =>
+                    _validator.ValidateAsync(
+                        A<DatabaseFingerprint>._,
+                        A<short>._,
+                        A<ImmutableArray<byte>>._,
+                        A<IReadOnlyList<ResourceKeyRow>>._,
+                        A<EffectiveDataStoreTarget>.That.Matches(target =>
+                            target.Kind == EffectiveTargetKind.Snapshot
+                            && target.ConnectionString == SnapshotConnectionString
+                        ),
+                        A<CancellationToken>._
+                    )
+                )
+                .MustHaveHappenedOnceExactly();
+        }
+
+        [Test]
+        public void It_never_validates_the_parent_database()
+        {
+            A.CallTo(() =>
+                    _validator.ValidateAsync(
+                        A<DatabaseFingerprint>._,
+                        A<short>._,
+                        A<ImmutableArray<byte>>._,
+                        A<IReadOnlyList<ResourceKeyRow>>._,
+                        A<EffectiveDataStoreTarget>.That.Matches(target =>
+                            target.ConnectionString == ParentConnectionString
+                        ),
+                        A<CancellationToken>._
+                    )
+                )
+                .MustNotHaveHappened();
+        }
+
+        [Test]
+        public void It_calls_next()
+        {
+            _nextCalled.Should().BeTrue();
         }
     }
 
@@ -488,27 +622,31 @@ public class ValidateResourceKeySeedMiddlewareTests
     {
         private RequestInfo _requestInfo = No.RequestInfo();
         private bool _nextCalled;
+        private CapturingLogger _logger = null!;
 
         [SetUp]
         public async Task Setup()
         {
+            _logger = new CapturingLogger();
             var (middleware, validator, _, schemaSetProvider, dataStoreSelection, serviceProvider) =
-                CreateMiddleware();
+                CreateMiddleware(_logger);
 
             SetupDataStoreSelection(dataStoreSelection);
             A.CallTo(() => schemaSetProvider.EffectiveSchemaSet).Returns(CreateMinimalEffectiveSchemaSet());
 
+            // A provider exception raised inside connection acquisition can quote connection-string
+            // values back, which is exactly what must never reach the log.
             A.CallTo(() =>
                     validator.ValidateAsync(
                         A<DatabaseFingerprint>._,
                         A<short>._,
                         A<ImmutableArray<byte>>._,
                         A<IReadOnlyList<ResourceKeyRow>>._,
-                        A<string>._,
+                        A<EffectiveDataStoreTarget>._,
                         A<CancellationToken>._
                     )
                 )
-                .ThrowsAsync(new TimeoutException("connection timed out"));
+                .ThrowsAsync(new TimeoutException("connection timed out for Password=hunter2"));
 
             _requestInfo = CreateRequestInfoWithFingerprint(
                 serviceProvider,
@@ -556,6 +694,208 @@ public class ValidateResourceKeySeedMiddlewareTests
                 .FrontendResponse.Body!.ToString()
                 .Should()
                 .Contain("urn:ed-fi:api:resource-key-seed-validation-error");
+        }
+
+        [Test]
+        public void It_logs_the_exception_type_for_the_unexpected_failure()
+        {
+            _logger
+                .Entries.Should()
+                .Contain(entry =>
+                    entry.Level == LogLevel.Error
+                    && entry.Message.Contains("Resource key seed validation failed")
+                    && entry.Message.Contains(nameof(TimeoutException))
+                );
+        }
+
+        [Test]
+        public void It_never_hands_the_provider_exception_to_the_logger()
+        {
+            _logger
+                .Entries.Should()
+                .OnlyContain(
+                    entry => entry.Exception == null,
+                    "a provider exception can quote connection-string values back"
+                );
+        }
+
+        [Test]
+        public void It_never_logs_connection_material()
+        {
+            _logger.Entries.Should().NotContain(entry => entry.Message.Contains("Password=hunter2"));
+        }
+    }
+
+    /// <summary>
+    /// Seams 2 and 3: the slow-path dms.ResourceKey read could not acquire a connection, so
+    /// ResourceKeyValidator rethrew rather than reporting a seed mismatch. Which response that becomes
+    /// depends on the kind of target, which the exception carries.
+    /// </summary>
+    [TestFixture]
+    [Parallelizable]
+    public class Given_The_Resource_Key_Read_Could_Not_Acquire_A_Connection
+        : ValidateResourceKeySeedMiddlewareTests
+    {
+        private const string ConnectionString = "Server=snapshot;Database=edfi;Password=hunter2";
+
+        /// <summary>
+        /// What an engine would have composed: the provider type and its own error code, and nothing
+        /// else. Distinct from anything in the connection string, so a log assertion that the string
+        /// is absent still means something when this is present.
+        /// </summary>
+        private const string FailureDescription = "TimeoutException(-2)";
+
+        /// <summary>
+        /// A provider exception of the shape the seam guard classifies. Its message quotes the
+        /// connection string back, which is exactly what must never reach a log.
+        /// </summary>
+        private static TimeoutException ProviderFailure() =>
+            new($"connection timed out for {ConnectionString}");
+
+        private sealed record Outcome(
+            RequestInfo RequestInfo,
+            bool NextCalled,
+            IResourceKeyValidator Validator,
+            CapturingLogger Logger
+        );
+
+        /// <summary>
+        /// Executes twice against the same middleware and cache provider, so the validator call count
+        /// reveals whether the failed verdict was cached.
+        /// </summary>
+        private static async Task<Outcome> ExecuteWith(EffectiveTargetKind kind)
+        {
+            EffectiveDataStoreTarget target = new(kind, ConnectionString);
+
+            CapturingLogger logger = new();
+            var (middleware, validator, _, schemaSetProvider, dataStoreSelection, serviceProvider) =
+                CreateMiddleware(logger);
+
+            A.CallTo(() => dataStoreSelection.IsSet).Returns(true);
+            A.CallTo(() => dataStoreSelection.GetSelectedDataStore())
+                .Returns(
+                    new DataStore(
+                        Id: 1,
+                        DataStoreType: "Test",
+                        Name: "Test Instance",
+                        ConnectionString: ConnectionString,
+                        RouteContext: []
+                    )
+                );
+            A.CallTo(() => dataStoreSelection.GetEffectiveTarget()).Returns(target);
+            A.CallTo(() => schemaSetProvider.EffectiveSchemaSet).Returns(CreateMinimalEffectiveSchemaSet());
+
+            A.CallTo(() =>
+                    validator.ValidateAsync(
+                        A<DatabaseFingerprint>._,
+                        A<short>._,
+                        A<ImmutableArray<byte>>._,
+                        A<IReadOnlyList<ResourceKeyRow>>._,
+                        A<EffectiveDataStoreTarget>._,
+                        A<CancellationToken>._
+                    )
+                )
+                .ThrowsAsync(() =>
+                    new DatabaseConnectionUnavailableException(kind, FailureDescription, ProviderFailure())
+                );
+
+            var fingerprint = new DatabaseFingerprint("1.0", "abc123", 2, new byte[32].ToImmutableArray());
+            RequestInfo requestInfo = CreateRequestInfoWithFingerprint(serviceProvider, fingerprint);
+            bool nextCalled = false;
+
+            await middleware.Execute(
+                requestInfo,
+                () =>
+                {
+                    nextCalled = true;
+                    return Task.CompletedTask;
+                }
+            );
+
+            await middleware.Execute(
+                CreateRequestInfoWithFingerprint(serviceProvider, fingerprint),
+                () => Task.CompletedTask
+            );
+
+            return new Outcome(requestInfo, nextCalled, validator, logger);
+        }
+
+        [Test]
+        public async Task It_answers_snapshot_not_found_for_a_snapshot()
+        {
+            Outcome outcome = await ExecuteWith(EffectiveTargetKind.Snapshot);
+
+            outcome.RequestInfo.FrontendResponse.ShouldBeSnapshotNotFound("test-trace-id");
+            outcome.NextCalled.Should().BeFalse();
+        }
+
+        /// <summary>
+        /// This provider retains no fault on either policy class, so the failed verdict is already
+        /// gone and the immediately following request revalidates.
+        /// </summary>
+        [Test]
+        public async Task It_does_not_cache_the_failed_snapshot_verdict()
+        {
+            Outcome outcome = await ExecuteWith(EffectiveTargetKind.Snapshot);
+
+            A.CallTo(() =>
+                    outcome.Validator.ValidateAsync(
+                        A<DatabaseFingerprint>._,
+                        A<short>._,
+                        A<ImmutableArray<byte>>._,
+                        A<IReadOnlyList<ResourceKeyRow>>._,
+                        A<EffectiveDataStoreTarget>._,
+                        A<CancellationToken>._
+                    )
+                )
+                .MustHaveHappenedTwiceExactly();
+        }
+
+        /// <summary>
+        /// A primary or a read replica keeps the unexpected-error 503 it produces today. Only a
+        /// snapshot's response depends on the failure being a connection failure.
+        /// </summary>
+        [TestCase(EffectiveTargetKind.Primary)]
+        [TestCase(EffectiveTargetKind.ReadReplica)]
+        public async Task It_keeps_the_existing_503_for_a_non_snapshot(EffectiveTargetKind kind)
+        {
+            Outcome outcome = await ExecuteWith(kind);
+
+            outcome.RequestInfo.FrontendResponse.StatusCode.Should().Be(503);
+            outcome
+                .RequestInfo.FrontendResponse.Body!.ToString()
+                .Should()
+                .Contain("urn:ed-fi:api:resource-key-seed-validation-error");
+            outcome.NextCalled.Should().BeFalse();
+        }
+
+        [Test]
+        public async Task It_logs_the_inner_exception_type_and_the_target_kind()
+        {
+            Outcome outcome = await ExecuteWith(EffectiveTargetKind.Snapshot);
+
+            outcome
+                .Logger.Entries.Should()
+                .Contain(entry =>
+                    entry.Level == LogLevel.Warning
+                    && entry.Message.Contains("Snapshot connection unavailable")
+                    && entry.Message.Contains(nameof(TimeoutException))
+                    && entry.Message.Contains("for Snapshot target")
+                );
+        }
+
+        [Test]
+        public async Task It_never_logs_connection_material()
+        {
+            Outcome outcome = await ExecuteWith(EffectiveTargetKind.Snapshot);
+
+            outcome.Logger.Entries.Should().NotContain(entry => entry.Message.Contains("Password=hunter2"));
+            outcome
+                .Logger.Entries.Should()
+                .OnlyContain(
+                    entry => entry.Exception == null,
+                    "the wrapper's inner provider exception quotes the connection string in its message"
+                );
         }
     }
 }

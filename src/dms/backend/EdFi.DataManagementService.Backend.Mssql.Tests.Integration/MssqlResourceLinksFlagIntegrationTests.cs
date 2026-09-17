@@ -214,7 +214,7 @@ public class Given_A_Mssql_AcademicWeek_When_The_ResourceLinks_Flag_Is_Flipped_A
         services.Configure<DatabaseOptions>(options => options.IsolationLevel = IsolationLevel.ReadCommitted);
         services.AddTestReadableProfileProjector();
         services.AddScoped<RelationalDocumentStoreRepository>();
-        services.AddMssqlReferenceResolver();
+        services.AddMssqlBackendIntegrationTestServices();
 
         short schoolResourceKeyId = _mappingSet.ResourceKeyIdByResource[SchoolResource];
         Dictionary<short, DocumentLinkSlugTriple> slugByResourceKeyId = new()
@@ -396,13 +396,16 @@ public class Given_A_Mssql_AcademicWeek_When_The_ResourceLinks_Flag_Is_Flipped_A
             MappingSet: _mappingSet,
             QueryElements: [],
             AuthorizationStrategyEvaluators: [],
-            PaginationParameters: new PaginationParameters(
-                Limit: 25,
-                Offset: 0,
-                TotalCount: false,
-                MaximumPageSize: MaximumPageSize
+            Paging: new CollectionPaging.Traditional(
+                new PaginationParameters(
+                    Limit: 25,
+                    Offset: 0,
+                    TotalCount: false,
+                    MaximumPageSize: MaximumPageSize
+                )
             ),
-            TraceId: new TraceId("mssql-31-query-academicweek")
+            TraceId: new TraceId("mssql-31-query-academicweek"),
+            PageOrderingMode: PageOrderingMode.DocumentId
         );
 
         QueryResult result = await scope
@@ -512,6 +515,7 @@ public class Given_A_Mssql_AcademicWeek_When_The_ResourceLinks_Flag_Is_Flipped_A
             """
             INSERT INTO [dms].[Descriptor] (
                 [DocumentId],
+                [ResourceKeyId],
                 [Namespace],
                 [CodeValue],
                 [ShortDescription],
@@ -521,6 +525,7 @@ public class Given_A_Mssql_AcademicWeek_When_The_ResourceLinks_Flag_Is_Flipped_A
             )
             VALUES (
                 @documentId,
+                @resourceKeyId,
                 @namespace,
                 @codeValue,
                 @shortDescription,
@@ -530,6 +535,7 @@ public class Given_A_Mssql_AcademicWeek_When_The_ResourceLinks_Flag_Is_Flipped_A
             );
             """,
             new SqlParameter("@documentId", documentId),
+            new SqlParameter("@resourceKeyId", resourceKeyId),
             new SqlParameter("@namespace", @namespace),
             new SqlParameter("@codeValue", codeValue),
             new SqlParameter("@shortDescription", shortDescription),

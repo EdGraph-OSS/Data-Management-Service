@@ -155,7 +155,7 @@ public class Given_A_Postgresql_ParentResource_With_Collection_Aligned_Extension
         services.Configure<DatabaseOptions>(options => options.IsolationLevel = IsolationLevel.ReadCommitted);
         services.AddTestReadableProfileProjector();
         services.AddScoped<RelationalDocumentStoreRepository>();
-        services.AddPostgresqlReferenceResolver();
+        services.AddPostgresqlBackendIntegrationTestServices();
 
         short sponsorResourceKeyId = _mappingSet.ResourceKeyIdByResource[SponsorResource];
         Dictionary<short, DocumentLinkSlugTriple> slugByResourceKeyId = new()
@@ -301,13 +301,16 @@ public class Given_A_Postgresql_ParentResource_With_Collection_Aligned_Extension
             MappingSet: _mappingSet,
             QueryElements: [],
             AuthorizationStrategyEvaluators: [],
-            PaginationParameters: new PaginationParameters(
-                Limit: 25,
-                Offset: 0,
-                TotalCount: false,
-                MaximumPageSize: MaximumPageSize
+            Paging: new CollectionPaging.Traditional(
+                new PaginationParameters(
+                    Limit: 25,
+                    Offset: 0,
+                    TotalCount: false,
+                    MaximumPageSize: MaximumPageSize
+                )
             ),
-            TraceId: new TraceId("pg-29d-query-parentresource")
+            TraceId: new TraceId("pg-29d-query-parentresource"),
+            PageOrderingMode: PageOrderingMode.DocumentId
         );
 
         return await scope

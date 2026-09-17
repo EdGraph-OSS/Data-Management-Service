@@ -13,15 +13,15 @@
     <PackageVersion Include="dbup-core" Version="5.0.87" />
     <PackageVersion Include="dbup-postgresql" Version="5.0.40" />
     <PackageVersion Include="dbup-sqlserver" Version="5.0.40" />
-    <PackageVersion Include="EdFi.DataStandard52.ApiSchema" Version="1.0.333" />
-    <PackageVersion Include="EdFi.DataStandard52.Homograph.ApiSchema" Version="1.0.333" />
-    <PackageVersion Include="EdFi.DataStandard52.Sample.ApiSchema" Version="1.0.333" />
-    <PackageVersion Include="EdFi.DataStandard52.TPDM.ApiSchema" Version="1.0.333" />
+    <PackageVersion Include="EdFi.DataStandard52.ApiSchema" Version="1.0.335" />
+    <PackageVersion Include="EdFi.DataStandard52.Homograph.ApiSchema" Version="1.0.335" />
+    <PackageVersion Include="EdFi.DataStandard52.Sample.ApiSchema" Version="1.0.335" />
+    <PackageVersion Include="EdFi.DataStandard52.TPDM.ApiSchema" Version="1.0.335" />
     <!-- In Data Standard 6.1 the TPDM model is folded into core, so there is no separate
          EdFi.DataStandard61.TPDM.ApiSchema extension (unlike 5.2); 6.1 is Core + Sample + Homograph. -->
-    <PackageVersion Include="EdFi.DataStandard61.ApiSchema" Version="1.0.333" />
-    <PackageVersion Include="EdFi.DataStandard61.Homograph.ApiSchema" Version="1.0.333" />
-    <PackageVersion Include="EdFi.DataStandard61.Sample.ApiSchema" Version="1.0.333" />
+    <PackageVersion Include="EdFi.DataStandard61.ApiSchema" Version="1.0.335" />
+    <PackageVersion Include="EdFi.DataStandard61.Homograph.ApiSchema" Version="1.0.335" />
+    <PackageVersion Include="EdFi.DataStandard61.Sample.ApiSchema" Version="1.0.335" />
     <PackageVersion Include="FastGuid" Version="1.4.1" />
     <PackageVersion Include="Keycloak.Net.Core" Version="1.0.29" />
     <PackageVersion Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.1" />
@@ -42,6 +42,10 @@
     <PackageVersion Include="OpenIddict.Validation.AspNetCore" Version="7.0.0" />
     <PackageVersion Include="OpenIddict.Validation.SystemNetHttp" Version="7.0.0" />
     <PackageVersion Include="Snapshooter.NUnit" Version="1.0.1" />
+    <!-- Test-only, and referenced only by a plugin loader fixture: it ships a native library for
+         every runtime identifier that suite runs on, which is what lets the fixture resolve and
+         call one through a plugin's own load context. No production project references it. -->
+    <PackageVersion Include="SQLitePCLRaw.lib.e_sqlite3" Version="3.53.3" />
     <PackageVersion Include="System.CommandLine" Version="2.0.0-rc.1.25451.107" />
     <PackageVersion Include="System.IdentityModel.Tokens.Jwt" Version="8.12.0" />
     <PackageVersion Include="Microsoft.CodeAnalysis" Version="4.12.0" />
@@ -64,15 +68,16 @@
     <PackageVersion Include="NuGet.Packaging" Version="6.13.1" />
     <PackageVersion Include="NuGet.Protocol" Version="6.13.1" />
     <PackageVersion Include="Polly" Version="8.5.2" />
-    <PackageVersion Include="Polly.Core" Version="8.4.2" />
-    <PackageVersion Include="Polly.Extensions" Version="8.4.2" />
+    <PackageVersion Include="Polly.Core" Version="8.5.2" />
+    <PackageVersion Include="Polly.Extensions" Version="8.5.2" />
     <PackageVersion Include="Respawn" Version="7.0.0" />
     <PackageVersion Include="Sandwych.QuickGraph.Core" Version="1.0.0" />
-    <PackageVersion Include="Serilog" Version="4.0.2" />
+    <PackageVersion Include="Serilog" Version="4.2.0" />
     <PackageVersion Include="Serilog.Extensions.Logging" Version="8.0.0" />
     <PackageVersion Include="Serilog.Settings.Configuration" Version="8.0.2" />
     <PackageVersion Include="Serilog.Sinks.Console" Version="6.0.0" />
     <PackageVersion Include="Serilog.Sinks.File" Version="6.0.0" />
+    <PackageVersion Include="Serilog.Sinks.OpenTelemetry" Version="4.2.0" />
     <PackageVersion Include="SonarAnalyzer.CSharp" Version="9.32.0.97167" />
     <PackageVersion Include="JsonSchema.Net" Version="7.2.2" />
     <PackageVersion Include="JsonPath.Net" Version="1.1.6" />
