@@ -3,6 +3,167 @@
 # The Ed-Fi Alliance licenses this file to you under the Apache License, Version 2.0.
 # See the LICENSE and NOTICES files in the project root for more information.
 
+Describe 'CDC qualification image pulls' {
+    BeforeAll {
+        Import-Module (Join-Path $PSScriptRoot '../cdc-qualification.psm1') -Force
+        function docker { }
+    }
+    BeforeEach {
+        $caseRoot = New-Item -ItemType Directory (Join-Path $TestDrive ([guid]::NewGuid().ToString('N')))
+        $script:raw = New-Item -ItemType Directory (Join-Path $caseRoot 'private')
+        $script:destination = New-Item -ItemType Directory (Join-Path $caseRoot 'published')
+        $script:image = 'registry.example.test/team/image@sha256:' + ('a' * 64)
+        $script:exitCodes = [System.Collections.Generic.Queue[int]]::new()
+        $script:commands = [System.Collections.Generic.List[string]]::new()
+        $script:events = [System.Collections.Generic.List[string]]::new()
+        $script:failure = 'Error response from daemon: unexpected EOF https://user:private-token@registry.example.test/path'
+        $script:savedExitCode = $global:LASTEXITCODE
+        Mock -ModuleName cdc-qualification docker {
+            $script:commands.Add(($args -join ' '))
+            $script:events.Add('pull')
+            $global:LASTEXITCODE = $script:exitCodes.Dequeue()
+            if ($global:LASTEXITCODE -ne 0) { Write-Output $script:failure }
+            else { Write-Output 'Status: Image is up to date' }
+        }
+        Mock -ModuleName cdc-qualification Start-Sleep {
+            param($Seconds)
+            $script:events.Add("sleep:$Seconds")
+        }
+    }
+    AfterEach {
+        $global:LASTEXITCODE = $script:savedExitCode
+    }
+    It 'pulls once on immediate success and records the exact pinned image without sleeping' {
+        $script:exitCodes.Enqueue(0)
+        Invoke-CdcQualificationImagePull $script:image $script:raw $script:destination
+        $script:commands | Should -Be @("pull $script:image")
+        $script:events | Should -Be @('pull')
+        $records = @(Get-Content (Join-Path $script:destination 'image-pulls.jsonl') | ConvertFrom-Json)
+        $records.Count | Should -Be 1
+        $records[0].Image | Should -Be $script:image
+        $records[0].Attempt | Should -Be 1
+        $records[0].ExitCode | Should -Be 0
+        $records[0].Outcome | Should -Be 'Succeeded'
+        $records[0].FailureCategory | Should -Be 'None'
+        $records[0].RetryDelaySeconds | Should -Be 0
+        [DateTimeOffset]::Parse($records[0].StartedAtUtc) | Should -BeLessOrEqual ([DateTimeOffset]::UtcNow)
+        $records[0].DurationMs | Should -BeGreaterOrEqual 0
+    }
+    It 'recovers on the third attempt with bounded backoff and retains earlier failures' {
+        foreach ($code in @(1, 7, 0)) { $script:exitCodes.Enqueue($code) }
+        $output = Invoke-CdcQualificationImagePull $script:image $script:raw $script:destination
+        $script:commands | Should -Be @("pull $script:image", "pull $script:image", "pull $script:image")
+        $script:events | Should -Be @('pull', 'sleep:5', 'pull', 'sleep:15', 'pull')
+        $records = @(Get-Content (Join-Path $script:destination 'image-pulls.jsonl') | ConvertFrom-Json)
+        $records.Attempt | Should -Be @(1, 2, 3)
+        $records.MaxAttempts | Should -Be @(3, 3, 3)
+        $records.ExitCode | Should -Be @(1, 7, 0)
+        $records.Outcome | Should -Be @('Failed', 'Failed', 'Succeeded')
+        $records.FailureCategory | Should -Be @('Connection', 'Connection', 'None')
+        $records.RetryDelaySeconds | Should -Be @(5, 15, 0)
+        @($records.PrivateLog | Select-Object -Unique).Count | Should -Be 3
+        (Get-Content (Join-Path $script:raw $records[0].PrivateLog) -Raw) | Should -Match 'private-token'
+        ($output -join '') | Should -Not -Match 'private-token|https://'
+        (Get-Content (Join-Path $script:destination 'image-pulls.jsonl') -Raw) | Should -Not -Match 'private-token|https://'
+        @(Get-ChildItem $script:destination).Count | Should -Be 1
+    }
+    It 'fails closed after three failed attempts with retained diagnostics and no final sleep' {
+        foreach ($code in @(1, 1, 23)) { $script:exitCodes.Enqueue($code) }
+        $script:failure = 'toomanyrequests: rate limit exceeded; private-token'
+        { Invoke-CdcQualificationImagePull $script:image $script:raw $script:destination } |
+            Should -Throw 'EnvironmentUnavailable:*after 3 attempts (exit=23, category=RateLimited)*image-pulls.jsonl*'
+        $script:events | Should -Be @('pull', 'sleep:5', 'pull', 'sleep:15', 'pull')
+        $records = @(Get-Content (Join-Path $script:destination 'image-pulls.jsonl') | ConvertFrom-Json)
+        $records.ExitCode | Should -Be @(1, 1, 23)
+        $records.Outcome | Should -Be @('Failed', 'Failed', 'Failed')
+        $records.RetryDelaySeconds | Should -Be @(5, 15, 0)
+        $records.FailureCategory | Should -Be @('RateLimited', 'RateLimited', 'RateLimited')
+    }
+    It 'appends attempts across images without overwriting evidence or private logs' {
+        foreach ($code in @(0, 1, 0)) { $script:exitCodes.Enqueue($code) }
+        Invoke-CdcQualificationImagePull $script:image $script:raw $script:destination
+        Invoke-CdcQualificationImagePull 'postgres:16' $script:raw $script:destination
+        $records = @(Get-Content (Join-Path $script:destination 'image-pulls.jsonl') | ConvertFrom-Json)
+        $records.Image | Should -Be @($script:image, 'postgres:16', 'postgres:16')
+        $records.Attempt | Should -Be @(1, 1, 2)
+        @($records.PrivateLog | Select-Object -Unique).Count | Should -Be 3
+        @(Get-ChildItem $script:raw).Count | Should -Be 3
+    }
+    It 'classifies <Category> without publishing raw Docker output' -ForEach @(
+        @{ ErrorText = 'unauthorized: authentication required'; Category = 'Authorization' }
+        @{ ErrorText = 'manifest unknown'; Category = 'ImageNotFound' }
+        @{ ErrorText = 'no space left on device'; Category = 'DiskFull' }
+        @{ ErrorText = 'dial tcp: lookup registry: no such host'; Category = 'Dns' }
+        @{ ErrorText = 'x509: certificate signed by unknown authority'; Category = 'Tls' }
+        @{ ErrorText = 'net/http: request canceled (Client.Timeout exceeded while awaiting headers)'; Category = 'Timeout' }
+        @{ ErrorText = 'received unexpected HTTP status: 503 Service Unavailable'; Category = 'RegistryUnavailable' }
+        @{ ErrorText = 'unrecognized private-token'; Category = 'Unknown' }
+        @{ ErrorText = ''; Category = 'Unknown' }
+    ) {
+        foreach ($code in @(1, 0)) { $script:exitCodes.Enqueue($code) }
+        $script:failure = $ErrorText
+        Invoke-CdcQualificationImagePull $script:image $script:raw $script:destination
+        $records = @(Get-Content (Join-Path $script:destination 'image-pulls.jsonl') | ConvertFrom-Json)
+        $records[0].FailureCategory | Should -Be $Category
+        (Get-Content (Join-Path $script:destination 'image-pulls.jsonl') -Raw) | Should -Not -Match 'private-token'
+    }
+    It 'redacts unsafe image identities from both evidence and the failure message' -ForEach @(
+        @{ UnsafeImage = "registry/image:tag`n::error::injected" }
+        @{ UnsafeImage = 'user:private-token@registry.example.test/image' }
+        @{ UnsafeImage = 'https://registry/image?token=private-token' }
+    ) {
+        foreach ($code in @(1, 1, 1)) { $script:exitCodes.Enqueue($code) }
+        { Invoke-CdcQualificationImagePull $UnsafeImage $script:raw $script:destination } |
+            Should -Throw 'EnvironmentUnavailable:*for `[redacted`] after 3 attempts*'
+        $records = @(Get-Content (Join-Path $script:destination 'image-pulls.jsonl') | ConvertFrom-Json)
+        $records.Image | Should -Be @('[redacted]', '[redacted]', '[redacted]')
+        (Get-Content (Join-Path $script:destination 'image-pulls.jsonl') -Raw) | Should -Not -Match 'private-token|::error::'
+    }
+}
+
+Describe 'CDC qualification image-pull runner boundary' {
+    It 'retains pull evidence and reports unavailable prerequisites without starting tests after retries are exhausted' {
+        # Run the real entry point in a child process because it deliberately exits nonzero.
+        # Docker and sleep shims keep this deterministic and independent of a live registry.
+        $harness = Join-Path $TestDrive 'runner-harness.ps1'
+        $destination = Join-Path $TestDrive 'runner-evidence'
+        $runner = Join-Path $PSScriptRoot '../Invoke-CdcQualification.ps1'
+        Set-Content -LiteralPath $harness -Value @'
+param([string] $Runner, [string] $Destination)
+$ErrorActionPreference = 'Stop'
+$repo = [IO.Path]::GetFullPath((Join-Path (Split-Path $Runner) '../..'))
+$qualified = Get-Content (Join-Path $repo 'src/dms/backend/EdFi.DataManagementService.Backend.Cdc/CdcQualifiedWorkerImage.json') -Raw | ConvertFrom-Json
+$env:CDC_CONNECTOR_TEMPLATE_CONNECT_IMAGE = $qualified.image
+function global:docker {
+    $global:LASTEXITCODE = 0
+    if ($args[0] -eq 'pull' -and $args[-1] -eq $env:CDC_CONNECTOR_TEMPLATE_CONNECT_IMAGE) {
+        $global:LASTEXITCODE = 17
+        'Error response from daemon: toomanyrequests: private-token'
+    }
+    else { 'fixture-docker-success' }
+}
+function global:Start-Sleep { }
+function global:dotnet { throw 'The test suite must not start after a failed pull.' }
+& $Runner -Lane Kafka -ResultsDirectory $Destination -PullImages
+exit $LASTEXITCODE
+'@
+        $output = & pwsh -NoProfile -File $harness -Runner $runner -Destination $destination 2>&1 | Out-String
+        $LASTEXITCODE | Should -Be 1
+        $output | Should -Not -Match 'private-token|The test suite must not start'
+        $report = Get-Content (Join-Path $destination 'qualification.json') -Raw | ConvertFrom-Json -NoEnumerate
+        $report.Count | Should -Be 1
+        $report[0].Status | Should -Be 'EnvironmentUnavailable'
+        $report[0].Total | Should -Be 0
+        $report[0].Reason | Should -Match 'after 3 attempts \(exit=17, category=RateLimited\)'
+        $records = @(Get-Content (Join-Path $destination 'image-pulls.jsonl') | ConvertFrom-Json)
+        $records.ExitCode | Should -Be @(0, 17, 17, 17)
+        $records.Attempt | Should -Be @(1, 1, 2, 3)
+        @($records.PrivateLog | Select-Object -Unique).Count | Should -Be 4
+        @(Get-ChildItem $destination -Name | Sort-Object) | Should -Be @('image-pulls.jsonl', 'qualification.json')
+        (Get-ChildItem $destination -File | Get-Content -Raw) -join '' | Should -Not -Match 'private-token'
+    }
+}
+
 Describe 'CDC qualification result boundary' {
     BeforeAll {
         Import-Module (Join-Path $PSScriptRoot '../cdc-qualification.psm1') -Force
@@ -29,6 +190,32 @@ Describe 'CDC qualification result boundary' {
         Write-Report
         (Get-CdcQualificationReport $script:report 0).Status | Should -Be 'Passed'
     }
+    It 'reports recovered startup failures without hiding them or counting injected failures as flakes' {
+        try {
+            Write-Report
+            '{"Stage":"unprovisioned-sql-startup","Signature":"ReasonTwoErrnoEleven","Container":{"Logs":{"InjectedFailure":false}}}' |
+                Set-Content (Join-Path $TestDrive 'admission-evidence-sql-startup-real.json')
+            '{"Stage":"unprovisioned-sql-recovery","Outcome":"Ready","Injected":false}' |
+                Set-Content (Join-Path $TestDrive 'admission-evidence-sql-recovery-real.json')
+            '{"Stage":"unprovisioned-sql-startup","Signature":"LsaInitializationTimeout","Container":{"Logs":{"InjectedFailure":true}}}' |
+                Set-Content (Join-Path $TestDrive 'admission-evidence-sql-startup-injected.json')
+            '{"Stage":"unprovisioned-sql-recovery","Outcome":"Ready","Injected":true}' |
+                Set-Content (Join-Path $TestDrive 'admission-evidence-sql-recovery-injected.json')
+            $result = Get-CdcQualificationReport $script:report 0
+            $result.Status | Should -Be 'Passed'
+            $result.SqlStartupFailures | Should -Be 1
+            $result.SqlStartupRecoveries | Should -Be 1
+            $result.SqlStartupInjectedFailures | Should -Be 1
+            $result.SqlStartupInjectedRecoveries | Should -Be 1
+            $result.SqlStartupFailureSignatures.ReasonTwoErrnoEleven | Should -Be 1
+            Write-Report -Outcome Failed -Message 'Expected ready CDC evidence'
+            (Get-CdcQualificationReport $script:report 1).Status | Should -Be 'Failed'
+        }
+        finally {
+            Remove-Item (Join-Path $TestDrive 'admission-evidence-sql-*.json')
+        }
+    }
+
     It 'rejects skipped cases instead of counting them as qualification' {
         Write-Report -Outcome NotExecuted
         $result = Get-CdcQualificationReport $script:report 0
@@ -128,6 +315,7 @@ Describe 'CDC qualification CI scheduling' {
         $script:scheduledWorkflow = Get-Content (Join-Path $PSScriptRoot '../../../.github/workflows/nightly-cdc-qualification.yml') -Raw
         $script:scheduledJob = [regex]::Match($script:scheduledWorkflow, '(?ms)^  run-cdc-qualification:.*?(?=^  [a-z][a-z0-9-]+:|\z)').Value
         $script:scheduledNotification = [regex]::Match($script:scheduledWorkflow, '(?ms)^  notify-results:.*\z').Value
+        Import-Module (Join-Path $PSScriptRoot '../cdc-qualification.psm1') -Force
         $script:matrixScript = Join-Path $PSScriptRoot '../Get-CdcQualificationMatrix.ps1'
     }
     It 'requires only Contract without live Docker prerequisites in PR and merge-queue qualification' {
@@ -136,12 +324,12 @@ Describe 'CDC qualification CI scheduling' {
         $script:gate | Should -Match '(?m)^      - run-cdc-qualification$'
         $script:gate | Should -Not -Match 'nightly-cdc|run-cdc-heavy-qualification'
     }
-    It 'selects all thirteen live jobs by default without Contract or duplicates' {
+    It 'selects all fifteen live jobs by default without Contract or duplicates' {
         $matrix = & $script:matrixScript | ConvertFrom-Json
         $pairs = @($matrix.include | ForEach-Object { $_.lane + '/' + $_.suite })
         $expected = @('Kafka/All')
         foreach ($provider in @('Postgresql', 'Mssql')) {
-            foreach ($suite in @('Admission', 'Lifecycle', 'Recovery', 'RecordSize', 'Telemetry', 'History')) {
+            foreach ($suite in @('Admission', 'Lifecycle', 'Recovery', 'RecordSize', 'Telemetry', 'History', 'MessageContract')) {
                 $expected += "$provider/$suite"
             }
         }
@@ -149,15 +337,21 @@ Describe 'CDC qualification CI scheduling' {
     }
     It 'selects <Lane>/<Suite> for a targeted manual run' -ForEach @(
         @{ Lane = 'Kafka'; Suite = 'All'; Count = 1 }
-        @{ Lane = 'Postgresql'; Suite = 'All'; Count = 6 }
-        @{ Lane = 'Mssql'; Suite = 'All'; Count = 6 }
+        @{ Lane = 'Postgresql'; Suite = 'All'; Count = 7 }
+        @{ Lane = 'Mssql'; Suite = 'All'; Count = 7 }
         @{ Lane = 'Postgresql'; Suite = 'RecordSize'; Count = 1 }
         @{ Lane = 'Mssql'; Suite = 'Admission'; Count = 1 }
         @{ Lane = 'Mssql'; Suite = 'History'; Count = 1 }
+        @{ Lane = 'Postgresql'; Suite = 'MessageContract'; Count = 1 }
+        @{ Lane = 'Mssql'; Suite = 'MessageContract'; Count = 1 }
     ) {
         $matrix = & $script:matrixScript -Lane $Lane -Suite $Suite | ConvertFrom-Json
         $matrix.include.GetType().IsArray | Should -BeTrue
         $matrix.include.Count | Should -Be $Count
+        @($matrix.include | ForEach-Object { $_.lane + '/' + $_.suite } | Select-Object -Unique).Count | Should -Be $Count
+        if ($Suite -eq 'All' -and $Lane -ne 'Kafka') {
+            @($matrix.include.suite | Sort-Object) | Should -Be @('Admission', 'History', 'Lifecycle', 'MessageContract', 'RecordSize', 'Recovery', 'Telemetry')
+        }
         @($matrix.include | Where-Object lane -ne $Lane).Count | Should -Be 0
         if ($Suite -ne 'All') { @($matrix.include | Where-Object suite -ne $Suite).Count | Should -Be 0 }
     }
@@ -176,7 +370,7 @@ Describe 'CDC qualification CI scheduling' {
         $script:scheduledWorkflow | Should -Match "inputs.suite \|\| 'All'"
         $script:scheduledJob | Should -Match 'matrix: \$\{\{ fromJSON\(needs.select-suites.outputs.matrix\) \}\}'
         $script:scheduledJob | Should -Not -Match '(?m)^    if:'
-        $weekend = Get-Content (Join-Path $PSScriptRoot '../../../.github/workflows/scheduled-build.yml') -Raw
+        $weekend = Get-Content (Join-Path $PSScriptRoot '../../../.github/workflows/dms-weekend-build.yml') -Raw
         $weekend | Should -Not -Match 'Invoke-CdcQualification|run-cdc-heavy-qualification|nightly-cdc-qualification'
     }
     It 'retains fail-closed prerequisites and sanitized artifacts in the nightly jobs' {
@@ -234,7 +428,7 @@ Describe 'CDC qualification CI scheduling' {
             ($_.Groups[1].Value | ConvertFrom-Json).text
         })
         $messages.Count | Should -Be 2
-        $messages[0] | Should -Be ':heavy_check_mark: DMS CI nightly CDC qualification passed, all 13 live suites verified'
+        $messages[0] | Should -Be ':heavy_check_mark: DMS CI nightly CDC qualification passed, all 15 live suites verified'
         $messages[1] | Should -Be ':x: DMS CI nightly CDC qualification failed (selection: ${{ needs.select-suites.result }}, qualification: ${{ needs.run-cdc-qualification.result }})'
         foreach ($message in $messages) {
             $message | Should -Not -Match '[\r\n]'
@@ -247,5 +441,58 @@ Describe 'CDC qualification CI scheduling' {
         $script:job | Should -Match 'if: always\(\)'
         $script:job | Should -Match 'path: TestResults/cdc-qualification/\*\*'
         $script:job | Should -Match 'name: cdc-qualification-.*github.run_attempt'
+    }
+}
+
+Describe 'Message contract qualification selection and attachments' {
+    BeforeAll {
+        Import-Module (Join-Path $PSScriptRoot '../cdc-qualification.psm1') -Force
+    }
+    It 'selects serialized and broker cases for <Provider> without selecting offline cases' -ForEach @(
+        @{ Provider = 'Postgresql' }
+        @{ Provider = 'Mssql' }
+    ) {
+        $suites = Get-CdcQualificationProviderSuite -Provider $Provider
+        $suites.MessageContract | Should -Be "(Category=CdcMessageContractSerialized|Category=CdcMessageContractKafka)&Category=$($Provider)Integration"
+        $suites.Count | Should -Be 7
+    }
+    It 'publishes contract attachments and their links while excluding document bodies and private logs' {
+        $raw = New-Item -ItemType Directory (Join-Path $TestDrive 'contract-raw')
+        $safe = Join-Path $TestDrive 'contract-safe'
+        $name = 'cdc-message-contract-MC-PG-1234567890abcdef.json'
+        "<TestRun><Results><UnitTestResult outcome='Passed'><ResultFiles><ResultFile path='host/$name'/><ResultFile path='host/input.json'/></ResultFiles></UnitTestResult></Results></TestRun>" | Set-Content (Join-Path $raw 'contract.trx')
+        '{"ScenarioIds":["MC-PG-BOUNDARY"],"KeyBytes":36,"ValueBytes":16300,"DocumentBody":{"name":"private-sentinel"},"Password":"private-sentinel"}' | Set-Content (Join-Path $raw $name)
+        '{"document":"private-sentinel"}' | Set-Content (Join-Path $raw 'input.json')
+        'private-sentinel' | Set-Content (Join-Path $raw 'private.log')
+        Export-CdcQualificationEvidence $raw $safe
+        [xml] $trx = Get-Content (Join-Path $safe 'contract.trx') -Raw
+        @($trx.TestRun.Results.UnitTestResult.ResultFiles.ResultFile).Count | Should -Be 1
+        $trx.TestRun.Results.UnitTestResult.ResultFiles.ResultFile.path | Should -Be $name
+        $evidence = Get-Content (Join-Path $safe $name) -Raw | ConvertFrom-Json
+        $evidence.ScenarioIds | Should -Contain 'MC-PG-BOUNDARY'
+        $evidence.ValueBytes | Should -Be 16300
+        (Get-ChildItem $safe -File | Get-Content -Raw) -join '' | Should -Not -Match 'private-sentinel'
+        Test-Path (Join-Path $safe 'input.json') | Should -BeFalse
+        Test-Path (Join-Path $safe 'private.log') | Should -BeFalse
+    }
+}
+
+Describe 'CDC fixture-level evidence retention' {
+    BeforeAll {
+        Import-Module (Join-Path $PSScriptRoot '../cdc-qualification.psm1') -Force
+    }
+    It 'exports allowlisted fixture evidence even when VSTest omits the attachment link' {
+        $raw = Join-Path $TestDrive 'raw'
+        $fixture = Join-Path $raw 'TestResults/MessageContractProgressAcknowledgement'
+        $destination = Join-Path $TestDrive 'published'
+        New-Item -ItemType Directory -Force $fixture | Out-Null
+        @{ ScenarioIds = @('MC-PROGRESS-ACK-PG-GATING'); Payload = 'private-document' } |
+            ConvertTo-Json | Set-Content (Join-Path $fixture 'cdc-message-contract-ack.json')
+        '{"private":"not-exported"}' | Set-Content (Join-Path $fixture 'runtime-settings.json')
+        Export-CdcQualificationEvidence -RawDirectory $raw -Destination $destination
+        $result = Get-Content (Join-Path $destination 'cdc-message-contract-ack.json') -Raw | ConvertFrom-Json
+        $result.ScenarioIds | Should -Be @('MC-PROGRESS-ACK-PG-GATING')
+        $result.Payload | Should -Be '[redacted]'
+        Test-Path (Join-Path $destination 'runtime-settings.json') | Should -BeFalse
     }
 }

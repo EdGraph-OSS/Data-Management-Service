@@ -5,6 +5,63 @@
 
 Set-StrictMode -Version Latest
 
+function Invoke-CdcQualificationImagePull {
+    <# .SYNOPSIS
+    Retries an image pull and retains safe per-attempt evidence, including recovered failures.
+    #>
+    param([string] $Image, [string] $RawDirectory, [string] $Destination)
+
+    # A nonzero native exit must reach the retry/evidence path even for callers that opt
+    # into PowerShell native-command errors. Do not change the caller's preference.
+    $PSNativeCommandUseErrorActionPreference = $false
+    $safeImage = if ($Image -cmatch '\A[a-zA-Z0-9][a-zA-Z0-9._/:-]*(?:@sha256:[a-f0-9]{64})?\z') {
+        ConvertTo-CdcSafeEvidence $Image
+    }
+    else { '[redacted]' }
+    $pullId = [guid]::NewGuid().ToString('N')
+    $retryDelays = @(5, 15)
+    $maxAttempts = $retryDelays.Count + 1
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $logName = "pull-$pullId-$attempt.log"
+        $logPath = Join-Path $RawDirectory $logName
+        $started = [DateTimeOffset]::UtcNow
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        & docker pull -- $Image *> $logPath
+        $exitCode = $LASTEXITCODE
+        $timer.Stop()
+        $failureCategory = 'None'
+        if ($exitCode -ne 0) {
+            # Never copy arbitrary Docker prose, registry URLs or credentials into the
+            # public artifact. Keep the full output privately and publish known categories.
+            [string] $output = Get-Content -LiteralPath $logPath -Raw
+            $failureCategory = switch -Regex ($output) {
+                '(?i)toomanyrequests|too many requests|rate.?limit|\b429\b' { 'RateLimited'; break }
+                '(?i)unauthorized|authentication required|access denied|denied:|\b401\b|\b403\b' { 'Authorization'; break }
+                '(?i)manifest unknown|manifest.*not found|name unknown|\b404\b' { 'ImageNotFound'; break }
+                '(?i)no space left on device' { 'DiskFull'; break }
+                '(?i)no such host|temporary failure in name resolution' { 'Dns'; break }
+                '(?i)x509|certificate|tls handshake' { 'Tls'; break }
+                '(?i)timeout|timed out|context deadline exceeded' { 'Timeout'; break }
+                '(?i)connection reset|connection refused|unexpected EOF|network is unreachable' { 'Connection'; break }
+                '(?i)\b50[0234]\b|internal server error|bad gateway|service unavailable|gateway timeout' { 'RegistryUnavailable'; break }
+                default { 'Unknown' }
+            }
+        }
+        $retrySeconds = if ($exitCode -ne 0 -and $attempt -lt $maxAttempts) { $retryDelays[$attempt - 1] } else { 0 }
+        $outcome = if ($exitCode -eq 0) { 'Succeeded' } else { 'Failed' }
+        [ordered]@{
+            Image = $safeImage; Attempt = $attempt; MaxAttempts = $maxAttempts
+            StartedAtUtc = $started.ToString('O'); DurationMs = $timer.ElapsedMilliseconds
+            ExitCode = $exitCode; Outcome = $outcome; FailureCategory = $failureCategory
+            RetryDelaySeconds = $retrySeconds; PrivateLog = $logName
+        } | ConvertTo-Json -Compress | Add-Content -LiteralPath (Join-Path $Destination 'image-pulls.jsonl')
+        Write-Output "CDC image pull $safeImage attempt $attempt/$maxAttempts`: $outcome (exit=$exitCode, category=$failureCategory, retrySeconds=$retrySeconds)."
+        if ($exitCode -eq 0) { return }
+        if ($retrySeconds -gt 0) { Start-Sleep -Seconds $retrySeconds }
+    }
+    throw "EnvironmentUnavailable: required image pull failed for $safeImage after $maxAttempts attempts (exit=$exitCode, category=$failureCategory); see image-pulls.jsonl."
+}
+
 function Get-CdcQualificationReport {
     <# .SYNOPSIS
     Classifies complete TRX results without treating skipped or unavailable cases as evidence.
@@ -40,9 +97,33 @@ function Get-CdcQualificationReport {
     elseif ($skipped -gt 0) { 'SkippedQualification' }
     elseif (-not $complete -or $results.Count -eq 0) { 'ReportIncomplete' }
     else { 'Passed' }
+    # Attachments survive passing tests too. Count observed failures separately from the
+    # deliberate process exits used to qualify the recovery mechanism itself.
+    $startupFailures = 0; $startupRecoveries = 0
+    $injectedFailures = 0; $injectedRecoveries = 0
+    $signatures = @{}
+    foreach ($file in Get-ChildItem -LiteralPath (Split-Path -Parent $Path) -Filter 'admission-evidence-sql-*.json' -Recurse) {
+        $evidence = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json -AsHashtable
+        if ($evidence.Stage -eq 'unprovisioned-sql-startup') {
+            if ($evidence['Container']?['Logs']?['InjectedFailure'] -eq $true) { $injectedFailures++ }
+            else {
+                $startupFailures++
+                $signature = if ($evidence.Signature -in @('LsaInitializationTimeout', 'ReasonTwoErrnoEleven')) { $evidence.Signature } else { 'Other' }
+                if (-not $signatures.ContainsKey($signature)) { $signatures[$signature] = 0 }
+                $signatures[$signature]++
+            }
+        }
+        elseif ($evidence.Stage -eq 'unprovisioned-sql-recovery' -and $evidence.Outcome -eq 'Ready') {
+            if ($evidence.Injected -eq $true) { $injectedRecoveries++ }
+            else { $startupRecoveries++ }
+        }
+    }
     return [ordered]@{
         Status = $status; Total = $results.Count; Passed = $passed; Failed = $failed
         Skipped = $skipped; EnvironmentFailures = $environmentFailures
+        SqlStartupFailures = $startupFailures; SqlStartupRecoveries = $startupRecoveries
+        SqlStartupInjectedFailures = $injectedFailures; SqlStartupInjectedRecoveries = $injectedRecoveries
+        SqlStartupFailureSignatures = $signatures
         Diagnostics = @($results | Where-Object outcome -ne 'Passed' | ForEach-Object {
             [ordered]@{
                 TestId = $_.GetAttribute('testId')
@@ -84,7 +165,7 @@ function Export-CdcQualificationEvidence {
     param([string] $RawDirectory, [string] $Destination)
 
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
-    $attachmentPattern = '^(?:admission-evidence-|cdc-controller-|managed-lifecycle-|native-recovery-|cdc-history-|record-size-|\d+-)[a-zA-Z0-9_.-]+\.json$'
+    $attachmentPattern = '^(?:cdc-message-contract-|admission-evidence-|cdc-controller-|managed-lifecycle-|native-recovery-|cdc-history-|record-size-|\d+-)[a-zA-Z0-9_.-]+\.json$'
     foreach ($file in Get-ChildItem -LiteralPath $RawDirectory -Filter '*.trx' -Recurse) {
         [xml] $trx = Get-Content -LiteralPath $file.FullName -Raw
         # Assertion diffs and stdout can contain a whole record or an unlabelled password.
@@ -126,4 +207,23 @@ function Export-CdcQualificationEvidence {
     }
 }
 
-Export-ModuleMember -Function Get-CdcQualificationReport, Export-CdcQualificationEvidence
+function Get-CdcQualificationProviderSuite {
+    <# .SYNOPSIS
+    Returns the ordered provider suites and their complete test filters for execution and CI scheduling.
+    #>
+    param([ValidateSet('Postgresql', 'Mssql')][string] $Provider)
+
+    $categories = [ordered]@{
+        Admission = 'CdcControllerAdmission'; Lifecycle = 'CdcControllerManagedLifecycle'
+        Recovery = 'CdcControllerNativeRecovery'; RecordSize = 'CdcControllerRecordSize'
+        Telemetry = 'CdcConnectorTelemetryQualification'; History = 'CdcPublicationHistory'
+    }
+    $filters = [ordered]@{}
+    foreach ($phase in $categories.Keys) {
+        $filters[$phase] = "Category=$($categories[$phase])&Category=$($Provider)Integration"
+    }
+    $filters['MessageContract'] = "(Category=CdcMessageContractSerialized|Category=CdcMessageContractKafka)&Category=$($Provider)Integration"
+    return $filters
+}
+
+Export-ModuleMember -Function Invoke-CdcQualificationImagePull, Get-CdcQualificationReport, Export-CdcQualificationEvidence, Get-CdcQualificationProviderSuite
