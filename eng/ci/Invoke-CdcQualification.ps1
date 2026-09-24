@@ -9,7 +9,7 @@
 param(
     [ValidateSet('All', 'Contract', 'Postgresql', 'Mssql', 'Kafka')]
     [string] $Lane = 'All',
-    [ValidateSet('All', 'Admission', 'Lifecycle', 'Recovery', 'RecordSize', 'Telemetry', 'History')]
+    [ValidateSet('All', 'Admission', 'Lifecycle', 'Recovery', 'RecordSize', 'Telemetry', 'History', 'MessageContract')]
     [string] $Suite = 'All',
     [string] $ResultsDirectory = 'TestResults/cdc-qualification',
     [ValidateSet('Debug', 'Release')]
@@ -51,11 +51,25 @@ function Invoke-QualificationSuite {
     $arguments = @('test', $Project, '-c', $script:qualificationConfiguration, '--nologo', '--results-directory', $suiteDirectory,
         '--logger', "trx;LogFileName=$Name.trx", '--logger', 'console;verbosity=quiet')
     if ($Filter) { $arguments += @('--filter', $Filter) }
+    # VSTest omits fixture-level attachments. Keep their original JSON under this suite's
+    # private directory so the existing allowlisted exporter can retain it as well.
+    $arguments += @('--', "NUnit.WorkDirectory=$suiteDirectory")
     & dotnet @arguments *> (Join-Path $suiteDirectory 'private.log')
     $report = Get-CdcQualificationReport -Path (Join-Path $suiteDirectory "$Name.trx") -ExitCode $LASTEXITCODE
     $report.Name = $Name
     $reports.Add($report)
     Export-CdcQualificationEvidence -RawDirectory $suiteDirectory -Destination (Join-Path $destination $Name)
+    if ($report.Contains('SqlStartupFailures') -and (
+            $report.SqlStartupFailures -gt 0 -or
+            $report.SqlStartupRecoveries -gt 0 -or
+            $report.SqlStartupInjectedFailures -gt 0 -or
+            $report.SqlStartupInjectedRecoveries -gt 0
+        )) {
+        Write-Output "SQL startup: observed failures=$($report.SqlStartupFailures), recovered=$($report.SqlStartupRecoveries), injected failures=$($report.SqlStartupInjectedFailures), injected recoveries=$($report.SqlStartupInjectedRecoveries)"
+        if ($env:GITHUB_STEP_SUMMARY) {
+            "- $Name SQL startup: $($report.SqlStartupFailures) observed failures; $($report.SqlStartupRecoveries) recovered; $($report.SqlStartupInjectedRecoveries) injected recoveries." >> $env:GITHUB_STEP_SUMMARY
+        }
+    }
     Write-Output "$Name`: $($report.Status), total=$($report.Total), passed=$($report.Passed), failed=$($report.Failed), skipped=$($report.Skipped)"
 }
 
@@ -91,8 +105,7 @@ try {
         $images = @($broker) + @($required | Where-Object { $_ -like '*_IMAGE' } | ForEach-Object { [Environment]::GetEnvironmentVariable($_) })
         foreach ($image in $images | Select-Object -Unique) {
             if ($PullImages) {
-                & docker pull $image *> (Join-Path $raw 'pull.log')
-                if ($LASTEXITCODE -ne 0) { throw 'EnvironmentUnavailable: required image pull failed.' }
+                Invoke-CdcQualificationImagePull -Image $image -RawDirectory $raw -Destination $destination
             }
             & docker image inspect $image --format '{{.Id}}' *> (Join-Path $raw 'inspect.log')
             if ($LASTEXITCODE -ne 0) { throw 'EnvironmentUnavailable: required image is unavailable locally.' }
@@ -123,21 +136,20 @@ try {
             Invoke-QualificationSuite -Name 'kafka-local' -Project $backend -Filter 'Category=CdcControllerKafkaPolicy&Category=CdcAuthorizationDisabledLocal'
         }
         else {
-            $categories = [ordered]@{
-                Admission = 'CdcControllerAdmission'; Lifecycle = 'CdcControllerManagedLifecycle'
-                Recovery = 'CdcControllerNativeRecovery'; RecordSize = 'CdcControllerRecordSize'
-                Telemetry = 'CdcConnectorTelemetryQualification'; History = 'CdcPublicationHistory'
-            }
-            foreach ($phase in $categories.Keys) {
+            $filters = Get-CdcQualificationProviderSuite -Provider $selected
+            foreach ($phase in $filters.Keys) {
                 if ($Suite -ne 'All' -and $Suite -ne $phase) { continue }
                 $project = $backend
-                $name = "$selected-$($categories[$phase])"
+                $name = "$selected-$phase"
+                if ($phase -notin @('History', 'Telemetry', 'MessageContract')) {
+                    $name = "$selected-$(([regex]::Match($filters[$phase], '^Category=([^&]+)')).Groups[1].Value)"
+                }
                 if ($phase -eq 'Telemetry') { $name = "$selected-telemetry" }
                 if ($phase -eq 'History') {
                     $name = "$selected-history"
                     $project = 'src/dms/clis/EdFi.DataManagementService.DocumentCacheAdmin.Tests.Integration/EdFi.DataManagementService.DocumentCacheAdmin.Tests.Integration.csproj'
                 }
-                Invoke-QualificationSuite -Name $name -Project $project -Filter "Category=$($categories[$phase])&Category=$($selected)Integration"
+                Invoke-QualificationSuite -Name $name -Project $project -Filter $filters[$phase]
                 if ($phase -eq 'History') {
                     $env:CDC_ARTIFACT_CLEANUP_FAIL_FAST = 'true'
                     if ($selected -eq 'Postgresql') { $env:CDC_CLEANUP_POSTGRESQL_ADMIN = $env:ConnectionStrings__DatabaseConnection }

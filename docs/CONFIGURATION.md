@@ -18,6 +18,8 @@ file.
 | BypassTypeCoercion               | Type coercion attempts to coerce schema-guided request values to their proper type on `POST` and `PUT` requests. This includes boolean strings such as `"true"`, numeric strings such as `"100"`, and boolean numeric aliases such as `1` and `"0"`. This setting bypasses all request value type coercion for performance. |
 | AllowIdentityUpdateOverrides     | Comma separated list of resource names that allow identity updates, overriding the default behavior to reject identity updates.                                                                           |
 | MaskRequestBodyInLogs            | Controls whether to mask HTTP request bodies in log statements to avoid potentially logging PII. This setting only applies to `DEBUG` logging where requests are logged.                                  |
+| CorrelationIdHeader              | Name of the request header a client-supplied correlation ID is read from. When this setting is non-empty and the named header is present with a value that still has content after normalization, that value identifies the request in logs and in the `correlationId` of error responses; otherwise — header absent, sent empty, or normalizing to nothing but whitespace, as a value made up only of removed characters or only of whitespace does — the server-generated trace identifier is used. Client-supplied values are normalized — a logging-safe character allowlist, which removes control characters (`Cc`), format characters (`Cf` — bidirectional overrides, zero-width characters, soft hyphen, BOM) and the Unicode line/paragraph separators, and `CorrelationIdMaxLength` are applied — before use; see [Logging Policy](./LOGGING.md#correlation-id-normalization). Leave empty to disable client-supplied correlation IDs entirely: no header name is honored on any path, including the catch-all `404` for an unmatched route. Environment override: `AppSettings__CorrelationIdHeader`. Default: empty |
+| CorrelationIdMaxLength           | Maximum number of UTF-16 code units retained from a correlation ID, client-supplied or server-generated, before it is used in a log event or an error response body; longer values are truncated rather than rejected. The cut is made on a code unit rather than on a user-perceived character, which is why a non-BMP character costs two. Truncation happens before disallowed characters are removed, so an over-length value can end up shorter than this limit — either because it also contains characters the allowlist removes, which are removed after the cut, or because the cut landed inside a surrogate pair, which costs one further code unit even when there is nothing to remove. Must be between `64` and `1024` inclusive - the floor keeps the cap above every common correlation ID scheme, including the 22-character server-generated trace identifier, and the ceiling bounds how much client-controlled text one request can reflect into logs and error bodies; see [the ADR](../reference/adr-correlation-id-normalization.md#bounds-on-the-length-cap). An out-of-range value does **not** prevent the process from starting: the host starts, logs the validation failure at `Critical` once at startup, and short-circuits every request — including `/health` — with the generic Ed-Fi `500` problem-details body, carrying the same `correlationId` the request is logged under, until the setting is corrected and the service is restarted. See [Logging Policy](./LOGGING.md#correlation-id-normalization). Environment override: `AppSettings__CorrelationIdMaxLength`. Default: `255` |
 | UseApiSchemaPath                 | When set to `true`, the application loads core data standard and extension artifacts from the manifest-backed workspace at `ApiSchemaPath`. When `false`, it loads the bundled manifest-backed ApiSchema workspace from the application output. Loose no-manifest `ApiSchema*.json` folders are not a runtime loading contract. |
 | ApiSchemaPath                    | Specifies the runtime ApiSchema workspace directory containing `bootstrap-api-schema-manifest.json` and the manifest-declared core and extension schema files. The ApiSchemaDownloader CLI can be used to download and extract the published ApiSchema packages before the root manifest is materialized. |
 | DomainsExcludedFromOpenApi       | Comma separated list of domain names to exclude from OpenAPI documentation generation. Domains listed here will not appear in the generated OpenAPI specifications. Case insensitive. |
@@ -345,6 +347,23 @@ and what a startup failure means, and
 [eng/docker-compose/README.md](../eng/docker-compose/README.md) for running them
 against a local development stack.
 
+A plugin is built against two published contract packages, on the Ed-Fi Azure
+Artifacts feed at
+`https://pkgs.dev.azure.com/ed-fi-alliance/Ed-Fi-Alliance-OSS/_packaging/EdFi/nuget/v3/index.json`:
+
+| Package                     | What it declares                                                    |
+| --------------------------- | ------------------------------------------------------------------- |
+| `EdFi.Api.Plugins`          | `EdFiApiPlugin`, the base class a plugin implements.                  |
+| `EdFi.Api.CustomValidation` | `ICustomResourceValidator`, for a plugin that registers a validator.  |
+
+Neither carries the Data Management Service release version. Each declares its own
+semantic version, in its own source, and moves it only when its public surface, its
+XML documentation or its declared dependencies change, because the loader compares
+contract assembly versions when it decides whether a plugin may run. Which contract
+versions a given release carries is stated in the host assembly manifest attached to
+that release. None of this is configuration: it is what a vendor compiles against
+before the directory this section governs ever exists.
+
 | Parameter | Description                                                                                                                                                                                                                  |
 | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Directory | The plugin root. Defaults to `/app/plugins`, and a relative value is resolved against the application's base directory. A root that does not exist is not an error when `Allowed` is empty.                                   |
@@ -510,7 +529,9 @@ retry-after metadata, and the body is served either way. The
 `correlationId` is taken from the request header named by
 `AppSettings:CorrelationIdHeader` when that setting and header are
 present, otherwise from the server-generated trace identifier — the same
-selection the API's other error responses use.
+selection, and the same
+[normalization](./LOGGING.md#correlation-id-normalization), the API's other
+error responses use.
 
 ```json
 {
@@ -692,6 +713,44 @@ relevant environment variables or appsettings to set `IdentityProvider` to
 | `IdentitySettings.EncryptionKey`    | Key used for token encryption (self-contained only)              | _(not used)_                                         | `QWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo0NTY3ODkwMTIz` |
 | `IdentitySettings.TokenCleanupEnabled` | Enables the background sweep that deletes expired OpenIddict access tokens (self-contained only) | _(not used)_                                         | `true`              |
 | `IdentitySettings.TokenCleanupIntervalMinutes` | Interval, in minutes, between expired-token cleanup sweeps (self-contained only)           | _(not used)_                                         | `30`              |
+| `IdentitySettings.BearerTokenPerClientLimit` | Maximum number of active (unexpired, unrevoked) access tokens a single client may hold (self-contained only). A grant beyond the limit is rejected with HTTP 429 and a `Too Many Tokens` problem response of type `urn:ed-fi:api:security:authentication:too-many-tokens`; the client should reuse its existing token until it expires. Any value below 1, conventionally `-1`, disables enforcement. | _(not used)_ | `5` |
+
+> **Before upgrading an existing deployment:** the limit takes effect immediately, so a client
+> already holding at least `BearerTokenPerClientLimit` active tokens starts receiving 429s on its
+> next grant. Deployments running two or more DMS replicas against a single Configuration
+> Service client id must raise this value before upgrading — see the sizing arithmetic below.
+> Leave `TokenCleanupEnabled` on as well: every grant counts the client's active tokens, and
+> expired tokens the sweep has not yet removed still sit in the table it counts over, so a
+> deployment that has run with cleanup disabled makes each grant read through that whole backlog.
+
+`BearerTokenPerClientLimit` counts active tokens per client id, not per process, so size it
+against the number of processes sharing a client id. DMS caches its own Configuration Service
+token for 1500 seconds against the default 1800-second token lifetime, so each DMS replica
+normally holds one active token, and two during the five-minute window in which a freshly
+fetched token overlaps the one it replaces. Three replicas sharing a single client id can
+therefore need six active tokens at once, which already exceeds the default of 5. Budget roughly
+two tokens per replica sharing a client id, plus headroom for restarts and rolling deployments,
+and size that budget against the effective 30-minute lifetime: a token held by a replica that is
+restarted or replaced continues to count until it expires.
+
+Waiting for a token to expire is not the only remedy. A caller that still holds a token it no
+longer needs can revoke it at `POST /connect/revoke`, the `revocation_endpoint` advertised in the
+Configuration Service's OpenID configuration; a revoked token stops counting toward the limit
+straight away, which frees a slot for the next grant. A client that genuinely needs distinct
+tokens should revoke each one as it finishes with it rather than letting it sit until it expires.
+This only helps a caller that still has the token string — one that has lost track of its tokens,
+after a crash loop for instance, has to wait for them to expire.
+
+When DMS crosses the limit on its own Configuration Service client, it logs an error carrying the
+429 status and the `urn:ed-fi:api:security:authentication:too-many-tokens` response body, and the
+metadata lookup that triggered the fetch fails until the next successful one. During startup the
+rejected fetch is fatal instead: DMS cannot load its data stores and exits. Because DMS keeps its
+token only in process memory, every restart of a DMS that is crash-looping at startup spends one
+slot, so after `BearerTokenPerClientLimit` restarts within the token lifetime DMS cannot start at
+all until the oldest of those tokens expires, even once the fault behind the crash loop is fixed.
+A deployment that starts DMS before its data stores are registered hits this. Raising the limit,
+or giving DMS a client id it does not share, is the fix; the symptom is a sizing problem, not a
+Configuration Service outage.
 
 ### JwtAuthentication parameters in `appsettings.json` (DMS API Service)
 
