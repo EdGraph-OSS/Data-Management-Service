@@ -16,7 +16,8 @@
 # No YAML parser is available in this lane, so (following DmsPullRequestMssqlWorkflow.Tests.ps1)
 # named blocks are extracted by their two-space job key and invariants are asserted inside them.
 
-# The ten jobs that each ran their own solution build before the shared build artifact landed.
+# The jobs that consume the shared build artifact: ten that each ran their own solution build before
+# it landed, plus the identity plugin lane, which consumed it from the start.
 # Declared at file scope rather than in BeforeAll because Pester binds -ForEach during discovery,
 # which happens before any BeforeAll body has run.
 $buildOutputConsumer = @(
@@ -28,6 +29,7 @@ $buildOutputConsumer = @(
     @{ JobName = 'run-e2e-tests-mssql-ds61' }
     @{ JobName = 'run-instance-management-e2e-tests' }
     @{ JobName = 'run-instance-management-e2e-tests-mssql' }
+    @{ JobName = 'run-instance-management-identity-plugin-e2e-tests' }
     @{ JobName = 'build-and-start-dms' }
     # Also a producer: it stages the much smaller dms-integration-test-assemblies for the eight
     # integration lanes. It is a consumer all the same - the five projects it used to compile are in
@@ -477,6 +479,36 @@ Describe "on-dms-pullrequest.yml CI budget wiring" {
         }
     }
 
+    Context "CDC documentation uses the existing Contract job" {
+        It "gates only on CDC relevance for pull requests and always runs for other events" {
+            Get-JobIfCondition -JobName 'run-cdc-qualification' |
+                Should -Be "github.event_name != 'pull_request' || needs.detect-fresh-build-changes.outputs.cdc_relevant == 'true'"
+            # A docs-only PR skips the shared build and Bootstrap Pester jobs. Neither may be a
+            # dependency that would cause GitHub to skip Contract despite its relevance flag.
+            @(Get-JobNeed -JobName 'run-cdc-qualification') | Should -Be @('detect-fresh-build-changes')
+        }
+
+        It "selects Contract for a checked document alone but not unrelated documentation" {
+            Import-Module (Join-Path $PSScriptRoot '../dms-change-categories.psm1') -Force
+            try {
+                $checked = Get-DmsChangeCategory -EventName 'pull_request' -ChangedFile @('reference/cdc-documentation/operations-runbook.md')
+                $unrelated = Get-DmsChangeCategory -EventName 'pull_request' -ChangedFile @('reference/cdc-documentation/notes.md')
+                $checked.cdc_relevant | Should -BeTrue
+                $checked.dms_relevant | Should -BeFalse
+                $unrelated.cdc_relevant | Should -BeFalse
+                $unrelated.dms_relevant | Should -BeFalse
+            }
+            finally {
+                Remove-Module dms-change-categories -Force
+            }
+        }
+
+        It "invokes the shared Contract runner that owns CLI and wrapper documentation reports" {
+            Get-JobBlock -JobName 'run-cdc-qualification' |
+                Should -Match 'eng/ci/Invoke-CdcQualification\.ps1 -Lane Contract -ResultsDirectory '
+        }
+    }
+
     Context "The document-embed check runs where the drift it refuses can happen" {
         It "gates on document_embeds_relevant and not on dms_relevant" {
             # dms_relevant excludes docs/, so gating this job on it would skip the one pull request
@@ -745,7 +777,7 @@ Describe "on-dms-pullrequest.yml CI budget wiring" {
                 $script:lines | Where-Object { $_ -match '\./build-dms\.ps1 (E2ETest|InstanceE2ETest)\b' }
             )
 
-            $e2eInvocation.Count | Should -Be 7
+            $e2eInvocation.Count | Should -Be 8
 
             foreach ($invocation in $e2eInvocation) {
                 $invocation | Should -Match '-UsePrebuiltOutput'

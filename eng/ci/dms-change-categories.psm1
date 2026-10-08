@@ -77,6 +77,42 @@ $script:DocumentEmbedPathPrefix = @(
     # not on dms_relevant, so without this entry a pull request editing that readme would reach no
     # rule here and skip the guard entirely.
     'src/dms/core/EdFi.DataManagementService.CustomValidation/'
+    # The reference plugin whose regions docs/UNIQUEID-VALIDATION.md embeds lives here rather than
+    # under eng/verification/, because it is also loaded and run by the integration suite, not just
+    # read by this check. Without this entry a pull request editing the plugin's source would leave
+    # the guide's embedded sample unverified against it and reach no rule here at all.
+    'eng/fixtures/plugins/'
+    # The secrets contract's packed readme is the fifth checked document, and it lives under
+    # src/config/ rather than under any prefix above. Its worked examples sit under
+    # eng/verification/, which is already here; the readme itself would otherwise reach no rule,
+    # and a pull request editing only that readme would skip the guard entirely.
+    'src/config/contracts/EdFi.DmsConfigurationService.Secrets/'
+)
+
+# Operator documents checked by CdcRunbookLinkTests.Documents and their linked design targets.
+# These select the existing Contract lane even outside the DMS tree.
+# Keep other relevance flags governed by their existing rules.
+$script:CdcDocumentExactPath = @(
+    'reference/cdc-documentation/README.md'
+    'reference/cdc-documentation/operations-runbook.md'
+    'reference/cdc-documentation/cdc-inv-evidence.md'
+    'reference/document-cache-documentation/README.md'
+    'reference/document-cache-documentation/operations-runbook.md'
+    'src/dms/clis/EdFi.DataManagementService.SchemaTools/README.md'
+    'src/dms/clis/EdFi.DataManagementService.DocumentCacheAdmin/README.md'
+    'eng/docker-compose/README.md'
+    'src/dms/tests/EdFi.InstanceManagement.Tests.E2E/README.md'
+    'docs/CONFIGURATION.md'
+    'docs/CDC-QUALIFICATION.md'
+    'docs/RELATIONAL-BACKEND.md'
+    'src/dms/tests/RestClient/local-development-setup.http'
+    'reference/design/backend-redesign/epics/19-cdc-kafka/07-ops-docs-runbooks.md'
+    'reference/design/backend-redesign/design-docs/data-model.md'
+    'reference/design/backend-redesign/design-docs/ddl-generation.md'
+)
+
+$script:CdcDocumentPathPrefix = @(
+    'reference/design/backend-redesign/design-docs/cdc/'
 )
 
 # Promoted-suite categories. Each names one or two integration lanes that a pull request runs only
@@ -366,6 +402,12 @@ function Get-DmsChangeCategory {
             $documentEmbedsRelevant = $true
         }
 
+        # Checked runbook inputs outside eng/ and src/ must select Contract before the general
+        # relevance filter skips them. This does not opt documentation into broader DMS jobs.
+        if (Test-DmsChangedFileMatch -Path $path -ExactPath $script:CdcDocumentExactPath -PathPrefix $script:CdcDocumentPathPrefix) {
+            $category['cdc_relevant'] = $true
+        }
+
         if (
             -not (
                 Test-DmsChangedFileMatch `
@@ -374,8 +416,8 @@ function Get-DmsChangeCategory {
                     -PathPrefix $script:DmsRelevantPathPrefix
             )
         ) {
-            # Not DMS-relevant at all - documentation, editor configuration and the like. It cannot
-            # make a promoted suite relevant either, so it must not reach the fail-open rule.
+            # Outside the general DMS tree. Dedicated document rules above may select checks,
+            # but this path must not reach the promoted-suite fail-open rule.
             continue
         }
 

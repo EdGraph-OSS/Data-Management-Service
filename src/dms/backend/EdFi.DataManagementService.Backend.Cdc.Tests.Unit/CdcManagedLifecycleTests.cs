@@ -101,6 +101,42 @@ internal class Given_CdcManagedLifecycle(Ddl.CdcProvider provider) : CdcReadines
         ResetManaged();
     }
 
+    [TestCase(CdcManagedLifecycleOperation.Start, false)]
+    [TestCase(CdcManagedLifecycleOperation.Restart, false)]
+    [TestCase(CdcManagedLifecycleOperation.Resume, false)]
+    [TestCase(CdcManagedLifecycleOperation.Start, true)]
+    [TestCase(CdcManagedLifecycleOperation.Restart, true)]
+    [TestCase(CdcManagedLifecycleOperation.Resume, true)]
+    public async Task It_starts_its_projection_executor_only_after_eligible_preflight(
+        CdcManagedLifecycleOperation operation,
+        bool missingProvenance
+    )
+    {
+        if (operation == CdcManagedLifecycleOperation.Start)
+        {
+            (await Execute(CdcManagedLifecycleOperation.Stop)).TargetShutdownVerified.Should().BeTrue();
+        }
+        if (missingProvenance)
+        {
+            Directory.Delete(Path.Combine(_root, "workflows"), true);
+        }
+        int starts = 0;
+        A.CallTo(() => _runtime.StartProcessingAsync(A<CancellationToken>._))
+            .Invokes(() =>
+            {
+                starts++;
+                (_resumes + _restarts).Should().Be(0);
+                A.CallTo(() => _runtime.ObserveEstablishedDatabaseAsync(A<CancellationToken>._))
+                    .MustHaveHappened();
+            });
+
+        var result = await Execute(operation);
+
+        starts.Should().Be(missingProvenance ? 0 : 1);
+        result.Succeeded.Should().Be(!missingProvenance);
+        (_resumes + _restarts).Should().Be(missingProvenance ? 0 : 1);
+    }
+
     private void ReplaceWorker(string identity) =>
         _workerEvidence = new(
             identity,
@@ -693,12 +729,9 @@ internal class Given_CdcManagedLifecycle(Ddl.CdcProvider provider) : CdcReadines
         _resumes.Should().Be(1);
         _restarts.Should().Be(0);
         _trace.IndexOf("offset").Should().BeLessThan(_trace.IndexOf("resume"));
-        _trace.Count(t => t == "start").Should().Be(operation == CdcManagedLifecycleOperation.Start ? 1 : 0);
-        if (operation == CdcManagedLifecycleOperation.Start)
-        {
-            _trace.IndexOf("start").Should().BeGreaterThan(_trace.IndexOf("offset"));
-            _trace.IndexOf("start").Should().BeLessThan(_trace.IndexOf("resume"));
-        }
+        _trace.Count(t => t == "start").Should().Be(1);
+        _trace.IndexOf("start").Should().BeGreaterThan(_trace.IndexOf("offset"));
+        _trace.IndexOf("start").Should().BeLessThan(_trace.IndexOf("resume"));
         _trace.IndexOf("metrics").Should().BeGreaterThan(_trace.IndexOf("resume"));
         ReadJournal().Operations.Last().Effect.Should().Be(CdcWorkflowEffect.ResumeConnector);
         ReadJournal().Operations.Last().Completions.Should().HaveCount(1);
@@ -1107,17 +1140,38 @@ internal class Given_CdcManagedLifecycle(Ddl.CdcProvider provider) : CdcReadines
     [TestCase(true)]
     public async Task It_requires_fresh_post_mutation_lag_and_projection(bool backlog)
     {
-        ShortTiming(100);
+        using var deadline = new CancellationTokenSource();
         _backlog = backlog;
         _lag = backlog ? 1 : 1001;
-        var elapsed = System.Diagnostics.Stopwatch.StartNew();
-        var result = await Execute(CdcManagedLifecycleOperation.Restart);
-        elapsed
-            .Elapsed.Should()
-            .BeGreaterThanOrEqualTo(_request.Timing.WaitTimeout - TimeSpan.FromMilliseconds(20))
-            .And.BeLessThan(TimeSpan.FromSeconds(3));
+        bool completionPersisted = false;
+        int catchUpObservations = 0;
+        _onWrite = boundary =>
+        {
+            if (boundary == CdcWorkflowWriteBoundary.AfterAtomicReplacement && _restarts > 0)
+            {
+                ReadJournal().Operations.Last().Completions.Should().ContainSingle();
+                completionPersisted = true;
+            }
+        };
+        _onCall = call =>
+        {
+            if (call == "metrics" && completionPersisted && ++catchUpObservations == 2)
+            {
+                // Let the first post-completion pass reject lag/backlog before ending catch-up.
+                deadline.Cancel();
+            }
+        };
+        var result = await _managed.ExecuteAsync(
+            new(_request, _runtime, 1000),
+            CdcManagedLifecycleOperation.Restart,
+            operationDeadline: deadline.Token
+        );
+        completionPersisted.Should().BeTrue();
+        catchUpObservations.Should().BeGreaterThanOrEqualTo(2);
+        deadline.IsCancellationRequested.Should().BeTrue();
         result.Diagnostics.Should().Contain(d => d.Failure == CdcDeploymentFailure.Timeout);
         ReadJournal().Operations.Last().Completions.Should().ContainSingle();
+        ReadJournal().WriterPublicationAuthorized.Should().BeFalse();
         _restarts.Should().Be(1);
         result.Ready.Should().BeFalse();
         result.Succeeded.Should().BeFalse();

@@ -26,7 +26,9 @@ public class ApplicationModule : IEndpointModule
     {
         endpoints.MapSecuredPost("/v3/applications/", InsertApplication);
         endpoints.MapSecuredGet("/v3/applications/", GetAll).Produces<List<ApplicationResponse>>(200);
-        endpoints.MapSecuredGet($"/v3/applications/{{id}}", GetById).Produces<ApplicationResponse>(200);
+        // Limited access: DMS reads an application's profile assignments through this endpoint, so the
+        // limited scope its service account uses for its other reads must cover it too.
+        endpoints.MapLimitedAccess($"/v3/applications/{{id}}", GetById).Produces<ApplicationResponse>(200);
         endpoints.MapSecuredPut($"/v3/applications/{{id}}", Update);
         endpoints.MapSecuredDelete($"/v3/applications/{{id}}", Delete);
 
@@ -384,8 +386,8 @@ public class ApplicationModule : IEndpointModule
     /// <summary>
     /// Validates that every requested profile id exists. Throws a ValidationException
     /// when one is missing, returns a failure result for infrastructure errors, and
-    /// returns null when the request is valid. Profiles are not tenant-scoped, so this
-    /// existence check mirrors the repository's foreign-key validation exactly.
+    /// returns null when the request is valid. The profile lookup is tenant-scoped, so a profile
+    /// created in another tenant is reported exactly like a missing one.
     /// </summary>
     private static async Task<IResult?> ValidateProfileIdsExist(
         int[] profileIds,
