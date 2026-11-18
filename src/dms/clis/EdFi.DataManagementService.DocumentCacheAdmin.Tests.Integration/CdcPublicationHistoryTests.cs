@@ -84,6 +84,7 @@ public sealed class Given_CdcPublicationHistory_packaged_administration(bool mss
         {
             await _fixture.PrepareAsync(command);
             string before = await _fixture.SnapshotAsync();
+            string stampsBefore = await _fixture.ReadAuthoritativeStampsAsync();
             JsonObject result = ReadResult(
                 await _fixture.Harness.RunAsync(_fixture.Arguments(command)),
                 command,
@@ -91,6 +92,7 @@ public sealed class Given_CdcPublicationHistory_packaged_administration(bool mss
             );
             result["mutated"]!.GetValue<bool>().Should().BeTrue();
             (await _fixture.SnapshotAsync()).Should().NotBe(before);
+            (await _fixture.ReadAuthoritativeStampsAsync()).Should().Be(stampsBefore);
             (
                 await _fixture.QueryAsync(
                     "SELECT \"ProjectionLifecycleState\",\"CacheAheadRecoveryRequired\" FROM dms.\"DocumentCacheState\""
@@ -267,10 +269,9 @@ public sealed class Given_CdcPublicationHistory_packaged_administration(bool mss
             await using (var session = await _fixture.AcquireAsync())
             {
                 process = _fixture.Harness.Start(_fixture.Arguments(command));
-                await WaitAsync(() =>
-                    Task.FromResult(_fixture.Harness.ConfigurationService.DataStoresRequestCount > 0)
-                );
-                (await process.TryWaitForExitAsync(TimeSpan.FromSeconds(1))).Should().BeNull();
+                await process.WaitForControllerLockContentionAsync(TimeSpan.FromSeconds(30));
+                process.HasExited.Should().BeFalse();
+                _evidence.Enqueue(new { phase = "controller-lock-contended", at = DateTimeOffset.UtcNow });
                 (await _fixture.MutexWaitersAsync())
                     .Should()
                     .Be("[[0]]", "the controller lock must be acquired before entering the provider mutex");

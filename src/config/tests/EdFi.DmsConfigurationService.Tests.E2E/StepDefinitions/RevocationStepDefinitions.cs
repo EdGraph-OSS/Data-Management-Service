@@ -90,6 +90,13 @@ public partial class StepDefinitions
             BasicAuthorization(_lastClientId, $"{_lastClientSecret}-wrong")
         );
 
+    [When("a revocation of a {int}-character token is attempted with the current client's Basic credentials")]
+    public async Task WhenARevocationOfATokenOfALengthIsAttempted(int length) =>
+        await PostRevocation(
+            new() { { "token", TokenOfLength(length) } },
+            BasicAuthorization(_lastClientId, _lastClientSecret)
+        );
+
     [When("a revocation of the current token is attempted with the credentials captured as {string}")]
     public async Task WhenARevocationIsAttemptedWithTheCredentialsCapturedAs(string slot)
     {
@@ -182,9 +189,11 @@ public partial class StepDefinitions
 
     /// <summary>
     /// The self-contained provider is observed through CMS <c>/connect/introspect</c>, which checks
-    /// the token's stored status. Keycloak access tokens are observed through Keycloak's own
-    /// introspection endpoint by the feature's dedicated observer client, whose credentials are
-    /// never sent to revocation (D-16). Does not replace the scenario's last response.
+    /// the token's stored status; the observer authenticates with HTTP Basic as the token's owner
+    /// (the scenario's current client), the only caller introspection reports on. Keycloak access
+    /// tokens are observed through Keycloak's own introspection endpoint by the feature's dedicated
+    /// observer client, whose credentials are never sent to revocation (D-16). Does not replace the
+    /// scenario's last response.
     /// </summary>
     private async Task<bool> IsTokenActive(string token)
     {
@@ -198,6 +207,7 @@ public partial class StepDefinitions
             Headers = new Dictionary<string, string>
             {
                 { "Content-Type", "application/x-www-form-urlencoded" },
+                { "Authorization", BasicAuthorization(_lastClientId, _lastClientSecret) },
             },
             Data = await new FormUrlEncodedContent(
                 new Dictionary<string, string> { { "token", token } }

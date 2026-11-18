@@ -29,7 +29,9 @@ internal sealed partial class CdcConnectorTemplatePinnedImageFixture
     private async Task PrepareControllerComposeAsync(CancellationToken token)
     {
         var directory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
-        while (!File.Exists(Path.Combine(directory.FullName, "eng", "docker-compose", "kafka-cdc.yml")))
+        while (
+            !File.Exists(Path.Combine(directory.FullName, "eng", "docker-compose", "kafka-cdc.compose.yml"))
+        )
         {
             directory =
                 directory.Parent ?? throw new DirectoryNotFoundException("Repository root unavailable.");
@@ -45,7 +47,7 @@ internal sealed partial class CdcConnectorTemplatePinnedImageFixture
         }
         // Retained wrapper handoffs inventory the neighboring broker file. Keep both
         // shipped Compose files together so their relative inheritance and CDC overrides survive.
-        foreach (string file in new[] { "kafka-broker.yml", "kafka-cdc.yml" })
+        foreach (string file in new[] { "kafka-broker.compose.yml", "kafka-cdc.compose.yml" })
         {
             await File.WriteAllTextAsync(
                 Path.Combine(_controllerComposeDirectory, file),
@@ -56,7 +58,7 @@ internal sealed partial class CdcConnectorTemplatePinnedImageFixture
                 token
             );
         }
-        string shipped = Path.Combine(_controllerComposeDirectory, "kafka-cdc.yml");
+        string shipped = Path.Combine(_controllerComposeDirectory, "kafka-cdc.compose.yml");
         // Only isolate names, network and ports and select a small initial size. Inherit the
         // shipped broker image, storage layout, startup command and worker deployment.
         var services = new Dictionary<string, object>
@@ -132,21 +134,28 @@ internal sealed partial class CdcConnectorTemplatePinnedImageFixture
             );
     }
 
-    private Task<DockerCommandResult> RunControllerComposeAsync(string[] command, CancellationToken token) =>
-        _docker.RunAsync(
-            [
-                "compose",
-                "-f",
-                ControllerComposeFile,
-                "--env-file",
-                ControllerComposeEnvironment,
-                "-p",
-                ControllerProject,
-                .. (File.Exists(ControllerSizeOverride) ? new[] { "-f", ControllerSizeOverride } : []),
-                .. command,
-            ],
-            token
-        );
+    private Task<DockerCommandResult> RunControllerComposeAsync(
+        string[] command,
+        CancellationToken token,
+        bool allowingFailure = false
+    )
+    {
+        string[] arguments =
+        [
+            "compose",
+            "-f",
+            ControllerComposeFile,
+            "--env-file",
+            ControllerComposeEnvironment,
+            "-p",
+            ControllerProject,
+            .. (File.Exists(ControllerSizeOverride) ? new[] { "-f", ControllerSizeOverride } : []),
+            .. command,
+        ];
+        return allowingFailure
+            ? _docker.RunAllowingFailureAsync(arguments, token)
+            : _docker.RunAsync(arguments, token);
+    }
 
     internal async Task RecreateControllerComposeAsync(
         CdcDeploymentRequest request,
@@ -169,11 +178,89 @@ internal sealed partial class CdcConnectorTemplatePinnedImageFixture
                 ControllerSizeOverride
             )
         );
-        (await startup.StartRetainedAsync(request, token))
+        var result = await startup.StartRetainedAsync(request, token);
+        result
             .Should()
-            .BeOfType<CdcTransportResult<CdcTransportAcknowledgement>.Observed>();
+            .BeOfType<CdcTransportResult<CdcTransportAcknowledgement>.Observed>(
+                "{0}",
+                JsonSerializer.Serialize(result, result.GetType())
+            );
         await WaitForKafkaConnectAsync(token);
         await AssertControllerMetricsPrerequisiteAsync(token);
+    }
+
+    internal ICdcKafkaAuthorizationInspection CreateControllerKafkaAuthorizationInspection() =>
+        new CdcComposeKafkaAuthorizationInspection(
+            ControllerProject,
+            ControllerKafkaBootstrapServers,
+            KafkaBootstrapServers
+        );
+
+    internal async Task<string> ComposeKafkaFeaturesAsync(CancellationToken token) =>
+        (
+            await _docker.RunAsync(
+                [
+                    "exec",
+                    BrokerContainerName,
+                    "/opt/kafka/bin/kafka-features.sh",
+                    "--bootstrap-server",
+                    KafkaBootstrapServers,
+                    "describe",
+                ],
+                token
+            )
+        ).StandardOutput;
+
+    internal async Task<string> ComposeKafkaStorageIdentityAsync(
+        string expectedImage,
+        CancellationToken token
+    )
+    {
+        using var inspected = JsonDocument.Parse(
+            (await _docker.RunAsync(["inspect", BrokerContainerName], token)).StandardOutput
+        );
+        inspected
+            .RootElement[0]
+            .GetProperty("Config")
+            .GetProperty("Image")
+            .GetString()
+            .Should()
+            .Be(expectedImage);
+        string identity = (
+            await _docker.RunAsync(
+                ["exec", BrokerContainerName, "cat", "/tmp/kraft-combined-logs/meta.properties"],
+                token
+            )
+        ).StandardOutput;
+        string ownership = (
+            await _docker.RunAsync(
+                [
+                    "exec",
+                    BrokerContainerName,
+                    "stat",
+                    "-c",
+                    "%u:%g",
+                    "/tmp/kraft-combined-logs",
+                    "/tmp/kraft-combined-logs/meta.properties",
+                    "/tmp/kraft-combined-logs/__cluster_metadata-0",
+                ],
+                token
+            )
+        ).StandardOutput;
+        ownership
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Should()
+            .OnlyContain(owner => owner == "1000:1000");
+        string config = (
+            await _docker.RunAsync(
+                ["exec", BrokerContainerName, "cat", "/opt/kafka/config/server.properties"],
+                token
+            )
+        ).StandardOutput;
+        config.Should().Contain("controller.quorum.voters=1@dms-kafka1:9093");
+        config.Should().Contain("process.roles=broker,controller");
+        config.Should().Contain("node.id=1");
+        return identity;
     }
 
     internal async Task<string> ComposeBrokerContainerIdAsync(CancellationToken token) =>

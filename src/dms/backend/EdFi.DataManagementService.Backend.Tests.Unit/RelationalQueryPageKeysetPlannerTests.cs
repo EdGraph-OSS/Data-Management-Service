@@ -100,7 +100,7 @@ public class Given_RelationalQueryPageKeysetPlanner
                             new QualifiedResourceName("Ed-Fi", "SchoolCategoryDescriptor")
                         ),
                         "uri://schoolCategoryDescriptor",
-                        new PreprocessedRelationalQueryValue.DescriptorDocumentId(800L)
+                        new PreprocessedRelationalQueryValue.DescriptorId(17)
                     ),
                 ]
             ),
@@ -126,7 +126,73 @@ public class Given_RelationalQueryPageKeysetPlanner
         keyset.ParameterValues["classStartTime"].Should().Be(new TimeOnly(10, 30, 0));
         keyset.ParameterValues["nameOfInstitution"].Should().Be("Lincoln High");
         keyset.ParameterValues["id"].Should().Be(Guid.Parse("11111111-1111-1111-1111-111111111111"));
-        keyset.ParameterValues["schoolCategoryDescriptor"].Should().Be(800L);
+        keyset.ParameterValues["schoolCategoryDescriptor"].Should().BeOfType<int>().Which.Should().Be(17);
+    }
+
+    [Test]
+    public void It_should_declare_a_root_string_filter_with_its_mapped_column_length_and_leave_other_filters_untyped()
+    {
+        var planner = new RelationalQueryPageKeysetPlanner(SqlDialect.Mssql);
+        var keyset = planner.Plan(
+            CreateRootTable(),
+            new RelationalQueryPreprocessingResult(
+                new RelationalQueryPreprocessingOutcome.Continue(),
+                [
+                    CreateElement(
+                        "nameOfInstitution",
+                        "$.nameOfInstitution",
+                        "string",
+                        new RelationalQueryFieldTarget.RootColumn(new DbColumnName("NameOfInstitution")),
+                        "Lincoln High",
+                        new PreprocessedRelationalQueryValue.Raw("Lincoln High")
+                    ),
+                    CreateElement(
+                        "schoolId",
+                        "$.schoolId",
+                        "number",
+                        new RelationalQueryFieldTarget.RootColumn(new DbColumnName("SchoolId")),
+                        "456",
+                        new PreprocessedRelationalQueryValue.Raw("456")
+                    ),
+                    CreateElement(
+                        "schoolCategoryDescriptor",
+                        "$.schoolCategoryDescriptor",
+                        "string",
+                        new RelationalQueryFieldTarget.DescriptorIdColumn(
+                            new DbColumnName("SchoolCategoryDescriptorId"),
+                            new QualifiedResourceName("Ed-Fi", "SchoolCategoryDescriptor")
+                        ),
+                        "uri://schoolCategoryDescriptor",
+                        new PreprocessedRelationalQueryValue.DescriptorId(17)
+                    ),
+                ]
+            ),
+            new CollectionPaging.Traditional(
+                new PaginationParameters(Limit: null, Offset: null, TotalCount: true, MaximumPageSize: 500)
+            )
+        );
+
+        foreach (
+            var inventory in new[]
+            {
+                keyset.Plan.PageParametersInOrder,
+                keyset.Plan.TotalCountParametersInOrder!.Value,
+            }
+        )
+        {
+            inventory
+                .Single(parameter => parameter.ParameterName == "nameOfInstitution")
+                .Binding.Should()
+                .Be(QuerySqlParameterBinding.CreateString(75));
+            inventory
+                .Single(parameter => parameter.ParameterName == "schoolId")
+                .Binding.Should()
+                .Be(QuerySqlParameterBinding.Scalar);
+            inventory
+                .Single(parameter => parameter.ParameterName == "schoolCategoryDescriptor")
+                .Binding.Should()
+                .Be(QuerySqlParameterBinding.Scalar);
+        }
     }
 
     [Test]
@@ -1597,6 +1663,55 @@ public class Given_RelationalQueryPageKeysetPlanner
         act.Should().Throw<InvalidOperationException>().WithMessage("*mirrored Int64 'ContentVersion'*");
     }
 
+    [TestCase(SqlDialect.Pgsql, ScalarKind.Int64)]
+    [TestCase(SqlDialect.Mssql, ScalarKind.Int64)]
+    [TestCase(SqlDialect.Pgsql, null)]
+    [TestCase(SqlDialect.Mssql, null)]
+    public void It_should_reject_descriptor_filters_without_int32_storage_metadata(
+        SqlDialect dialect,
+        ScalarKind? scalarKind
+    )
+    {
+        var root = CreateRootTable();
+        var descriptorColumn = root.Columns.Single(column => column.Kind is ColumnKind.DescriptorFk) with
+        {
+            ScalarType = scalarKind is null ? null : new RelationalScalarType(scalarKind.Value),
+        };
+        root = root with
+        {
+            Columns = root
+                .Columns.Select(column => column.Kind is ColumnKind.DescriptorFk ? descriptorColumn : column)
+                .ToArray(),
+        };
+        var preprocessingResult = new RelationalQueryPreprocessingResult(
+            new RelationalQueryPreprocessingOutcome.Continue(),
+            [
+                CreateElement(
+                    "schoolCategoryDescriptor",
+                    "$.schoolCategoryDescriptor",
+                    "string",
+                    new RelationalQueryFieldTarget.DescriptorIdColumn(
+                        new DbColumnName("SchoolCategoryDescriptorId"),
+                        new QualifiedResourceName("Ed-Fi", "SchoolCategoryDescriptor")
+                    ),
+                    "uri://Example#Value",
+                    new PreprocessedRelationalQueryValue.DescriptorId(42)
+                ),
+            ]
+        );
+
+        var act = () =>
+            new RelationalQueryPageKeysetPlanner(dialect).Plan(
+                root,
+                preprocessingResult,
+                new CollectionPaging.Traditional(
+                    new PaginationParameters(Limit: 25, Offset: 0, TotalCount: true, MaximumPageSize: 500)
+                )
+            );
+
+        act.Should().Throw<InvalidOperationException>().WithMessage("*Int32 descriptor FK metadata*");
+    }
+
     private static DbTableModel CreateRootTable()
     {
         return CreateRootTable(
@@ -1649,7 +1764,7 @@ public class Given_RelationalQueryPageKeysetPlanner
                 CreateColumn(
                     "SchoolCategoryDescriptorId",
                     ColumnKind.DescriptorFk,
-                    new RelationalScalarType(ScalarKind.Int64)
+                    new RelationalScalarType(ScalarKind.Int32)
                 ),
                 CreateColumn(
                     "OffsetQueryField",

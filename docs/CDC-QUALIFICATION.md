@@ -16,7 +16,7 @@ They describe the evidence below, not a claim that this story qualifies every be
 | [Absent-connector retirement](../src/dms/backend/EdFi.DataManagementService.Backend.Cdc.Tests.Integration/CdcRetirementOffsetStoreTests.cs) / both providers | Pre-registration provider cleanup using production REST/Kafka adapters; actual pinned-worker offset keys, retained-offset rejection, exact tombstones and unchanged shared storage. Kafka policy qualification also checks existing administrator authority, denied access, unchanged ACLs and no new consumer groups | CDC-INV-12 |
 | [Provider artifact cleanup](../src/dms/backend/EdFi.DataManagementService.Backend.Cdc.Tests.Integration/CdcArtifactCleanupProviderTests.cs) / provider history jobs | Live provider absence, retry, ownership rejection and peer preservation, using the same isolated admin servers | CDC-INV-12 |
 | [Record-size rollout](../src/dms/backend/EdFi.DataManagementService.Backend.Cdc.Tests.Integration/CdcRecordSizeIncreaseTests.cs), [producer recovery](../src/dms/backend/EdFi.DataManagementService.Backend.Cdc.Tests.Integration/CdcRecordSizeIncreaseTests.Producer.cs) / both providers | Scoped consumer/no-consumer attestation, seven interruption boundaries, renewed confirmation, ordered live capacity alignment, retained over-budget record recovery without offset reset | CDC-INV-07 (operational capacity only), 11, 12, 14 |
-| [Compose persistence](../src/dms/backend/EdFi.DataManagementService.Backend.Cdc.Tests.Integration/CdcComposePersistenceTests.cs) / both provider RecordSize jobs | Shipped broker/worker services and named data volume; verified stop and non-destructive Compose down/up; acknowledged increase through the production Compose broker-size adapter. Actual container replacement retains cluster/topic identity, public sentinel, connector configuration and committed source offsets, followed by fresh readiness validation | CDC-INV-07 (operational capacity only), 11, 12 |
+| [Compose persistence](../src/dms/backend/EdFi.DataManagementService.Backend.Cdc.Tests.Integration/CdcComposePersistenceTests.cs) / both provider RecordSize jobs | Shipped broker/worker services and named data volume; verified stop and non-destructive Compose down/up; acknowledged increase through the production Compose broker-size adapter. Fresh 4.3.2 startup and current-image broker recreation retain cluster/topic identity, public sentinel, connector configuration, storage metadata and committed source offsets, followed by fresh readiness validation | CDC-INV-07 (operational capacity only), 11, 12 |
 | [CDC wrapper tests](../eng/docker-compose/tests) (`Cdc*.Tests.ps1`) / `Contract` | Bootstrap, E2E, worker startup, stop/start and destructive cleanup ordering; explicit provider/environment/state-root forwarding | CDC-INV-01, 10, 12 |
 | [Message and consumer contracts](../src/dms/backend/Fixtures/cdc/message-contract/README.md) / `Contract` and both provider `MessageContract` jobs | Fixture and scenario traceability, focused admission, reference consumer bootstrap/continuity, published transform serialization, provider routing, broker replay, heartbeat acknowledgement and record-size enforcement. Synthetic prerequisites qualify evaluator behavior only; replay convergence does not certify lifecycle continuity | CDC-INV-02, 06, 07, 08, 09, 10, 13, 14 |
 | [API-driven Kafka E2E](../src/dms/tests/EdFi.DataManagementService.Tests.E2E/Cdc/CdcApiScenarios.cs) / both provider `ApiE2E` jobs | API CRUD, executor restart, delete-before-projection, overlap, online rebuild, unavailable evidence and terminal loss using branch-built services and owned disposable stacks | See [API scenario traceability](../eng/ci/cdc-api-e2e.ps1) |
@@ -41,7 +41,7 @@ and topic-policy inspection.
 The Kafka lane requires the marked broker retention inspection, local packaged
 `cdc-topic-policy-inspect`, authenticated allow/deny probes and separate secured/local
 required-case reports. The local case uses the existing PostgreSQL admission fixture,
-so this lane also requires the PostgreSQL and Redpanda image inputs (no external admin
+so this lane also requires the PostgreSQL image input (no external admin
 server). It exercises the shared initial-enable retry before status. Secured inspections
 use the pinned Kafka image's client tools and privately scoped broker JMX; administrator
 and denied-consumer samples retain only selected fields. Missing or duplicate cases fail
@@ -55,19 +55,34 @@ All 17 live qualification jobs—Kafka plus Admission, Lifecycle, Recovery, Reco
 
 For targeted pre-merge validation, manually dispatch Nightly CDC Qualification on the desired branch with `lane` set to `Postgresql` or `Mssql` and a specific `suite`. `suite: All` runs that provider's eight jobs; `lane: Kafka` with `suite: All` selects the Kafka job. The default `All`/`All` selection runs all 17 jobs. A specific suite without a provider lane fails rather than silently selecting another scope.
 
-The nightly workflow loads `CDC_CONNECTOR_TEMPLATE_CONNECT_IMAGE` from the checked-out `CdcQualifiedWorkerImage.json` record. This keeps the worker image aligned with the branch being qualified without maintaining a separate GitHub repository variable. Redpanda and database images still come from their `CDC_CONNECTOR_TEMPLATE_*_IMAGE` repository variables.
+The nightly workflow loads `CDC_CONNECTOR_TEMPLATE_CONNECT_IMAGE` from the checked-out `CdcQualifiedWorkerImage.json` record. The nightly workflow and the manually dispatched CDC connector-template smoke job load `CDC_CONNECTOR_TEMPLATE_POSTGRES_IMAGE` from the checked-in default in `eng/docker-compose/postgresql.compose.yml`, using `eng/ci/Get-CdcQualificationPostgresqlImage.ps1`. The qualification runner and smoke workflow select the shipped Apache Kafka image through `eng/ci/Get-CdcQualificationKafkaImage.ps1`, which requires matching digest pins in Compose and `CdcComposeBrokerSizeDeployment.BrokerImage`. SQL Server still uses the `CDC_CONNECTOR_TEMPLATE_SQLSERVER_2025_IMAGE` repository variable. No Redpanda image or compatibility lane is required.
+
+`Get-CdcQualificationPostgresqlImage.ps1` requires a digest-pinned PostgreSQL 18 or later default and fails before image pulls when the pin is missing, malformed, or too old. A stale GitHub PostgreSQL image variable cannot override it. Direct local qualification still requires `CDC_CONNECTOR_TEMPLATE_POSTGRES_IMAGE`; set it from the same script to match CI. SchemaTools also rejects older servers before provisioning (see [Database versions](OPERATIONS.md#database-versions)). The move to PostgreSQL 18 follows the [DMS-1447 closure checklist](../reference/design/backend-redesign/epics/21-storage-reduction/05-postgresql-18-and-descriptor-collation-upgrade.md#post-merge-closure-checklist).
+
+Each provider's RecordSize selection includes shipped-image Compose persistence
+(20 scenarios per provider). The required-case guard rejects results missing that
+persistence case. See [Kafka startup and persistence](KAFKA-UPGRADE.md) and the
+[dated image security assessment](KAFKA-IMAGE-SECURITY.md). Retained managed
+startup requires the deployment's original Compose fingerprint.
 
 Both workflows call [Invoke-CdcQualification.ps1](../eng/ci/Invoke-CdcQualification.ps1); its default `All` selection runs Contract and all 17 live jobs sequentially locally. `-Lane` selects one complete lane; a provider `-Suite` selects one complete CI job. Results default to a unique system temporary directory. An explicit `-ResultsDirectory` must be new and outside the checkout. CI uploads sanitized results from the runner temporary directory with 14-day retention; generated diagnostics are never committed.
 
 Qualification requires PowerShell 7.5 or newer, including direct Pester runs of the CDC lifecycle and qualification tests. Retained Compose input checks distinguish empty environment variables from absent ones; PowerShell 7.4 removes variables assigned an empty string. Check `$PSVersionTable.PSVersion` before running locally.
 
-Live lanes require Docker, .NET 10, `CDC_CONNECTOR_TEMPLATE_CONNECT_IMAGE` equal to the [shipped qualification record](../src/dms/backend/EdFi.DataManagementService.Backend.Cdc/CdcQualifiedWorkerImage.json), `CDC_CONNECTOR_TEMPLATE_REDPANDA_IMAGE`, and the selected `CDC_CONNECTOR_TEMPLATE_POSTGRES_IMAGE` / `CDC_CONNECTOR_TEMPLATE_SQLSERVER_2025_IMAGE`. The repository-pinned native Kafka image is also required. Images must exist locally unless `-PullImages` is supplied. Packaged-history tests require `ConnectionStrings__DatabaseConnection` / `ConnectionStrings__MssqlAdmin` pointing to isolated PostgreSQL / SQL Server 2025 admin servers. The contract lane, provider Admission and Lifecycle lanes require Pester 5.7.1.
+Live lanes require Docker, .NET 10, `CDC_CONNECTOR_TEMPLATE_CONNECT_IMAGE` equal to the [shipped qualification record](../src/dms/backend/EdFi.DataManagementService.Backend.Cdc/CdcQualifiedWorkerImage.json), and the selected `CDC_CONNECTOR_TEMPLATE_POSTGRES_IMAGE` / `CDC_CONNECTOR_TEMPLATE_SQLSERVER_2025_IMAGE`. The repository-pinned Apache Kafka image is also required. The runner sets `CDC_CONNECTOR_TEMPLATE_KAFKA_IMAGE` to that pin for all selected suites and restores the caller's value afterward. Direct `dotnet test` fixture runs default to the same pin; an optional `CDC_CONNECTOR_TEMPLATE_KAFKA_IMAGE` override is for candidate Apache Kafka experiments and does not qualify the shipped broker. Images must exist locally unless `-PullImages` is supplied to the qualification runner; direct smoke fixtures allow Docker to pull missing configured images during setup. Packaged-history tests require `ConnectionStrings__DatabaseConnection` / `ConnectionStrings__MssqlAdmin` pointing to isolated PostgreSQL / SQL Server 2025 admin servers. The contract lane, provider Admission and Lifecycle lanes require Pester 5.7.1.
+
+For candidate-image experiments, use direct `Category=CdcConnectorTemplateSmoke`
+runs. Controller/admission paths using `CdcComposeKafkaAuthorizationInspection`
+require the exact shipped Kafka image; overriding it can start the candidate broker
+but then return authorization `Unavailable`. The qualification runner always selects
+the shipped pin.
+
 Admission and Lifecycle also require `CDC_RUNBOOK_OWNED_STACK=1` and a disposable, exclusively owned
 local/published Compose environment with no retained containers, volumes or bootstrap
 workspace. The shared live runbook fixture requires two PostgreSQL setup cases and
 three SQL Server setup cases (local, published and direct DMS E2E); missing or skipped
 cases fail qualification independently of the controller suite. SQL Server published
-qualification tags matching branch-built application/CMS images under the published
+qualification tags matching branch-built application and Configuration Service images under the published
 Compose names and records their image IDs; it does not qualify a registry release.
 Both provider Lifecycle lanes reuse that fixture with `Procedure=Lifecycle` and require
 `CDC-DOC cdc-managed-start` in addition to the provider `CdcControllerManagedLifecycle`
@@ -90,7 +105,7 @@ Recovery. Each native-recovery attachment records snippet/scenario IDs, command
 results and immutable service image IDs. Test hooks supply failed/unverified shutdown
 and unavailable observations; real worker/task recovery, offset loss, state-file
 absence and CLI containment operate only on fixture-owned services. The fixture
-reuses the packaged-administration test CMS endpoint and runtime-compatible schema
+reuses the packaged-administration test Configuration Service endpoint and runtime-compatible schema
 workspace; the CLI loads complete matching settings and inspects live
 provider, broker, worker, offsets and metrics. Its invocation-owned projector is
 not started by status/watch, so projection health remains unavailable. Separate
@@ -137,6 +152,51 @@ cleanup supplies no platform purge or independent consumer-store evidence.
 Controller and secured-policy fixture workers use a 1 GiB maximum Java heap, checked against their declared worker policy. The controller fixture allows one minute for observation freshness across live read-back and offline shutdown; expiry cases use explicit shorter windows. SQL Server setup commands and provider calls allow three minutes; the complete invocation allows five minutes for multi-step setup and worker read-back. Each invocation isolates its temporary files from prior test runs. CI provisions those history servers; controller fixtures own and remove their separate resources.
 
 `qualification.json` records every suite's counts and outcome. Empty selection, missing/inconsistent reports, skipped cases and nonzero process exits fail qualification. Prerequisite failures are labeled `EnvironmentUnavailable`; they are not passing behavior evidence. No automatic retry replaces a failed test scenario or suite run. Structured JSON attachments retain controller boundaries, provider/lag observations, recovery, rollout, history and cleanup evidence, linked from TRX results. Fixture validation diagnostics retain bounded code locations without exception messages or values. Public TRX files omit raw assertion output; raw logs stay in a private temporary directory and are never uploaded.
+
+When the live E2E setup wrapper fails with `CDC_RUNBOOK_EVIDENCE_DIRECTORY` set,
+its `cdc-runbook-e2e-setup-*.json` record includes a `worker` snapshot captured before
+governed cleanup. Discovery is restricted to the selected Compose project's
+`kafka-cdc-worker` service; zero or multiple matches are reported without inspecting
+another container. Collection shares a ten-second deadline across discovery, inspection,
+and logs, with at most 16 KiB retained from each output pipe (32 KiB total per command) and
+100 recent log lines requested. Log collection drains through EOF or the shared deadline,
+keeping the newest bytes in fixed buffers so earlier verbose lines cannot displace a late
+failure signature. Discovery and inspection stop when either pipe reaches its limit.
+Truncated logs report `OutputLimit`; deadline exhaustion reports `TimedOut`.
+The snapshot contains only state flags, exit/restart
+counts, health status, collection stage/status, and fixed Java out-of-memory and broker
+connection failure signatures. Unknown signatures and incomplete collection are explicit;
+signatures are hints, not confirmed causes. Raw log text, health-check output, configuration,
+and exception messages are never exported. The original admission failure codes and
+subsequent cleanup outcome remain separate, even if diagnostic collection fails.
+
+### API E2E cleanup failures
+
+When API E2E scenarios pass but teardown fails, open the artifact
+`cdc-qualification-<Provider>-ApiE2E-<attempt>` and inspect the `Cleanup` object in
+`<Provider>-ApiE2E/cdc-api-e2e.json`. The Actions log also prints the provider,
+first failed cleanup step (or last started step if interrupted), and cleanup process outcome.
+
+- `Steps` records running and completed checkpoints with UTC start times, durations,
+  command categories, and allowlisted exception/source metadata. It distinguishes ownership
+  and deployment validation, controller retirement, worker verification, Compose teardown,
+  runtime/bootstrap cleanup, image removal, resource verification, and final state cleanup.
+  A `Running` checkpoint without a completion can indicate an interrupted child process;
+  consult `Process` for its exit code, failure kind and timeout status.
+- `ChildFailures` retains the existing lifecycle diagnostics, including controller exit codes
+  and fixed failure classifications, before outer catches replace their error messages.
+- `RemainingResources` is a fresh, bounded observation after cleanup, including failures.
+  It is separate from `RuntimeInputs.OwnedCounts`, which is the **pre-cleanup** inventory.
+  A missing count means its probe failed or did not run, not that no resources remain.
+
+The cleanup child writes checkpoints incrementally. If it times out, the parent retains the
+process result and attempts the remaining-resource probes before export. Collection and
+export have size limits; `Missing`, `Partial`, `Invalid`, `IdentityMismatch`, or `Oversized`
+identify unavailable/incomplete evidence. Diagnostics do not authorize cleanup, suppress its
+failure, or replace the scenario results. Raw exception messages, command arguments, resource
+names, stdout and stderr remain private; only explicitly allowed fields enter the existing
+always-uploaded artifact, retained for 14 days. A runner cancellation or loss before export
+can still prevent artifact publication.
 
 With `-PullImages`, each prerequisite image gets at most three pull attempts, with waits of five and fifteen seconds after failures. Exhausting those attempts reports `EnvironmentUnavailable` before any suite starts. The uploaded `image-pulls.jsonl` retains one JSON record per attempt, including failures followed by a successful retry: image reference, attempt/budget, UTC start time, duration, exit code, outcome, failure category, next retry delay, and private log filename. Categories distinguish rate limits, authorization, missing images, disk exhaustion, DNS, TLS, timeouts, connection failures, and registry availability; unrecognized errors are `Unknown`. These classifications are diagnostic hints from Docker output, not confirmed underlying causes. The corresponding `pull-<id>-<attempt>.log` files preserve complete output under the private temporary directory printed by the runner. Raw logs are never uploaded, and unsafe image references are redacted from public evidence and console messages.
 

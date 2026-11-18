@@ -30,6 +30,53 @@ earlier versions reject, so on PostgreSQL 13 or 14 the upgrade stops and the
 Configuration Service does not start. Upgrade PostgreSQL before upgrading the
 Configuration Service.
 
+DMS requires PostgreSQL 18 or later with a UTF-8 database encoding. Descriptor
+identity will depend on PostgreSQL's builtin `pg_c_utf8` collation, which exists
+only in UTF-8 databases. A server shared by DMS and the Configuration Service must
+meet the DMS floor. SQL Server deployments are unaffected.
+
+SchemaTools (`ddl provision`) checks both requirements before it runs any DDL:
+
+- With `--create-database`, it first connects to the server's `postgres`
+  maintenance database and checks `server_version_num` (at least `180000`) and the
+  encoding of the target database if it exists, or of `template1` if it does not.
+  Only then does it run `CREATE DATABASE "<name>" ENCODING 'UTF8'`. It does not
+  select `template0` or a locale to force UTF-8 onto a cluster whose `template1`
+  is not UTF-8; initialize such a cluster with a UTF-8 encoding instead.
+- Before any DDL, with or without `--create-database`, it checks the server
+  version and the encoding of the target database itself.
+
+A failed check stops provisioning before anything is created and prints this
+message, followed by the value that failed:
+
+```text
+DMS requires PostgreSQL 18 or later with a UTF-8 database encoding. Upgrade the server to PostgreSQL 18 or later and provision into a UTF-8 database; when SchemaTools creates the database, the server's template1 database must be UTF-8. Detected: server_version_num 170000.
+```
+
+The detected value is `server_version_num <n>`, `target database encoding <encoding>`
+or `template1 encoding <encoding>`. Managed (CDC) provisioning checks the server
+before it records the database-creation intent, so after upgrading the server the
+same command can be run again.
+
+PostgreSQL cannot change the encoding of an existing database. A database that
+is not UTF-8 must be re-created as UTF-8 and its data moved into it, for example
+with `pg_dump` and `pg_restore`, before DMS is upgraded.
+
+**Docker volumes created before PostgreSQL 18.** From PostgreSQL 18 the official
+`postgres` image keeps its cluster in a versioned directory below a volume mounted
+at `/var/lib/postgresql`, where earlier images mounted the volume at
+`/var/lib/postgresql/data`. A PostgreSQL 16 volume mounted at the new location is
+not read: PostgreSQL 18 initializes a new, empty cluster beside the old files.
+Before the first start on 18, either remove the old volume (its data is lost) or
+upgrade it with `pg_upgrade`. This applies to developer volumes from
+`eng/docker-compose/postgresql.compose.yml`. The security-review VM's `update.sh` refuses
+to update such a volume; see
+[its update runbook](../eng/azure-vm/provision/UPDATE.md#part-b-update-to-a-newer-build--bash).
+
+A later PostgreSQL major upgrade can change how `pg_c_utf8` folds case. Follow
+[PostgreSQL major upgrades](POSTGRESQL-MAJOR-UPGRADE.md) before reopening DMS to
+writes after such an upgrade.
+
 ## Plugins
 
 A plugin is a directory of already-published assemblies that the Ed-Fi API loads at
@@ -129,7 +176,7 @@ holds the plugin directories.
 
 # Plugin acquisition, recipe 1: a pre-populated plugin root, bind-mounted read-only.
 #
-# Add with its own -f. It is an alternative to plugins-fetch-dms.yml rather than an addition
+# Add with its own -f. It is an alternative to plugins-fetch-dms.compose.yml rather than an addition
 # to it: /app/plugins is one mount target and two overlays cannot both claim it.
 #
 # DMS_PLUGINS_MOUNT_SOURCE is declared with :? rather than a default. A deployment that
@@ -161,7 +208,7 @@ mounts that volume read-only exactly as in Recipe 1.
 The three required values are `PLUGIN_PACKAGE_URL`, `PLUGIN_PACKAGE_SHA256`, and
 `PLUGIN_NAME`.
 
-<!-- embed: eng/docker-compose/plugins-fetch-dms.yml -->
+<!-- embed: eng/docker-compose/plugins-fetch-dms.compose.yml -->
 ```yaml
 # SPDX-License-Identifier: Apache-2.0
 # Licensed to the Ed-Fi Alliance under one or more agreements.
@@ -193,9 +240,9 @@ services:
   fetch-plugins:
     # Pinned by digest, as every third-party image in this directory already is. An operator may
     # re-pin to an image they have approved; a mutable tag would leave the step that verifies the
-    # package digest running on bytes nobody pinned. This one is alpine:3.22, carrying BusyBox
+    # package digest running on bytes nobody pinned. This one is alpine:3.24.3, carrying BusyBox
     # 1.37.0, whose wget, sha256sum and unzip are the four commands below.
-    image: alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+    image: alpine@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
     environment:
       PLUGIN_PACKAGE_URL: ${PLUGIN_PACKAGE_URL:?set the .nupkg download address}
       PLUGIN_PACKAGE_SHA256: ${PLUGIN_PACKAGE_SHA256:?set the SHA-256 of the pinned .nupkg}
@@ -267,7 +314,7 @@ by no `.deps.json`, and the next person to read that directory cannot tell which
 version they are looking at.
 
 **The `fetch-plugins` image is pinned by digest**, following the convention every
-third-party image in `eng/docker-compose/` already uses — `postgresql.yml` pins its
+third-party image in `eng/docker-compose/` already uses — `postgresql.compose.yml` pins its
 Postgres image the same way. The committed digest is a real, pullable `alpine` 3.22
 image, so the recipe is runnable as it stands rather than a placeholder that must be
 replaced before it works. An operator may re-pin it to an image they have approved; a
@@ -310,7 +357,7 @@ spec:
   initContainers:
     - name: fetch-plugins
       # Pinned by digest for the same reason the Compose recipe pins it.
-      image: alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+      image: alpine@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
       env:
         # Supply these from a ConfigMap, or from a Secret when the feed address
         # carries credentials. They are the deployment's own values, exactly as the
@@ -538,9 +585,9 @@ stops it before it serves a request, and the reason is on standard error; see
 #### Recipe 1 for the Configuration Service: a pre-populated plugin root
 
 `plugins-config.yml` is the Configuration Service counterpart of `plugins-dms.yml`.
-`CMS_PLUGINS_MOUNT_SOURCE` is the one required value: the host path that holds the
+`CONFIGURATION_SERVICE_PLUGINS_MOUNT_SOURCE` is the one required value: the host path that holds the
 Configuration Service's plugin directories. Add the file with its own `-f` after
-`local-config.yml` or `published-config.yml`, followed by a deployment-owned
+`local-config.compose.yml` or `published-config.compose.yml`, followed by a deployment-owned
 override that sets `Plugins__Allowed` on the `config` service, because this overlay
 allowlists nothing. When the plugin serves secrets from a vault, that override also
 removes them from the environment; see
@@ -556,22 +603,22 @@ removes them from the environment; see
 # Plugin acquisition for the Configuration Service: a pre-populated plugin root, bind-mounted
 # read-only. The Configuration Service counterpart of plugins-dms.yml, which it mirrors.
 #
-# Add with its own -f, after local-config.yml or published-config.yml, both of which it leaves
+# Add with its own -f, after local-config.compose.yml or published-config.compose.yml, both of which it leaves
 # unchanged. start-local-config.ps1 has no setting that adds it: DMS_PLUGINS_COMPOSE_FILES is the
 # Data Management Service launchers' setting for DMS overlays, not a Configuration Service one.
 #
-# CMS_PLUGINS_MOUNT_SOURCE is declared with :? rather than a default. A deployment that composed
+# CONFIGURATION_SERVICE_PLUGINS_MOUNT_SOURCE is declared with :? rather than a default. A deployment that composed
 # this file in meant to supply a host path, and a silent default would make Docker materialize an
 # empty root-owned directory beside it, which is exactly what keeping the mount out of the base
 # files avoids.
 #
 # Acquiring the bytes does not enable them. Nothing here writes Plugins:Allowed; the allowlist is
-# a separate deployment-owned setting on the config service. See eng/docker-compose/README.md,
+# a separate deployment-owned setting on the Configuration Service. See eng/docker-compose/README.md,
 # "Loading plugins into the Configuration Service".
 services:
   config:
     volumes:
-      - ${CMS_PLUGINS_MOUNT_SOURCE:?set the host path holding the plugin directories}:/app/plugins:ro
+      - ${CONFIGURATION_SERVICE_PLUGINS_MOUNT_SOURCE:?set the host path holding the plugin directories}:/app/plugins:ro
 ```
 
 `DMS_PLUGINS_COMPOSE_FILES` is the DMS launchers' setting and does not add this
@@ -587,9 +634,9 @@ the target directory, and extract the plugin directory. Only where the result is
 mounted differs. Either of two forms does it:
 
 - **Into the host path Recipe 1 mounts.** Run the four commands as a deployment step
-  that extracts into the directory `CMS_PLUGINS_MOUNT_SOURCE` names, then compose
+  that extracts into the directory `CONFIGURATION_SERVICE_PLUGINS_MOUNT_SOURCE` names, then compose
   `plugins-config.yml` exactly as in Recipe 1. Nothing about the overlay changes.
-- **Into a volume, as `plugins-fetch-dms.yml` does for DMS.** Copy that file into the
+- **Into a volume, as `plugins-fetch-dms.compose.yml` does for DMS.** Copy that file into the
   deployment and point its last service block at `config` instead of `dms`. When DMS
   also uses Recipe 2 in the same Compose project, rename the `fetch-plugins` service
   and the `plugins` volume as well, because the two files would otherwise define one
@@ -607,7 +654,7 @@ because no committed file is their artifact.
 
 ### The Compose blocks above are asserted equal to the committed files
 
-`eng/docker-compose/plugins-dms.yml`, `eng/docker-compose/plugins-fetch-dms.yml`, and
+`eng/docker-compose/plugins-dms.yml`, `eng/docker-compose/plugins-fetch-dms.compose.yml`, and
 `eng/docker-compose/plugins-config.yml` are the artifact. The end-to-end tiers run
 those files as committed, and a check in this repository compares each block above
 against its file, so a chapter edited without the file — or a file edited without the
@@ -621,15 +668,15 @@ For running the recipes against a local development stack through
 
 ### Secrets on the shipped Compose files
 
-A secret a plugin serves from a vault must not also be supplied by the environment,
-because an environment variable outranks every plugin source; see
-[Secrets](./SECRETS.md#the-process-global-secrets-phase-a-serves). The shipped
-Compose files map five of those secrets from `.env` variables, and deleting a
-variable does not remove the mapping: Compose sets the key to an empty string, which
-outranks the vault. An empty `DatabaseSettings__EncryptionKey` stops the
-Configuration Service at startup. The others do not: the host starts and then fails
-requests, and an empty `IdentitySettings__EncryptionKey` fails only once the
-self-contained identity provider issues its first token.
+A secret a plugin serves from a vault must not also be supplied by the environment, because an environment variable outranks every plugin source; see [Secrets](./SECRETS.md#the-process-global-secrets-phase-a-serves).
+The shipped Compose files map six of those secrets from `.env` variables, and deleting a variable does not remove the mapping.
+For five of them, `local-dms.compose.yml` and `local-config.compose.yml` set the key to an empty string, which outranks the vault.
+An empty `DatabaseSettings__EncryptionKey` stops the Configuration Service at startup.
+The others do not: the host starts and then fails requests, and an empty `IdentitySettings__EncryptionKey` fails only once the self-contained identity provider issues its first token.
+`published-dms.compose.yml` and `published-config.compose.yml` require both encryption-key variables instead, which feed three mappings: `CONFIGURATION_SERVICE_DATABASE_ENCRYPTION_KEY` feeds `ConfigurationServiceSettings__EncryptionKey` on `dms` and `DatabaseSettings__EncryptionKey` on `config`, and `CONFIGURATION_SERVICE_IDENTITY_ENCRYPTION_KEY` feeds `IdentitySettings__EncryptionKey` on `config`.
+Deleting either variable stops `docker compose config`, `up` and `down` with an error that names it; only teardown through `start-published-dms.ps1 -d` supplies an inert placeholder for a missing value.
+In those files only the two client secrets still become empty strings.
+The sixth, `DatabaseSettings__DatabaseConnection`, is mapped only on `config` and has a default in `local-config.compose.yml` and `published-config.compose.yml`, so deleting its variable sends the Configuration Service to the bundled `dms-postgresql` database instead of the one the vault names.
 
 Remove each key the vault serves in the same deployment-owned override that sets
 `Plugins__Allowed`, with `!reset null`. A service block goes only in the override for
@@ -645,6 +692,7 @@ services:
       ConfigurationServiceSettings__EncryptionKey: !reset null
   config:
     environment:
+      DatabaseSettings__DatabaseConnection: !reset null
       DatabaseSettings__EncryptionKey: !reset null
       IdentitySettings__ClientSecret: !reset null
       IdentitySettings__EncryptionKey: !reset null
@@ -653,13 +701,69 @@ services:
 List only the keys the vault actually serves. Keep the matching `.env` variables
 set: the reset already keeps their values out of the containers, and the local
 launch scripts read them directly to register identity clients and provision
-databases. `DMS_CONFIG_DATABASE_ENCRYPTION_KEY` feeds both
+databases. For the two encryption-key variables the published files enforce this: Compose
+interpolates every file before it applies `!reset null`, so a deleted variable stops
+Compose even when the override resets its key.
+`CONFIGURATION_SERVICE_DATABASE_ENCRYPTION_KEY` feeds both
 `DatabaseSettings__EncryptionKey` on `config` and
 `ConfigurationServiceSettings__EncryptionKey` on `dms`, so clearing it for one host
-would blank the key the other still reads from the environment. Do not reset
-`DatabaseSettings__DatabaseConnection`: the stock Configuration Service entry point
-reads it before .NET starts, so it stays in the environment, as
-[Secrets](./SECRETS.md) describes.
+would blank the key the other still reads from the environment. With the connection
+string removed, the stock Configuration Service entry point skips its database wait
+and .NET reports a connection error itself if the database is not ready yet, so keep
+a restart policy on `config`, as [Secrets](./SECRETS.md) describes.
+
+Where the override sits decides whether its `config` block applies.
+`DMS_PLUGINS_COMPOSE_FILES` is the DMS launchers' hook for DMS overlays: both launchers
+insert its files right after the DMS service file and before `local-config.compose.yml` or
+`published-config.compose.yml`. The `dms` block works there. A `config` reset in a file named
+there does not: the Configuration Service file comes later and sets those keys again,
+whichever Compose version you use. The launchers have no hook that adds a file after the
+Configuration Service file, so a `config` reset needs a file composed after it, and in the
+combined stack the separate limitation below applies even then.
+
+> **Limitation in the combined DMS and Configuration Service stack, observed in affected
+> Docker Compose versions.** This is independent of where the launchers insert overlays. The DMS
+> launchers add `dms-cms-proxy.yml` after both service files, and
+> that file sets `environment` on `config`. In an affected Compose version, a later `!reset null`
+> on a `config` environment key is then not applied: the Configuration Service keys in this
+> override can stay in the container, and their `.env` values outrank the vault values. The
+> `dms` resets are not affected. This was verified locally with Compose v5.1.3 and has also
+> been reported with v5.5.1; do not assume another version behaves differently. Before relying
+> on the override, render the complete Compose
+> file sequence you deploy with, override included, and confirm that every key you reset is
+> absent. Check key names only, and do not publish or log the rendered configuration,
+> because it contains the secret values. For example, this PowerShell check keeps the
+> rendered configuration in a variable and prints only key names. It stops with an error
+> unless Compose renders successfully and the result has a `config` service with an
+> environment, so an empty result never passes for a render that did not include `config`:
+>
+> ```powershell
+> $composeFiles = '<first file>', '<next file>', '<your override>'  # every -f file, in the order your deployment passes them
+> $envFile = '<your env file>'
+> $resetKeys = 'DatabaseSettings__DatabaseConnection', 'DatabaseSettings__EncryptionKey',
+>     'IdentitySettings__ClientSecret', 'IdentitySettings__EncryptionKey'  # the config keys your override resets
+>
+> $fileArguments = foreach ($file in $composeFiles) { '-f'; $file }
+> $rendered = docker compose @fileArguments --env-file $envFile config --format json 2>$null
+> if ($LASTEXITCODE -ne 0) {
+>     throw "docker compose config failed (exit code $LASTEXITCODE). Run the same command with 'config --quiet' to see the error without printing the configuration."
+> }
+> $config = (($rendered -join "`n") | ConvertFrom-Json).services.config
+> if ($null -eq $config) { throw 'The rendered configuration has no config service; check the file list.' }
+> if ($null -eq $config.environment) { throw 'The rendered config service has no environment; check the file list.' }
+> $present = @($config.environment.PSObject.Properties.Name | Where-Object { $_ -in $resetKeys })
+> if ($present.Count -gt 0) { throw "Still set on config: $($present -join ', ')" }
+> 'Every reset key is absent from config.'
+> ```
+>
+> Reordering the files or leaving out `dms-cms-proxy.yml` is not a validated workaround:
+> that file carries the Configuration Service's forwarded-header trust and `/connect/*`
+> rate-limit settings for the combined stack.
+
+`DATABASE_CONNECTION_STRING_ADMIN` on `dms` is not a vault key, because only the DMS entry point reads it, but it carries database credentials.
+`local-dms.compose.yml` gives it a default, a superuser connection string for the bundled `dms-postgresql` service; `published-dms.compose.yml` has no default and requires a value.
+To keep it out of the container, keep the variable set and reset it in the same override with `DATABASE_CONNECTION_STRING_ADMIN: !reset null` under `dms`.
+DMS then starts without waiting for PostgreSQL.
 
 ## Logging
 
@@ -702,6 +806,398 @@ be relied on for DoS or brute-force protection.
 ### Authentication and Authorization
 
 See [Roles and Scopes](./ROLES-SCOPES.md)
+
+### Deployment preflight for claim-set names and scope shapes
+
+The Ed-Fi API resolves the one claim set a request uses from the token's scope
+values, the Configuration Service rejects commas in claim-set names, and the
+self-contained provider issues scopes separated by spaces. See
+[Roles and Scopes](./ROLES-SCOPES.md#claim-set-selection-from-token-scopes) for the
+rules. Complete the steps below **before** rolling out the release that contains
+them. This is a deployment prerequisite for operators, not a code migration, and
+nothing in the product performs it for you.
+
+1. **Inventory comma-containing claim-set names.** List every claim set in every
+   tenant whose name contains a comma. The new validation rejects such a name
+   wherever a name is introduced or replaced through the API, import, and application
+   paths (claim-set create, update, copy and import, application create and update),
+   so an existing one can no longer be re-saved unchanged. Fragment registration skips
+   registering an invalid name, logs it, and continues with the other claim sets, and
+   the XML conversion tool throws its established `InvalidOperationException`.
+
+   In **self-contained mode**, this inventory also prevents an unintended change in
+   permissions. A client assigned `Alpha,Beta` stores separate `Alpha` and `Beta`
+   permissions. Fresh tokens carry `Alpha Beta`, so DMS looks up those two names
+   instead of the literal `Alpha,Beta` claim set. If neither name exists in the
+   tenant, resource requests return `500`, identity-service requests return `403`,
+   and `/oauth/token_info` returns `401`. If exactly one exists, requests use that
+   claim set's permissions, which may differ from the application's assigned claim
+   set. If both exist, requests return `403` for ambiguity. Skipping preflight can
+   therefore change effective permissions as well as cause an outage. Keycloak
+   stores the literal client scope name and does not perform this comma split.
+2. **Inventory the references to those names.** List every application, and every
+   identity-provider client or client scope (the Keycloak realm, or the
+   `OpenIddictScope` and `OpenIddictApplicationScope` rows of the self-contained
+   provider), that refers to a comma-containing claim-set name. A token carries its
+   claim set as a scope, so a client's scope and the claim set's name must change
+   together.
+3. **Correct each name through the established management workflows.** Use the
+   Configuration Service claim-set and application endpoints, and the identity
+   provider's own administration, as for any other claim-set change. Do not
+   auto-rename names with scripts against stored data, and do not edit stored client
+   credentials: the key and secret of an existing application stay as they are.
+4. **Obtain fresh tokens where the old scope shape is incompatible.** An issued
+   token keeps the `scope` it was issued with until it expires. A token whose scope
+   joined several values with commas is read as one literal value, because DMS and
+   the Configuration Service do not split issued JWT claims on commas. Neither
+   product rewrites or splits such a token. Having clients request a new token is
+   what replaces it. The self-contained provider's change to space-separated output
+   applies only to tokens issued after the release and does not repair old ones.
+5. **Account for propagation.** Corrected claim sets reach the Ed-Fi API through its
+   cached claim sets, per tenant and per replica, and are eventually consistent
+   rather than an immediate revocation. Follow
+   [How long a change takes to apply](./IDENTITY-MANAGEMENT.md#how-long-a-change-takes-to-apply)
+   and [Reloading the claim-set cache](./IDENTITY-MANAGEMENT.md#reloading-the-claim-set-cache),
+   remembering that a reload clears one replica and one tenant spelling at a time.
+
+While a token's scopes recognize more than one claim set in a tenant, the Ed-Fi API
+answers `403` with `The token identifies multiple claim sets.`, and a tenant whose
+metadata holds two claim sets with names that differ only by case answers `500` for
+a token that names them. Correct such tenants by renaming or removing the duplicate
+through the same management workflows.
+
+## Configuration Service database upgrades
+
+The Configuration Service upgrades its own database with DbUp. The embedded
+scripts run in order at startup when `DeployDatabaseOnStartup` is set, or
+through the Installer, and each script that completes is journaled in
+`dmscs_SchemaVersions`. A script that fails is not journaled: the service logs
+`Database Deploy Failure` with the script's error and exits, and the whole
+script runs again on the next start. Some scripts refuse to run against data
+that the schema change would make invalid. That is deliberate: they change
+nothing and describe what blocks them, and this section is the operator
+procedure for resolving it.
+
+Run an upgrade from one Configuration Service instance, or from the Installer,
+with no other instance serving writes. Migration `0036` holds an exclusive
+lock on `dmscs."ApiClient"` from its preflight through constraint creation, so
+a concurrent writer waits rather than slipping past its check; other blocking
+scripts, such as `0035`, take no such lock. Two instances running the upgrade
+at the same time are not serialized by DbUp either. Stop every instance first,
+upgrade from one, then start the rest.
+
+### Migration 0036: API client identifiers must be unique
+
+Migration `0036` makes `ClientId` (the key a caller authenticates with) and
+`ClientUuid` (the identity provider's identifier for that client) unique
+across the whole `dmscs."ApiClient"` table, in every application and every
+tenant. The Configuration Service generates both values itself, so duplicates
+come only from rows seeded outside the API or from a setup that ran twice. If
+any exist, startup stops with a message of this shape:
+
+```text
+API client identifier uniqueness upgrade blocked: 2 ApiClient row(s) share a ClientId with another row, ids: 17, 42. 3 ApiClient row(s) share a ClientUuid with another row, ids: 42, 43, 44. Resolve the duplicates with the operator procedure in docs/OPERATIONS.md ("Configuration Service database upgrades"), then retry the upgrade. Do not use DELETE /v3/apiClients/{id} for these rows.
+```
+
+The counts are complete. The ids are a sample: at most 20 `ApiClient."Id"`
+values per column, so a message ending in `... and 5 more` names only part of
+the set, and even a short list does not say which rows share a value with
+which. The enumeration query in step 2 is the complete list; do not work from
+the message. The ids are internal row ids, not keys.
+
+**Do not delete through the API while resolving duplicates.**
+`DELETE /v3/apiClients/{id}` also deletes the identity-provider client the row
+points to, by its `ClientUuid`. For rows that share a `ClientUuid`, that is
+the survivor's provider client, and deleting the loser through the API
+destroys the survivor's credentials. The procedure below deletes rows directly
+in the database and leaves every provider client in place. The service is
+stopped for the whole procedure, so nothing else writes to the table; do not
+start the previous build to clean up through the API either.
+
+1. **Stop the Configuration Service.** Every instance. The upgrade runs at
+   startup or through the Installer, so nothing below happens with the
+   service up.
+
+2. **Enumerate every affected row.** The query lists every `ApiClient` row
+   whose `ClientId` or `ClientUuid` is also held by another row, with a flag
+   for each, its ownership chain (application, vendor, tenant), its audit
+   columns, and its data-store and ownership-token associations. Save the
+   output: it is the review record for steps 4 to 6 and the starting point
+   for step 8.
+
+   PostgreSQL:
+
+   ```sql
+   SELECT c."Id", c."ClientId", c."ClientUuid",
+          EXISTS (SELECT 1 FROM dmscs."ApiClient" o
+                  WHERE o."ClientId" = c."ClientId" AND o."Id" <> c."Id") AS "SharesClientId",
+          EXISTS (SELECT 1 FROM dmscs."ApiClient" o
+                  WHERE o."ClientUuid" = c."ClientUuid" AND o."Id" <> c."Id") AS "SharesClientUuid",
+          c."Name", c."IsApproved",
+          c."ApplicationId", a."ApplicationName", a."ClaimSetName",
+          v."Id" AS "VendorId", v."Company", t."Id" AS "TenantId", t."Name" AS "TenantName",
+          c."CreatedAt", c."CreatedBy", c."LastModifiedAt", c."ModifiedBy",
+          c."CreatorOwnershipTokenId",
+          (SELECT string_agg(ds."Id"::text || ':' || ds."Name", ', ' ORDER BY ds."Id")
+           FROM dmscs."ApiClientDataStore" acd
+           JOIN dmscs."DataStore" ds ON ds."Id" = acd."DataStoreId"
+           WHERE acd."ApiClientId" = c."Id") AS "DataStores",
+          (SELECT string_agg(acot."OwnershipTokenId"::text, ', ' ORDER BY acot."OwnershipTokenId")
+           FROM dmscs."ApiClientOwnershipToken" acot
+           WHERE acot."ApiClientId" = c."Id") AS "OwnershipTokens"
+   FROM dmscs."ApiClient" c
+   JOIN dmscs."Application" a ON a."Id" = c."ApplicationId"
+   JOIN dmscs."Vendor" v ON v."Id" = a."VendorId"
+   LEFT JOIN dmscs."Tenant" t ON t."Id" = v."TenantId"
+   WHERE EXISTS (SELECT 1 FROM dmscs."ApiClient" o
+                 WHERE o."ClientId" = c."ClientId" AND o."Id" <> c."Id")
+      OR EXISTS (SELECT 1 FROM dmscs."ApiClient" o
+                 WHERE o."ClientUuid" = c."ClientUuid" AND o."Id" <> c."Id")
+   ORDER BY c."ClientId", c."ClientUuid", c."Id";
+   ```
+
+   SQL Server:
+
+   ```sql
+   SELECT c.Id, c.ClientId, c.ClientUuid,
+          CASE WHEN EXISTS (SELECT 1 FROM dmscs.ApiClient o
+                            WHERE o.ClientId = c.ClientId AND o.Id <> c.Id) THEN 1 ELSE 0 END AS SharesClientId,
+          CASE WHEN EXISTS (SELECT 1 FROM dmscs.ApiClient o
+                            WHERE o.ClientUuid = c.ClientUuid AND o.Id <> c.Id) THEN 1 ELSE 0 END AS SharesClientUuid,
+          c.Name, c.IsApproved,
+          c.ApplicationId, a.ApplicationName, a.ClaimSetName,
+          v.Id AS VendorId, v.Company, t.Id AS TenantId, t.Name AS TenantName,
+          c.CreatedAt, c.CreatedBy, c.LastModifiedAt, c.ModifiedBy,
+          c.CreatorOwnershipTokenId,
+          (SELECT STRING_AGG(CAST(CONCAT(ds.Id, ':', ds.Name) AS NVARCHAR(MAX)), ', ') WITHIN GROUP (ORDER BY ds.Id)
+           FROM dmscs.ApiClientDataStore acd
+           JOIN dmscs.DataStore ds ON ds.Id = acd.DataStoreId
+           WHERE acd.ApiClientId = c.Id) AS DataStores,
+          (SELECT STRING_AGG(CAST(acot.OwnershipTokenId AS NVARCHAR(MAX)), ', ') WITHIN GROUP (ORDER BY acot.OwnershipTokenId)
+           FROM dmscs.ApiClientOwnershipToken acot
+           WHERE acot.ApiClientId = c.Id) AS OwnershipTokens
+   FROM dmscs.ApiClient c
+   JOIN dmscs.Application a ON a.Id = c.ApplicationId
+   JOIN dmscs.Vendor v ON v.Id = a.VendorId
+   LEFT JOIN dmscs.Tenant t ON t.Id = v.TenantId
+   WHERE EXISTS (SELECT 1 FROM dmscs.ApiClient o
+                 WHERE o.ClientId = c.ClientId AND o.Id <> c.Id)
+      OR EXISTS (SELECT 1 FROM dmscs.ApiClient o
+                 WHERE o.ClientUuid = c.ClientUuid AND o.Id <> c.Id)
+   ORDER BY c.ClientId, c.ClientUuid, c.Id;
+   ```
+
+   Both queries use the equality the constraints apply, which is also what
+   the migration's preflight uses. On SQL Server, `ClientId` compares under
+   the column's collation: a case-insensitive collation makes `abc` and `ABC`
+   duplicates, and trailing spaces never distinguish two keys. On PostgreSQL,
+   with the deterministic default collation Configuration Service databases
+   use, comparison is byte-wise, so those pairs are distinct keys.
+
+3. **Back up** before changing anything. Either the whole database:
+
+   ```bash
+   pg_dump -U postgres -Fc <database> > <database>-before-0036.dump
+   ```
+
+   ```sql
+   BACKUP DATABASE [<database>] TO DISK = N'<path>\<database>-before-0036.bak' WITH COPY_ONLY, INIT;
+   ```
+
+   or only the three tables the procedure touches:
+
+   ```bash
+   pg_dump -U postgres -Fc -t 'dmscs."ApiClient"' -t 'dmscs."ApiClientDataStore"' \
+     -t 'dmscs."ApiClientOwnershipToken"' <database> > apiclient-before-0036.dump
+   ```
+
+   ```sql
+   SELECT * INTO dmscs.ApiClient_Before0036 FROM dmscs.ApiClient;
+   SELECT * INTO dmscs.ApiClientDataStore_Before0036 FROM dmscs.ApiClientDataStore;
+   SELECT * INTO dmscs.ApiClientOwnershipToken_Before0036 FROM dmscs.ApiClientOwnershipToken;
+   ```
+
+   The SQL Server copies are plain tables in the `dmscs` schema; drop them
+   once the upgrade has been verified, because they are not part of the
+   schema and nothing else removes them.
+
+4. **Form the duplicate groups and inspect each one.** The output is ordered
+   by `ClientId`, then `ClientUuid`, so rows that share a key are adjacent but
+   rows that share a UUID under different keys are not. Group the rows twice:
+   once by `ClientId` over the rows flagged `SharesClientId`, and once by
+   `ClientUuid` over the rows flagged `SharesClientUuid`. A row flagged for
+   both belongs to one group of each kind; review such overlapping groups
+   together, because a decision in one changes what the other contains. For
+   each row, read both identifiers and both flags, the application, vendor
+   and tenant it belongs to, the audit columns (who created it and when), and
+   the associations the row would lose if deleted. Then look at the identity
+   provider for every key and UUID in the group:
+
+   * Keycloak: `GET {keycloak}/admin/realms/{realm}/clients?clientId={ClientId}`
+     finds a client by key; `GET {keycloak}/admin/realms/{realm}/clients/{ClientUuid}`
+     finds it by internal id; the admin console shows the same objects.
+     Compare the client's `id` and `clientId` with each row, and note its
+     name, its client scopes (the claim set), and the attributes or protocol
+     mappers that carry the education-organization and data-store claims.
+   * Self-contained provider (OpenIddict): the client is a row in the same
+     database.
+
+     ```sql
+     -- PostgreSQL
+     SELECT app."Id", app."ClientId", app."DisplayName", app."Type", app."CreatedAt", app."ProtocolMappers",
+            (SELECT string_agg(s."Name", ', ' ORDER BY s."Name")
+             FROM dmscs."OpenIddictApplicationScope" aps
+             JOIN dmscs."OpenIddictScope" s ON s."Id" = aps."ScopeId"
+             WHERE aps."ApplicationId" = app."Id") AS "Scopes"
+     FROM dmscs."OpenIddictApplication" app
+     WHERE app."ClientId" = '<ClientId>' OR app."Id" = '<ClientUuid>';
+     ```
+
+     ```sql
+     -- SQL Server
+     SELECT app.Id, app.ClientId, app.DisplayName, app.Type, app.CreatedAt, app.ProtocolMappers,
+            (SELECT STRING_AGG(CAST(s.Name AS NVARCHAR(MAX)), ', ') WITHIN GROUP (ORDER BY s.Name)
+             FROM dmscs.OpenIddictApplicationScope aps
+             JOIN dmscs.OpenIddictScope s ON s.Id = aps.ScopeId
+             WHERE aps.ApplicationId = app.Id) AS Scopes
+     FROM dmscs.OpenIddictApplication app
+     WHERE app.ClientId = '<ClientId>' OR app.Id = '<ClientUuid>';
+     ```
+
+   What the shapes mean: rows that share a `ClientId` but hold different
+   `ClientUuid` values point at two provider clients, or at one client and a
+   dangling reference; the provider answers that key for at most one of them,
+   so the other row's credentials never worked or stopped working. Rows that
+   share a `ClientUuid` point at one provider client, whose `clientId`
+   matches at most one of them; the rest disagree with the provider about
+   which key they hold. Audit columns and the provider's creation time show
+   which attempt created what.
+
+5. **Establish the intended owner of each group** from step 4, and record how
+   you established it. No rule such as "keep the lowest id" is offered, and
+   nothing in the service reconciles the provider automatically. **Stop if
+   ownership remains ambiguous** and leave the database as it is: an upgrade
+   that stays blocked is recoverable, a deleted credential is not.
+
+6. **Delete only the reviewed row ids**, in one transaction, child rows
+   first. Replace `<reviewed ids>` with the ids written down in step 5 and
+   nothing else; the same list goes in all three statements. Deleting a row
+   discards its data-store assignments and ownership-token links. The
+   provider client is not touched.
+
+   Run the deletion in an interactive session that stays open: `psql`, or
+   `sqlcmd` without `-Q` or `-i`, or a client with autocommit off. The block
+   opens the transaction and deletes; it does not end the transaction.
+
+   PostgreSQL:
+
+   ```sql
+   BEGIN;
+   DELETE FROM dmscs."ApiClientOwnershipToken" WHERE "ApiClientId" IN (<reviewed ids>)
+   RETURNING "ApiClientId", "OwnershipTokenId";
+   DELETE FROM dmscs."ApiClientDataStore" WHERE "ApiClientId" IN (<reviewed ids>)
+   RETURNING "ApiClientId", "DataStoreId";
+   DELETE FROM dmscs."ApiClient" WHERE "Id" IN (<reviewed ids>)
+   RETURNING "Id", "ClientId", "ClientUuid";
+   ```
+
+   SQL Server:
+
+   ```sql
+   SET XACT_ABORT ON;
+   BEGIN TRANSACTION;
+   DELETE FROM dmscs.ApiClientOwnershipToken
+   OUTPUT deleted.ApiClientId, deleted.OwnershipTokenId
+   WHERE ApiClientId IN (<reviewed ids>);
+   DELETE FROM dmscs.ApiClientDataStore
+   OUTPUT deleted.ApiClientId, deleted.DataStoreId
+   WHERE ApiClientId IN (<reviewed ids>);
+   DELETE FROM dmscs.ApiClient
+   OUTPUT deleted.Id, deleted.ClientId, deleted.ClientUuid
+   WHERE Id IN (<reviewed ids>);
+   ```
+
+   The transaction is still open. In the same session, compare the returned
+   rows with the review record: every id from step 5 and no other, and for
+   each one the associations step 2 listed. Then end the transaction with
+   exactly one of the statements below. If the session closes before either
+   runs, both engines roll the deletion back and nothing was deleted.
+
+   PostgreSQL, when the rows match:
+
+   ```sql
+   COMMIT;
+   ```
+
+   PostgreSQL, otherwise:
+
+   ```sql
+   ROLLBACK;
+   ```
+
+   SQL Server, when the rows match:
+
+   ```sql
+   COMMIT TRANSACTION;
+   ```
+
+   SQL Server, otherwise:
+
+   ```sql
+   ROLLBACK TRANSACTION;
+   ```
+
+   The child tables cascade from `ApiClient` on both engines, but the
+   procedure deletes them explicitly so that the returned rows show exactly
+   what each deletion discards.
+
+7. **Re-check both identifiers**, then retry the upgrade. Each query must
+   return zero rows; if either still returns rows, go back to step 2 with
+   that output.
+
+   PostgreSQL:
+
+   ```sql
+   SELECT c."Id" FROM dmscs."ApiClient" c
+   WHERE EXISTS (SELECT 1 FROM dmscs."ApiClient" o WHERE o."ClientId" = c."ClientId" AND o."Id" <> c."Id");
+   SELECT c."Id" FROM dmscs."ApiClient" c
+   WHERE EXISTS (SELECT 1 FROM dmscs."ApiClient" o WHERE o."ClientUuid" = c."ClientUuid" AND o."Id" <> c."Id");
+   ```
+
+   SQL Server:
+
+   ```sql
+   SELECT c.Id FROM dmscs.ApiClient c
+   WHERE EXISTS (SELECT 1 FROM dmscs.ApiClient o WHERE o.ClientId = c.ClientId AND o.Id <> c.Id);
+   SELECT c.Id FROM dmscs.ApiClient c
+   WHERE EXISTS (SELECT 1 FROM dmscs.ApiClient o WHERE o.ClientUuid = c.ClientUuid AND o.Id <> c.Id);
+   ```
+
+   Then start one Configuration Service instance or run the Installer. The
+   script runs again in full, adds both constraints, and journals `0036`;
+   `SELECT scriptname FROM public."dmscs_SchemaVersions" WHERE scriptname LIKE '%0036%';`
+   (PostgreSQL) or
+   `SELECT ScriptName FROM dbo.dmscs_SchemaVersions WHERE ScriptName LIKE '%0036%';`
+   (SQL Server) returns one row once it has. Start the remaining instances
+   after that.
+
+8. **Provider cleanup is a separate activity.** Deleting a row removes the
+   Configuration Service's reference to a provider client and establishes
+   nothing about that client. A row seeded outside the API, or corrupted, can
+   point at a provider client that is legitimately in use, including a client
+   registered through `POST /connect/register`, which never has an
+   `ApiClient` row. Leave every provider client in place until the upgrade is
+   done. Afterwards, handle a provider client you suspect is orphaned under
+   [the one rule for deleting a client during recovery](#the-one-rule-for-deleting-a-client-during-recovery):
+   deleting it requires independent evidence of ownership, such as provider
+   audit events tying the client's creation to the attempt that produced the
+   deleted row, or an operator's recorded confirmation documenting how
+   ownership was established, together with recorded operator approval of
+   the deletion. The `ClientUuid` in the step 2 review record says where to
+   look; it is not authorization. A provider client whose UUID a surviving
+   row still holds is in use and must not be deleted. If ownership remains
+   uncertain, stop and leave the client in place. Nothing in the migration or
+   in this procedure deletes provider objects.
 
 ## Configuration Service: identity-provider clients left behind by failed provisioning
 
@@ -851,3 +1347,580 @@ must not be deleted.
 
 Recovery never deletes realm roles or client scopes. Those are shared by every
 client in the realm, so a failed attempt leaves nothing about them to repair.
+
+### Finding provider clients that no API client references
+
+A provider client can also lose its `ApiClient` row without any log line. A
+`DELETE /v3/vendors/{id}` made before DMS-1493 removed the vendor's rows without
+deleting their provider clients, and those clients keep their credentials (see
+[OWASP-AUTH-COVERAGE.md](OWASP-AUTH-COVERAGE.md)). In `self-contained` mode, since
+DMS-1494, a client without an API client row is refused at `/connect/token`,
+`/connect/revoke` and `/connect/introspect` unless its roles and scopes qualify it
+as an administrative client
+([CS-AUTH](../reference/design/configuration-service/CS-AUTH.md#approval-states-and-clients-without-an-api-client-row)),
+so a vendor candidate obtains no new token. In `keycloak` mode its credentials keep
+working. The comparison below lists
+**candidates** for review. It changes nothing, and it cannot say why a client has
+no row: current rows do not record an earlier vendor deletion, and many provider
+clients legitimately have none. Expect these among the results:
+
+* clients registered through `POST /connect/register`, which carry
+  `IdentitySettings:ConfigServiceRole` (`cms-client` by default) instead of the
+  `IdentitySettings:ClientRole` (`dms-client`) given to API clients;
+* bootstrap and administrative clients created by deployment scripts or by hand;
+* for Keycloak, the realm's built-in clients (`account`, `account-console`,
+  `admin-cli`, `broker`, `realm-management`, `security-admin-console`) and the
+  clients of any other application that uses the realm;
+* a client created while the comparison runs, whose row is not yet committed.
+
+**Recognizing a refused candidate (`self-contained`).** When such a client presents
+its correct secret and is refused, the Configuration Service logs at Warning:
+
+```text
+Client {ClientId} (application {ApplicationId}) authenticated but is not admitted ({Admission}); refused
+```
+
+The application id is the `OpenIddictApplication.Id` the query below prints.
+`NoApiClientRowHoldsClientRoleOnly` is the shape of an orphaned vendor client: it
+holds `IdentitySettings:ClientRole` but not `IdentitySettings:ConfigServiceRole`.
+`NoApiClientRowNoAdministrativeRole`, `NoApiClientRowNoScopes` and
+`NoApiClientRowNonAdministrativeScope` usually mean an administrative client made
+by hand without the administrative role or with other scopes. A legitimate one is
+fixed by giving it `ConfigServiceRole` and only Management API scopes, or by
+re-creating it through `POST /connect/register` or `setup-openiddict.ps1`.
+`NoApiClientRowRoleConfiguration` names the configuration, not the client: the two
+role names resolve to one role row or collide, and every administrative client
+without a row is refused until non-colliding names are configured. A role-name
+change requires the
+[role-membership audit](#auditing-role-memberships-before-a-role-name-change).
+A wrong secret never produces this line, and an unapproved client stays silent.
+
+Compare against every Configuration Service database whose clients live in the
+same provider. All tenants of one database share its `dmscs.ApiClient` table, so
+the queries need no tenant filter. A Keycloak realm can also be shared by several
+Configuration Service deployments, each with its own database.
+
+**`self-contained`.** The provider clients are in the same database, and
+`ApiClient.ClientUuid` is their `Id`. The query lists each provider client with
+no API client row, with its roles. PostgreSQL:
+
+```sql
+SELECT oa."Id", oa."ClientId", oa."DisplayName", oa."CreatedAt",
+       string_agg(r."Name", ', ' ORDER BY r."Name") AS "Roles"
+FROM dmscs."OpenIddictApplication" oa
+LEFT JOIN dmscs."OpenIddictClientRole" cr ON cr."ClientId" = oa."Id"
+LEFT JOIN dmscs."OpenIddictRole" r ON r."Id" = cr."RoleId"
+WHERE NOT EXISTS (SELECT 1 FROM dmscs."ApiClient" ac WHERE ac."ClientUuid" = oa."Id")
+GROUP BY oa."Id", oa."ClientId", oa."DisplayName", oa."CreatedAt"
+ORDER BY oa."CreatedAt";
+```
+
+SQL Server:
+
+```sql
+SELECT oa.Id, oa.ClientId, oa.DisplayName, oa.CreatedAt,
+       STRING_AGG(r.Name, ', ') WITHIN GROUP (ORDER BY r.Name) AS Roles
+FROM dmscs.OpenIddictApplication oa
+LEFT JOIN dmscs.OpenIddictClientRole cr ON cr.ClientId = oa.Id
+LEFT JOIN dmscs.OpenIddictRole r ON r.Id = cr.RoleId
+WHERE NOT EXISTS (SELECT 1 FROM dmscs.ApiClient ac WHERE ac.ClientUuid = oa.Id)
+GROUP BY oa.Id, oa.ClientId, oa.DisplayName, oa.CreatedAt
+ORDER BY oa.CreatedAt;
+```
+
+**`keycloak`.** `ApiClient.ClientUuid` holds the client's internal `id`, not its
+OAuth `clientId`, so compare on `id`. Collect the UUIDs from every Configuration
+Service database that uses the realm into one file:
+
+```shell
+psql "<connection string>" -At -c 'SELECT "ClientUuid" FROM dmscs."ApiClient"' >> cms-client-uuids.txt
+sqlcmd -S <server> -d <database> -h -1 -W -Q "SET NOCOUNT ON; SELECT ClientUuid FROM dmscs.ApiClient" >> cms-client-uuids.txt
+```
+
+List the realm's clients with the admin CLI, which returns all of them. The
+Admin REST equivalent is `GET {keycloak}/admin/realms/{realm}/clients?briefRepresentation=true`;
+when paging with `first` and `max`, continue until a page is short.
+
+```shell
+kcadm.sh config credentials --server <keycloak url> --realm master --user <admin user>
+kcadm.sh get clients -r <realm> --fields id,clientId --format csv --noquotes > realm-clients.csv
+```
+
+Then list the realm clients whose `id` no database holds, leaving out the
+built-ins. SQL Server prints UUIDs in upper case, so the comparison ignores case:
+
+```powershell
+$builtIn = 'account', 'account-console', 'admin-cli', 'broker', 'realm-management', 'security-admin-console'
+$cms = Get-Content cms-client-uuids.txt | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ }
+Import-Csv realm-clients.csv -Header Id, ClientId |
+    Where-Object { $_.Id.ToLowerInvariant() -notin $cms -and $_.ClientId -notin $builtIn }
+```
+
+To see what a candidate was created for, read the realm roles of its service
+account. `dms-client` points to an API client, `cms-client` to a registration, and
+a client without a service account was not created by the Configuration Service:
+
+```shell
+kcadm.sh get clients/<id>/service-account-user -r <realm> --fields id,username
+kcadm.sh get users/<service account user id>/role-mappings/realm -r <realm> --fields name
+```
+
+Treat every result as a candidate until an operator has established who owns it.
+A role, a name or a missing row is not proof. Deleting a client that another
+deployment, tenant database or application still uses cuts it off. Deciding to
+delete one needs the same independent evidence of ownership and recorded approval
+as [the one rule for deleting a client during recovery](#the-one-rule-for-deleting-a-client-during-recovery);
+nothing in this procedure deletes or changes a client.
+
+### Auditing role memberships before a role-name change
+
+In `self-contained` mode a client without an API client row is admitted as
+administrative by its role membership
+([CS-AUTH](../reference/design/configuration-service/CS-AUTH.md#changing-or-reusing-a-role-name)).
+Memberships are written when a client is created and read under the current
+`IdentitySettings:ConfigServiceRole` and `IdentitySettings:ClientRole`. Changing
+either name, or reusing a name either role used before, therefore gives existing
+memberships a new meaning, on both database engines and whether or not the names
+ever collided. For example, after changing `ConfigServiceRole = A, ClientRole = B`
+to `ConfigServiceRole = B, ClientRole = C`, every vendor client created earlier
+holds `B`, now the administrative role. This affects clients with an API client
+row as well: an approved vendor client that holds `B` now meets the Management API
+role requirement and, with an administrative scope, reaches protected Configuration
+Service endpoints. Nothing in the product detects this.
+
+**Whenever either role name is changed, or a previously used name is reused,
+audit role memberships before the new configuration takes effect.** The names are
+read at startup, so finish the audit before any instance starts with them.
+
+1. Record the current names, the new names, and every name either role has used
+   before in this deployment.
+2. On every Configuration Service database the deployment uses, run the
+   `self-contained` query in
+   [Finding provider clients that no API client references](#finding-provider-clients-that-no-api-client-references)
+   **with its `WHERE NOT EXISTS` line removed**, so that it lists **every**
+   client with its roles, whether or not it has an API client row. The audit must
+   cover all clients: a role-name change affects clients with a row as much as
+   clients without one.
+3. Establish what each listed client is from ownership records, not from its role:
+   current data does not say whether a client was created as a vendor client or as
+   an administrative one. Under the new names, a client without an API client row
+   is admitted only if it holds the new `ConfigServiceRole` and only Management
+   API scopes, and any client that holds the new `ConfigServiceRole` meets the
+   Management API role requirement.
+4. Re-create or re-role every client whose membership no longer matches its kind:
+   - a vendor client, with or without an API client row, that holds the new
+     `ConfigServiceRole` name, including one created on SQL Server while
+     `ClientRole` collided with `ConfigServiceRole`, which holds the
+     administrative role row;
+   - an administrative client that holds only a retired name.
+
+   Re-roling changes `dmscs.OpenIddictClientRole` rows; re-creating an
+   administrative client goes through `POST /connect/register` or
+   `setup-openiddict.ps1`. Deleting a client follows
+   [the one rule for deleting a client during recovery](#the-one-rule-for-deleting-a-client-during-recovery).
+5. Start the Configuration Service with the new names only when every listed
+   client's membership matches its kind.
+
+The two names must also not collide. When they resolve to one role row in the
+database, or are equal after trailing white space is removed and case, width, kana
+type and non-spacing marks are ignored (for example `cms-client` and `CMS-Client`,
+or `cms-client` with a trailing space), every client without an API client row is
+refused with the `NoApiClientRowRoleConfiguration` Warning. Clients with an API
+client row are unaffected.
+
+## Configuration Service: DMS data store provisioning
+
+The Configuration Service can create and delete DMS data store databases from signed template packages
+(`Minimal` and `Sample`) on a PostgreSQL or SQL Server server. It is off by default and configured in the
+`DmsDataStoreProvisioning` section; see [DmsDataStoreProvisioning](./CONFIGURATION.md#dmsdatastoreprovisioning)
+for every setting. This release adds the provisioner as a service for the Configuration Service's own
+background jobs (see
+[Configuration Service Background Jobs](./CONFIGURATION-SERVICE-BACKGROUND-JOBS.md#dms-data-store-provisioning)).
+It adds no endpoint and does not change `/health`.
+
+How a create works, in short: the allowlisted package is copied into a private operation directory, its
+attestation is checked against the trust policy, and its manifest is checked against the `Compatibility`
+settings. The database is then restored under a generated staging name
+(`edfi_dms_provision_stage_<operation id>`, an id of 12 hex characters) and validated there: content
+profile, schema and inventory, and security state. Only then is it renamed to the requested name and marked
+with the data store's identity (`dms.DataStoreIdentity.SourceIdentity`), which is the last change. A
+database that already holds the requested name is never restored over: it is accepted only when it carries
+the expected identity and passes the same validation. A delete drops a database only when it carries the
+expected identity, after closing every other session on it.
+
+### Readiness
+
+At startup, an enabled provisioner checks its environment once. A failure does not stop the service: it
+marks provisioning `NotReady`, logs each failed check at Critical, and refuses every provisioning call until
+the service restarts. Fix the cause, then restart.
+
+The checks run before the Configuration Service starts listening for HTTP, so no endpoint, `/health`
+included, answers until they end. Their duration depends on the configured bounds (`CommandTimeout`,
+`LockAcquireTimeout`, `SessionTerminationTimeout`) and on how long copying and hashing each allowlisted
+package takes. Size the deployment's startup allowance (a Kubernetes `startupProbe`, or a longer initial
+delay before liveness checks) to cover them; a liveness check that fails during startup restarts a host
+that is still initializing. Each Critical line has this form:
+
+```text
+DMSPROV-<Code>: DMS data store provisioning is not ready for target provider <provider>: probe <Probe> failed at <Operation> (exception types <types>, provider error <code>)
+```
+
+| Probe | What it checks | Usual fix |
+| --- | --- | --- |
+| `SecretResolution` | `${secret:...}` references in `AdminConnectionString` resolve. | Fix the secret provider or the reference. |
+| `TrustPolicy` | The trust policy file is readable, valid, and lists at least one `detached-attestation` producer with a valid P-256 key. | See [Trust](#template-package-trust). |
+| `Catalog.Minimal`, `Catalog.Sample` | Each allowlisted package and its attestation are present, the attestation verifies, the manifest matches `Compatibility`, and the probe's operation directory is removed afterwards (`StagingFailed` at `ReleaseOperationDirectory` when it is not). | Place the exact package and attestation in `ArtifactDirectory`, or correct the allowlist or `Compatibility`. For `ReleaseOperationDirectory`, remove the leftover named in the `1438_21`/`1438_22` log entries (see [Leftovers after a crash](#leftovers-after-a-crash)) and fix what prevented its removal. |
+| `TargetServer` | The server can be reached and its facts read. | Network, credentials, TLS settings. |
+| `ServerVersion`, `EngineCompatibility.<template>` | PostgreSQL 18 or later; SQL Server 2022 (16) or later; and the server's major version is at least the one each package was built on. | Upgrade the server, or use packages built for it. |
+| `Template0Encoding` | PostgreSQL: `template0`, from which every staging database is created, uses `UTF8`. `template1` is not checked or used. | Initialize the cluster again with UTF-8 encoding; see [PostgreSQL](#postgresql). |
+| `Superuser`, `CreateDatabasePrivilege`, `SignalBackendPrivilege`, `ReadAllStatsPrivilege`, `EnqueueOwnerRole` | PostgreSQL privileges; see [PostgreSQL](#postgresql). | Grant them to the administrative login. |
+| `CreateDatabasePrivilege`, `AlterAnyDatabasePrivilege`, `AlterAnyConnectionPrivilege`, `ViewServerStatePrivilege`, `FileCatalogVisibility`, `DefaultDataPath`, `DefaultLogPath` | SQL Server privileges and default file locations; see [SQL Server](#sql-server). | Grant them, or set the instance default paths. |
+| `PsqlVersion` | `Postgresql:PsqlPath` runs and reports major version 18 or later. | Install `psql` 18, or correct the path. |
+| `ClientCertificate` | The Configuration Service's own PostgreSQL connections would send no client certificate: `PGSSLCERT` is unset and the home directory holds no `.postgresql/postgresql.crt` (`%APPDATA%\postgresql\postgresql.crt` on Windows), unless `SSL Mode` is `Disable`. `psql` never sends one. | Remove the variable or the file; client-certificate authentication of the administrative login is not supported. |
+| `AmbientPassword` | With no `Password` in `AdminConnectionString`, the Configuration Service's own PostgreSQL connections would find no password elsewhere: `PGPASSWORD` is unset or empty, and no password file exists at `PGPASSFILE` or, when that is unset, at `.pgpass` in the home directory (`%APPDATA%\postgresql\pgpass.conf` on Windows). `psql` receives only the configured password. | Put the password in `AdminConnectionString` (a `${secret:...}` reference), or remove the variable or the file. |
+| `GssAuthentication` | The server did not authenticate the administrative login to `postgres` through GSSAPI (Kerberos). That login comes from the Configuration Service's Kerberos credentials, which `psql` does not receive. `pg_hba.conf` is matched per database, so this probe cannot see a GSSAPI rule for other databases: each create checks its staging database before `psql` starts and fails with a permanent `RestoreFailed`, operation `RestoreIntoStaging.GssAuthentication`, when that database is authenticated through GSSAPI. | Authenticate the administrative login with a password (or `trust`/`peer`) in `pg_hba.conf` for every database; GSSAPI authentication of it is not supported. |
+| `StagingDirectory`, `StagingVisibility` | The SQL Server staging directory exists; on Linux, it is owned by the Configuration Service user, is not group- or other-writable, and is neither a symbolic link nor under a directory another account could use to replace it; and SQL Server can read a probe file written into it. On Windows the owner and access control list are not checked. | See [SQL Server](#sql-server). |
+| `TargetLock` | A lock can be taken and released on the server. | Usually a server or privilege problem an earlier probe also reports. |
+
+### Template package trust
+
+Every package is authenticated before anything is extracted. `TrustPolicyPath` names one trust policy file
+in the template trust-policy format (`eng/docker-compose/template-trust-policy.json` is the tracked, empty
+example). The Configuration Service reads that one file; it does not merge the git-ignored
+`template-trust-policy.local.json` overlay the bootstrap scripts use. A policy with no
+`detached-attestation` producer makes provisioning `NotReady`. There is no unsigned mode.
+
+Until a CI-signed release publishes its producer key, sign the packages you deploy with your own key:
+
+1. Create a P-256 signer with `eng/DatabaseTemplates/new-template-dev-trust.ps1 -Purpose Dev`, or keep an
+   equivalent key under your own key management.
+2. Attest each package's exact bytes with `Write-TemplatePackageAttestation` from
+   `eng/DatabaseTemplates/Template-Management.psm1`, and place the attestation next to the package as
+   `<PackageId>.<Version>.nupkg.attestation.json` in `ArtifactDirectory`.
+3. List that producer and its public key in the file `TrustPolicyPath` names.
+
+Any change to a package's bytes after signing makes it `ArtifactUntrusted`.
+
+Every operation reads the trust policy again; nothing is cached from startup, so a corrected or replaced
+policy takes effect without a restart. Replace the file atomically: write the new policy to a file in the
+same directory, then rename it over the file `TrustPolicyPath` names. An operation that meets a policy it
+cannot use fails with `TrustPolicyUnavailable` before anything on the target server is touched, and
+readiness does not change. The failure is `Transient` while another process holds the file open
+exclusively, and `OperatorInspectionRequired` for a policy that is missing, cannot be read, is too large, or
+is not valid. At startup the same defects make provisioning `NotReady` (`StartupValidationFailed`, probe
+`TrustPolicy`) until the service restarts.
+
+### PostgreSQL
+
+| Topology | Supported |
+| --- | --- |
+| The Configuration Service (container or host) with `psql` 18 or later, reaching the server over TCP. The published Configuration Service image includes `psql` 18 at `/usr/bin/psql`. | Yes |
+| No `psql` in the Configuration Service runtime | No (`NotReady`, `PsqlVersion`) |
+| A non-superuser administrative login | No (`NotReady`, `Superuser`) |
+| The Configuration Service reaching the server directly, or through a pooler in session mode (one server backend per client connection for the connection's whole life) | Yes |
+| A pooler in transaction or statement mode between the Configuration Service and the server | No (not detected) |
+
+The per-target lock is a session-level advisory lock held on one connection for the whole operation, and
+the service ends and verifies other sessions by the server backend (`pid` and start time) serving them.
+A transaction or statement pooler can serve consecutive commands of one connection from different
+backends, which breaks both; PgBouncer, for example, lists session-level advisory locks as
+[unsupported in transaction pooling](https://www.pgbouncer.org/features.html). The service turns Npgsql's own
+pooling off, but that does not control an external pooler, and startup does not detect one. Every
+connection must also reach the same server: see `Host` under
+[AdminConnectionString](./CONFIGURATION.md#dmsdatastoreprovisioning).
+
+A database under the target name that is owned by a role other than a superuser or the administrative
+login itself is never opened or read: a create or delete of that name fails with `TargetUnverifiable` at
+operation `InspectTarget`. Inside a database those roles own, the identity, effective-schema, and
+document tables are read only when each is a table owned by such a role with built-in column types;
+otherwise the identity read is `TargetUnverifiable` and the facts read `SecurityStateViolation`
+(operation `RelationTrust`). Reading an object another role created could run that role's code with the
+administrator's privileges. A target created under an earlier superuser login stays readable after the
+secret is switched to another superuser login, as long as that earlier login remains a superuser.
+
+The database and the objects in it keep the earlier login as their owner; nothing transfers ownership. A
+retry of the create therefore reconciles such a target only while the server still reports the earlier login
+as a superuser, which it reads from `pg_roles` for every reconcile. Making the earlier login `NOLOGIN` is
+supported: it can no longer connect, but it stays trusted as an owner. Removing its `SUPERUSER` attribute is
+not: its targets are then refused with `TargetUnverifiable` at `InspectTarget` and need an operator to transfer
+their ownership. Objects owned by any other role that is not a superuser are still refused with
+`SecurityStateViolation` at `Ownership`, and a newly restored database must still be owned entirely by the login
+that restored it.
+
+The administrative login must be a **superuser**. The PostgreSQL template ends by making
+`edfi_dms_enqueue_owner` the owner of its enqueue functions. PostgreSQL allows that for a non-superuser only
+when the new owner may create objects in the `dms` schema, which the template's own security rules forbid.
+The narrower privileges are still checked and named individually, so one startup shows all of them:
+
+- `CREATEDB` (`CreateDatabasePrivilege`) to create, rename, and drop databases;
+- the privileges of `pg_signal_backend` (`SignalBackendPrivilege`) to end other sessions on a target;
+- the privileges of `pg_read_all_stats` (`ReadAllStatsPrivilege`) to identify those sessions;
+- `CREATEROLE` while `edfi_dms_enqueue_owner` does not exist yet (`EnqueueOwnerRole`). Once it exists it
+  must be `NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`, with no
+  membership that carries the admin, inherit, or set option; otherwise operations fail with
+  `RoleStateUnsafe`.
+
+`template0` must use `UTF8` encoding; `template1` is not used. Every staging database is created with
+`CREATE DATABASE ... TEMPLATE template0 ENCODING 'UTF8'`, so objects added to `template1` never reach it and
+a session open on `template1` does not block it. The staging database, and the target it becomes, takes
+`template0`'s locale, which is the locale the cluster was initialized with. PostgreSQL cannot change the
+encoding of `template0` in place: a cluster whose `template0` is not UTF-8 must be initialized again with
+UTF-8 encoding.
+
+**Upgrade note.** Earlier builds of the provisioner checked and copied `template1` (probe
+`Template1Encoding`). A cluster that was `Ready` because its `template1` is UTF-8 while its `template0` is
+not becomes `NotReady` after upgrading, with `DMSPROV-EngineIncompatible` and probe `Template0Encoding`.
+Initialize such a cluster again with UTF-8 encoding. A cluster whose `template0` is UTF-8 needs no change.
+
+### SQL Server
+
+`RESTORE` reads its backup from a file the server opens, so the Configuration Service copies each backup into
+a staging directory the server also sees. The directory separates the two identities: the Configuration
+Service owns it and writes into it, and SQL Server can only read it. On Linux the service refuses a
+directory it does not own or that is group- or other-writable.
+
+The directory's own permissions protect a staged file only while its path keeps naming that directory, and
+`RESTORE` opens the file by path after it has been staged and verified. On Linux the service therefore also
+refuses, at startup and again before every staging, a `StagingPath` that is a symbolic link or passes through
+one, and a path any directory above which is owned by an account other than `root` and the Configuration
+Service, or is writable by its group or by others without the sticky bit. Any such account could rename the
+staging directory away and put its own file under the same path. Startup reports this as
+`StagingDirectory.UnsafeAncestry.<reason>`; an operation fails with `StagingFailed` for inspection at operation
+`StageBackup.UnsafeDirectory.<reason>`, before anything is written. The reasons are `SymbolicLink`,
+`NotDirectory`, `UntrustedOwner`, `ReplaceableEntries`, and `Unverifiable`. The same-host and shared-volume
+setups below pass: `/var/opt` and a container mount point's parents belong to `root` and are not group-writable.
+
+The service cannot inspect the server's side of `StagingServerPath`, so the operator must give it the same
+property. In the SQL Server host's or container's namespace, the staging directory and every directory above it
+must be real directories, not symbolic links, and no account other than `root` (or a Windows administrator) may
+write any directory above the staging directory, so none can rename or replace it. The SQL Server service
+account must not be able to write the staging directory or anything above it. Mount the shared volume or share
+only into the Configuration Service and SQL Server, so no other container or process can write into it or
+mount something else at that path.
+
+On Windows, and on a share, the service does not inspect the owner or the access control list: the operator
+must configure that separation (the Configuration Service identity with Modify, the SQL Server service identity
+with Read & Execute only) on the staging folder and every folder above it, and verify it, because the service
+cannot detect a directory other accounts may write. It re-hashes the staged file after the restore and fails
+with `StagingIntegrityViolation` if the file changed.
+
+| Topology | Setup | Supported |
+| --- | --- | --- |
+| Same host | `groupadd dms-staging`; `usermod -aG dms-staging mssql` (the SQL Server service account); `mkdir -p /var/opt/dms-staging`; `chown <cms user>:dms-staging /var/opt/dms-staging`; `chmod 2750 /var/opt/dms-staging`. `Mssql:StagingPath` and `Mssql:StagingServerPath` are the same path. | Yes |
+| Configuration Service and SQL Server containers sharing a volume | On the volume: `chown <cms uid>:<gid>` and `chmod 2750`. Run SQL Server with `--group-add <gid>` and the Configuration Service as the owning uid (the published image runs as root). `StagingPath` and `StagingServerPath` are each container's mount point. On Docker Desktop, use a named volume: a bind mount from Windows shows every file as `0777`. | Yes |
+| An SMB or NFS share mapped into both | The Configuration Service identity has Modify; the SQL Server service SID has Read & Execute only. `StagingServerPath` is the server's view of the share. | Yes |
+| No staging path SQL Server can see | — | No (`NotReady`, `StagingVisibility`) |
+| Platforms without `RESTORE ... FROM DISK` | — | No |
+
+A local, runnable version of the container topology with separate Linux identities is in
+[RUNNING-LOCALLY.md](./RUNNING-LOCALLY.md#cms-dms-template-provisioning-sql-server-staging-with-separate-identities).
+
+The administrative login must be a member of **`sysadmin`** (`CreateDatabasePrivilege`, operation
+`CreateDatabasePrivilege.Sysadmin`). A login that is not `sysadmin` is `NotReady`, whatever other privileges it
+holds. Startup also checks the privileges `sysadmin` carries and names each missing one separately:
+
+- `ALTER ANY DATABASE` (`AlterAnyDatabasePrivilege`);
+- `ALTER ANY CONNECTION` (`AlterAnyConnectionPrivilege`), to end other sessions on a target;
+- `VIEW SERVER STATE`, or `VIEW SERVER PERFORMANCE STATE` where the server has it
+  (`ViewServerStatePrivilege`);
+- visibility of `sys.master_files` (`FileCatalogVisibility`).
+
+The `sysadmin` requirement comes from this provisioner's restore path, not from `RESTORE` itself: SQL Server lets
+a `dbcreator` member restore a backup into a new database
+([RESTORE permissions](https://learn.microsoft.com/en-us/sql/t-sql/statements/restore-statements-transact-sql#permissions)).
+After such a restore, SQL Server records the login as the new database's owner, but the database's own `dbo`
+stays the owner recorded in the backup. The login then cannot open the staging database it has just restored
+(error `4060`), and the provisioner must open it to validate it. A `sysadmin` enters every database as `dbo`.
+
+The instance default data and log paths must be set (`DefaultDataPath`, `DefaultLogPath`). Restored files
+go there under generated names, never to the paths recorded in the backup.
+
+### Operational rule
+
+While provisioning is enabled, do not run DDL by hand (create, rename, drop, or `ALTER DATABASE` state or
+permissions) against a managed data store's database or any `edfi_dms_provision_*` database, except as
+described under [Recovery](#recovery), while the data store's record is in a failed state and no session
+holds its lock (see [A lock that is never released](#a-lock-that-is-never-released)). The provisioner
+detects a database it cannot verify and refuses it, but a change made by hand at the moment of a step
+cannot always be detected. On SQL Server, for example, a delete checks the database's identity and drops it
+in one batch, and a rename made between the two by another session can have the wrong database dropped.
+
+### Failure codes
+
+Every failure carries a code, a category, and a diagnostic with only the step that failed, the exception
+type names, and the provider's error number or SQLSTATE. It never carries a connection string, secret,
+server message, or `psql` output. The category tells the caller whether to retry:
+
+| Category | Meaning | Retry |
+| --- | --- | --- |
+| `InvalidRequest` | The request itself was rejected: unknown template, invalid name, empty identity, missing pin. | No |
+| `NotReady` | Provisioning is disabled or failed its startup checks. | Not until a restart |
+| `Transient` | The target was left as it was, or the outcome was settled; the same request may succeed later. The cleanup report may still list leftovers. | Yes |
+| `Permanent` | The same inputs fail again. No target was left behind, but the cleanup report may still list leftovers. | No |
+| `OperatorInspectionRequired` | A database, package, or server state needs a person to look at it. | No |
+
+| Code | Category |
+| --- | --- |
+| `FeatureDisabled`, `StartupValidationFailed` | `NotReady` |
+| `TemplateNotAllowlisted`, `InvalidTargetName`, `EmptySourceIdentity`, `ArtifactPinMissing` | `InvalidRequest` |
+| `ProtectedTarget`, `AdminPrivilegeMissing`, `RoleStateUnsafe`, `EngineIncompatible`, `StagingNotVisible` | `Permanent` |
+| `ServerRejected` | `Permanent`; `Transient` when the server rejected the administrative command, so nothing changed, for a reason that can clear on its own: a PostgreSQL serialization failure, deadlock, unavailable lock, or temporary resource shortage, or a SQL Server deadlock victim (error 1205) or temporary memory shortage (error 701). A refusal for lack of a privilege is `AdminPrivilegeMissing`, never this |
+| `SecretResolutionFailed`, `ServerUnavailable`, `LockTimeout`, `LockUnavailable`, `TimedOut`, `StagingNameCollision`, `Unknown` | `Transient` |
+| `StagingFailed` | `Transient`; `OperatorInspectionRequired` when the operation directory root is unsafe on a Unix host (operation `StagePackage.OperationRootUnsafe.<reason>`; see `OperationDirectory` in [CONFIGURATION.md](./CONFIGURATION.md#dmsdatastoreprovisioning)) |
+| `RestoreFailed` | `Permanent`; `Transient` when the restore, or a request it needs before it starts (such as the SQL Server backup header read or the PostgreSQL enqueue-owner role check), is known to have rolled back or been rejected for a reason that can clear on its own: a lost connection, a PostgreSQL serialization failure, deadlock, unavailable lock, or temporary resource shortage, or a SQL Server deadlock victim (error 1205) or temporary memory shortage (error 701) |
+| `ExclusiveAccessNotEstablished`, `LockLost`, `DropFailed` | `Transient` before anything on the target changed, or when the operation proved afterwards that its uncertain rename or fence left nothing in place (the rename did not happen and nothing holds the target name; the target is ours and accepts connections); `OperatorInspectionRequired` otherwise |
+| `TrustPolicyUnavailable` | `OperatorInspectionRequired`; `Transient` while another process holds the trust policy file open exclusively. Only an operation reports it; at startup a policy that cannot be used is `StartupValidationFailed`. See [Template package trust](#template-package-trust) |
+| `ArtifactMissing`, `ArtifactUntrusted`, `ArtifactTampered`, `ManifestInvalid`, `ManifestMismatch`, `BackupInvalid`, `PackageIdentityInvalid`, `ArtifactChangedSinceCreate` | `OperatorInspectionRequired` |
+| `ContentProfileViolation`, `TargetIncompatible`, `SecurityStateViolation`, `StagingIntegrityViolation`, `IdentityAssignmentFailed`, `TargetUnowned`, `TargetUnverifiable`, `TargetFenced`, `InstanceChanged`, `OutcomeUnknown`, `CompensationFailed` | `OperatorInspectionRequired` |
+
+#### A refused administrative login, and rotating its password
+
+When the target server refuses the administrative login or the lock request during an operation, the create
+or delete fails with `AdminPrivilegeMissing` (`Permanent`) at operation `AcquireTargetLock`. The diagnostic
+carries the provider code: PostgreSQL SQLSTATE `42501` or class `28` (for example `28P01`, a wrong password, or
+`28000`, a role that may not log in); SQL Server error `18456` (login failed) or `18470` (login disabled),
+among the other permission errors. The job does not retry it.
+
+A password rotation fails operations this way whenever the server rejects the password the Configuration
+Service is still using. The administrative connection string is resolved again for every operation, but a
+`${secret:...}` value is reused from the Configuration Service's secret cache until
+[`SecretsSettings:CacheExpirationSeconds`](./CONFIGURATION.md#secretssettings) (300 seconds by default) has
+passed since it was fetched, and a password written directly in `AdminConnectionString` changes only with a
+restart. See [How a rotation propagates](./SECRETS.md#how-a-rotation-propagates).
+
+- **Without failed operations:** neither PostgreSQL nor SQL Server keeps an old and a new password for one
+  login, so switch logins instead. The second login must be a supported administrative login too: a superuser
+  on PostgreSQL, a member of `sysadmin` on SQL Server. Point the secret at it, and disable the first login only
+  once both hold: the cache window has passed (or the Configuration Service was restarted, which clears its
+  cache), and every create or delete that started before the switch has finished. Each operation keeps the
+  credential it resolved when it started for its whole run, cleanup and recovery included, so disabling the
+  old login under a running operation can fail it or leave its cleanup unfinished. On PostgreSQL, disable the
+  first login with `NOLOGIN` and keep it a superuser: the targets it created stay owned by it and are trusted
+  only while it is one (see [PostgreSQL](#postgresql)). On SQL Server, each target stays owned by the login
+  that created it. The second login reads those targets because a `sysadmin` enters every database as `dbo`.
+  Equal server privileges short of `sysadmin` would not be enough: `dbcreator`, `ALTER ANY DATABASE`,
+  `ALTER ANY CONNECTION`, and `VIEW SERVER STATE` let a login alter and drop a database, but not open one it
+  does not own, so the target's identity could not be verified
+  ([server-level roles](https://learn.microsoft.com/en-us/sql/relational-databases/security/authentication-access/server-level-roles)).
+- **Changing the password in place:** update the secret and the login together, then restart the
+  Configuration Service or wait out the cache window. Operations in between fail as described above, and so
+  can an operation already running with the old password when it opens its next connection.
+- **After a failure:** correct the credential, wait until the Configuration Service resolves the updated value
+  (the cache window, or a restart), then rerun the failed job.
+
+### Recovery
+
+Never drop a database by hand unless you have shown which data store record it belongs to. A database that
+no `dmscs.DataStore` row points at is not proven to be an orphan, and an identity that cannot be read may
+only mean the login lacks a privilege. **If ownership remains uncertain, stop and do not delete.**
+
+- **`TargetUnowned`**: a database holds the requested name but carries another identity. Find out which
+  record or deployment owns it. Rename or drop it only once it is shown to belong to no one, then retry.
+- **`TargetUnverifiable`**, or an operation interrupted between the rename and the identity marker: the
+  database records which operation created it. On PostgreSQL, `shobj_description(oid, 'pg_database')` reads
+  `edfi-dms-provision:v1:<operation id>:<expected identity>`. On SQL Server, the primary file's
+  `physical_name` ends in `__<operation id>.mdf`. Drop it by hand, then retry, only when all of these hold:
+  - the database holds this record's target name;
+  - its operation id is the one in this record's failed create (the `1438_10` `OperationFailed` log line
+    names the operation id and the code);
+  - on PostgreSQL, the expected identity in the comment equals the identity this record persisted;
+  - no `dmscs.DataStore` row points at the database.
+- **`TargetFenced`**: an interrupted delete left the database closed to connections. After confirming that
+  no session holds its lock, reopen it: PostgreSQL `ALTER DATABASE "<name>" ALLOW_CONNECTIONS true`;
+  SQL Server `ALTER DATABASE [<name>] SET MULTI_USER`.
+- **`ArtifactChangedSinceCreate`**: the package now in `ArtifactDirectory` is not the one the data store was
+  first created from. Put the original package back, or create a new data store.
+- **`CompensationFailed`, `OutcomeUnknown`, `InstanceChanged`, `ExclusiveAccessNotEstablished`,
+  `StagingIntegrityViolation`, `LockLost`**: inspect the database the failure names, confirm that no session
+  holds its lock, then apply the matching step above.
+
+### A lock that is never released
+
+Each operation holds a per-name lock on the target server, in a session named `dmsprov:<operation id>`. If
+`LockTimeout` persists after every Configuration Service instance that could hold the lock is stopped or
+idle, find the holder by the lock, never by session name or age alone. Confirm that no running instance
+logs that operation id, and only then end the session. The operation that owned it, if still running, then
+fails safely with `LockLost`.
+
+PostgreSQL, connected to the `postgres` database (replace `<target name>`). Target names are ASCII, and
+`COLLATE "C"` makes `lower()` change only `A`–`Z`, as the service does; under the database's own locale
+(Turkish, for example) `lower()` can derive a different key and miss the holder:
+
+```sql
+WITH k AS (
+    SELECT encode(sha256(convert_to('dms-provision-target:v1:' || lower('<target name>' COLLATE "C"), 'UTF8')), 'hex') AS h
+)
+SELECT a.pid, a.application_name, a.backend_start
+FROM k, pg_locks l
+JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE l.locktype = 'advisory'
+  AND l.database = (SELECT oid FROM pg_database WHERE datname = 'postgres')
+  AND l.classid::bigint = ('x' || lpad(substr(k.h, 1, 8), 16, '0'))::bit(64)::bigint
+  AND l.objid::bigint = ('x' || lpad(substr(k.h, 9, 8), 16, '0'))::bit(64)::bigint
+  AND l.objsubid = 1
+  AND l.granted;
+```
+
+After confirming that `application_name` is `dmsprov:<operation id>` and its instance is stopped, run
+`SELECT pg_terminate_backend(<pid>, 10000);`.
+
+SQL Server shows an application lock only by a truncated resource name, so request the same lock and see
+which session blocks it. In one session on `master`:
+
+```sql
+EXEC sp_getapplock @Resource = N'dms-provision-target:v1:<lowercase target name>',
+    @LockMode = 'Exclusive', @LockOwner = 'Session', @LockTimeout = 30000;
+```
+
+While it waits, from a second session (replace `<first session id>`):
+
+```sql
+SELECT g.request_session_id, s.program_name, s.login_time
+FROM sys.dm_tran_locks w
+JOIN sys.dm_tran_locks g
+    ON g.resource_type = w.resource_type
+    AND g.resource_database_id = w.resource_database_id
+    AND g.resource_description = w.resource_description
+    AND g.request_status = 'GRANT'
+JOIN sys.dm_exec_sessions s ON s.session_id = g.request_session_id
+WHERE w.request_session_id = <first session id>
+  AND w.resource_type = 'APPLICATION'
+  AND w.request_status = 'WAIT';
+```
+
+End the first session's request: cancel it, or run `sp_releaseapplock` if it was granted because nothing
+held the lock. After confirming that `program_name` is `dmsprov:<operation id>` and its instance is
+stopped, run `KILL <session id>`. Then wait until no row in `sys.dm_exec_sessions` has both that
+`session_id` and that `login_time`; SQL Server reuses a freed `session_id` immediately.
+
+### Leftovers after a crash
+
+A failed or cancelled operation tries to remove what it created, with `CleanupAttempts` bounded attempts;
+removal is not guaranteed. What a call could not remove is listed in its result's cleanup report, whatever
+the outcome or failure category, and logged by generated name. A cancelled call returns no result, so its
+leftovers are reported only in the log. A process that crashed reports nothing.
+
+| Event | Level | Leftover |
+| --- | --- | --- |
+| `1438_12` `StagingResidue` | Error | A staging database |
+| `1438_14` `TargetResidue` | Error | A target left closed to connections by a delete, or renamed but not marked by a create, for inspection |
+| `1438_21` `ResidueLeft` | Error | An operation directory or a file in it |
+| `1438_22` `CredentialResidue` | Critical | A credential file in an operation directory |
+| `1438_34` `PasswordFileRetained` | Warning | The password file of a `psql` replay (the operation directory's cleanup then reports it) |
+| `1438_40` `StagedFileResidue` | Error | A staged SQL Server backup |
+| `1438_41` `ProbeFileResidue` | Error | A readiness probe file |
+
+Nothing is swept automatically on a later start: a process that crashed leaves its leftovers until an
+operator removes them. To find them:
+
+- operation directories `dms-provision-*` under `OperationDirectory` (the process temp directory when it is
+  not set) and staged backups `dms-provision-*.bak` under `Mssql:StagingPath`. Remove credential files
+  first;
+- PostgreSQL staging databases:
+  `SELECT datname, shobj_description(oid, 'pg_database') FROM pg_database WHERE datname LIKE 'edfi\_dms\_provision\_stage\_%';`
+- SQL Server staging databases:
+  `SELECT d.name, d.state_desc, f.physical_name FROM sys.databases d JOIN sys.master_files f ON f.database_id = d.database_id AND f.file_id = 1 WHERE d.name LIKE 'edfi[_]dms[_]provision[_]stage[_]%';`
+
+The 12 hex characters after `edfi_dms_provision_stage_`, and in each file name, are the operation id.
+Confirm that no session belongs to that operation (`application_name` or `program_name`
+`dmsprov:<operation id>` or `dms-provision:<operation id>`), then remove the leftover.

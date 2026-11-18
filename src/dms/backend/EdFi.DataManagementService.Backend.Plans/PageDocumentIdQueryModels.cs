@@ -34,15 +34,14 @@ public abstract record QueryPredicateTarget
 /// <param name="Target">The SQL-side predicate target.</param>
 /// <param name="Operator">The value-comparison operator.</param>
 /// <param name="ParameterName">The bare SQL parameter name that supplies the value.</param>
-/// <param name="ScalarKind">
-/// Optional scalar-kind metadata for the predicate value. Used by SQL emission for provider-specific string-comparison
-/// semantics.
+/// <param name="StringContract">
+/// The declared contract of the compared string column, or null when the value is not a string.
 /// </param>
 public sealed record QueryValuePredicate(
     QueryPredicateTarget Target,
     QueryComparisonOperator Operator,
     string ParameterName,
-    ScalarKind? ScalarKind = null
+    QuerySqlStringContract? StringContract = null
 )
 {
     /// <summary>
@@ -52,9 +51,9 @@ public sealed record QueryValuePredicate(
         DbColumnName Column,
         QueryComparisonOperator Operator,
         string ParameterName,
-        ScalarKind? ScalarKind = null
+        QuerySqlStringContract? StringContract = null
     )
-        : this(new QueryPredicateTarget.RootColumn(Column), Operator, ParameterName, ScalarKind) { }
+        : this(new QueryPredicateTarget.RootColumn(Column), Operator, ParameterName, StringContract) { }
 }
 
 /// <summary>

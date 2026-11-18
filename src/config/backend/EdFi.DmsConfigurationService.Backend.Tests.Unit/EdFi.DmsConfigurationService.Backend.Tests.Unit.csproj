@@ -7,6 +7,7 @@
         <IsTestProject>true</IsTestProject>
     </PropertyGroup>
     <ItemGroup>
+        <PackageReference Include="CsCheck" />
         <PackageReference Include="FakeItEasy" />
         <PackageReference Include="FluentAssertions" />
         <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
@@ -21,6 +22,21 @@
     </ItemGroup>
     <ItemGroup>
         <Using Include="NUnit.Framework" />
+    </ItemGroup>
+    <ItemGroup>
+        <!-- The PostgreSQL integration lane reuses the fake psql and the package builder. -->
+        <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+            <_Parameter1>EdFi.DmsConfigurationService.Backend.Postgresql.Tests.Integration</_Parameter1>
+        </AssemblyAttribute>
+    </ItemGroup>
+    <ItemGroup>
+        <None Update="Fixtures/ClaimsComposition/**/*.json" CopyToOutputDirectory="PreserveNewest" />
+        <None Update="Fixtures/AuthorizationMetadata/**/*.json" CopyToOutputDirectory="PreserveNewest" />
+        <None
+            Update="Fixtures/connection-string-encryption-vectors.json"
+            CopyToOutputDirectory="PreserveNewest"
+        />
+        <None Update="Fixtures/DataStoreProvisioning/**/*" CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
     <ItemGroup>
         <ProjectReference Include="..\EdFi.DmsConfigurationService.Backend\EdFi.DmsConfigurationService.Backend.csproj" />

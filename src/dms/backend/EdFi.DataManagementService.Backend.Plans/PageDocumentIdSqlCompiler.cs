@@ -201,7 +201,7 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
                 null,
                 predicate.Operator,
                 predicate.ParameterName,
-                predicate.ScalarKind
+                predicate.StringContract
             );
         }
 
@@ -221,7 +221,7 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
                 null,
                 predicate.Operator,
                 predicate.ParameterName,
-                predicate.ScalarKind
+                predicate.StringContract
             );
         }
 
@@ -232,7 +232,7 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
             mapping.PresenceColumn,
             predicate.Operator,
             predicate.ParameterName,
-            predicate.ScalarKind
+            predicate.StringContract
         );
     }
 
@@ -339,14 +339,29 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         [
             .. predicates.Select(static predicate => new QuerySqlParameter(
                 QuerySqlParameterRole.Filter,
-                predicate.ParameterName
+                predicate.ParameterName,
+                predicate.StringContract is { } stringContract
+                    ? QuerySqlParameterBinding.CreateString(stringContract.MaxLength)
+                    : null
             )),
         ];
 
         if (namespacePrefixParameterization is not null)
         {
+            // SQL Server binds each escaped prefix pattern as its own scalar. A pattern is claim data,
+            // lengthened by escaping and the appended wildcard, so it has no bounded contract; it is
+            // declared unbounded rather than sized by its value. PostgreSQL binds one array instead.
             filterParametersInOrder.AddRange(
-                NamespacePrefixSqlHelper.BuildFilterParametersInOrder(namespacePrefixParameterization)
+                NamespacePrefixSqlHelper
+                    .BuildFilterParametersInOrder(namespacePrefixParameterization)
+                    .Select(static parameter =>
+                        parameter.Binding.Kind is QuerySqlParameterBindingKind.Scalar
+                            ? parameter with
+                            {
+                                Binding = QuerySqlParameterBinding.CreateString(maxLength: null),
+                            }
+                            : parameter
+                    )
             );
         }
 
@@ -924,8 +939,7 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
             _rootAlias,
             new DbColumnName(ResolveOrderingColumnName(cursor)),
             operatorToken,
-            parameterName,
-            ScalarKind.Int64
+            parameterName
         );
     }
 
@@ -1035,8 +1049,7 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         // single step when the basis is the subject itself or is referenced by a root-owned FK, and a
         // child-table edge is prefixed with a root-to-child step (making the path two steps). The FK already
         // holds the basis resource's DocumentId, so the column can be filtered against the auth view
-        // directly. This covers descriptor bases too — their terminal step carries dms.Descriptor/DocumentId
-        // as a target, but the extra root re-scan those targets would drive is redundant.
+        // directly. Descriptor bases use a separate hop through DescriptorId to the owning DocumentId.
         if (pathSteps.Count == 1)
         {
             if (!terminalStep.SourceTable.Equals(rootTable))
@@ -1598,8 +1611,7 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
             GetTargetAlias(predicate.Target),
             predicate.CanonicalColumn,
             predicate.Operator,
-            predicate.ParameterName,
-            predicate.ScalarKind
+            predicate.ParameterName
         );
     }
 
@@ -1611,8 +1623,7 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         string tableAlias,
         DbColumnName column,
         QueryComparisonOperator @operator,
-        string parameterName,
-        ScalarKind? scalarKind
+        string parameterName
     )
     {
         _planSqlDialect.AppendComparisonSql(
@@ -1620,8 +1631,7 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
             tableAlias,
             column,
             ToSqlOperator(@operator),
-            parameterName,
-            scalarKind
+            parameterName
         );
     }
 
@@ -1888,7 +1898,7 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
     /// <param name="PresenceColumn">An optional presence gate column that must be <c>IS NOT NULL</c>.</param>
     /// <param name="Operator">The comparison operator.</param>
     /// <param name="ParameterName">The bare SQL parameter name that supplies the value.</param>
-    /// <param name="ScalarKind">Optional scalar-kind metadata for provider-specific comparison behavior.</param>
+    /// <param name="StringContract">The declared string contract carried from the predicate.</param>
     private readonly record struct RewrittenPredicate(
         QueryPredicateTarget Target,
         DbColumnName OriginalColumn,
@@ -1896,6 +1906,6 @@ public sealed class PageDocumentIdSqlCompiler(SqlDialect dialect)
         DbColumnName? PresenceColumn,
         QueryComparisonOperator Operator,
         string ParameterName,
-        ScalarKind? ScalarKind
+        QuerySqlStringContract? StringContract
     );
 }

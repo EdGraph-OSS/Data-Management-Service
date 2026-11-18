@@ -31,6 +31,16 @@ cd ../
 ./build-dms.ps1 run
 ```
 
+The shipped DMS `appsettings.json` sets `JwtAuthentication:RequireHttpsMetadata`
+to `true`, so DMS does not start when `JwtAuthentication:MetadataAddress` is a
+plain `http://` address. The DMS starter file
+`src/dms/frontend/EdFi.DataManagementService.Frontend.AspNetCore/appsettings.Development.json.example`
+sets it to `false` because the local Configuration Service is reached over
+http. If you already have an `appsettings.Development.json`, add
+`"RequireHttpsMetadata": false` under `JwtAuthentication`. Keep the value `true`
+for any identity provider reachable over an untrusted network; see
+[Configuration](./CONFIGURATION.md#jwtauthentication-parameters-in-appsettingsjson-dms-api-service).
+
 ## Selecting a Data Standard version
 
 The local start/build scripts run **Data Standard 5.2 by default**. To run a
@@ -63,6 +73,16 @@ If you already have an `appsettings.Development.json`, add the missing values to
 it instead of copying over it. Replacing the file changes the derived encryption
 key, which orphans any connection strings already stored in your local
 Configuration Service database.
+
+The shipped `appsettings.json` sets `IdentitySettings:RequireHttpsMetadata` to
+`true`, and the starter file sets it to `false` because a local identity
+provider is reached over http. If you already have an
+`appsettings.Development.json`, add `"RequireHttpsMetadata": false` under
+`IdentitySettings`. In self-contained mode the Configuration Service fetches no
+metadata, so the setting has no effect there, but a local run against a plain
+http Keycloak fails at the first authenticated request without it. Keep the
+value `true` for any identity provider reachable over an untrusted network; see
+[Configuration](./CONFIGURATION.md#relevant-parameters-in-appsettingsjson-configuration-service).
 
 `appsettings.Development.json` is gitignored, so the values stay on your
 machine. `DatabaseSettings:EncryptionKey` must be at least 32 ASCII characters;
@@ -103,7 +123,7 @@ Visual Studio. The file name is
 
 The `EdFi.DataManagementService.Tests.Integration` project boots the real DMS
 HTTP pipeline against a provisioned PostgreSQL and/or SQL Server database,
-with auth/CMS/profile-catalog/application-context faked. See
+with auth/Configuration Service/profile-catalog/application-context faked. See
 [`src/dms/tests/EdFi.DataManagementService.Tests.Integration/README.md`](../src/dms/tests/EdFi.DataManagementService.Tests.Integration/README.md)
 for the fixture map, runtime-compatibility materialization details, and the
 recipe for adding a scenario.
@@ -162,6 +182,245 @@ dotnet test src/dms/tests/EdFi.DataManagementService.Tests.Integration --filter 
 
 Tests whose dialect is unconfigured cleanly `Assert.Ignore`, so partial
 local setups still produce a useful test run.
+
+## MSSQL backend integration provisioning diagnostics
+
+The backend MSSQL integration project creates real SQL Server databases during
+fixture setup. These tests use `ConnectionStrings__MssqlAdmin` as described
+above; they are separate from the API-level integration project and from the
+Docker-stack E2E suite.
+
+Verify that the SQL Server endpoint in the test configuration is reachable before running.
+Use the SQL Server 2025 setup above, or start a temporary container on an available host
+port (for example, `1434`) and override `ConnectionStrings__MssqlAdmin` for the test command.
+In Bash, from the repository root:
+
+```bash
+docker run --rm --name dms-codex-mssql -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='<StrongPassword>' -p 1434:1433 -d mcr.microsoft.com/mssql/server:2025-latest
+# Wait until SQL Server is ready before running tests.
+ConnectionStrings__MssqlAdmin='Server=localhost,1434;User Id=sa;Password=<StrongPassword>;TrustServerCertificate=True;Encrypt=True' dotnet test src/dms/backend/EdFi.DataManagementService.Backend.Mssql.Tests.Integration/EdFi.DataManagementService.Backend.Mssql.Tests.Integration.csproj
+docker stop dms-codex-mssql
+```
+
+Replace `<StrongPassword>` with the same strong password in both commands. Stop the
+temporary container after the run; `--rm` removes it when stopped.
+
+On slow or emulated hosts, such as Apple Silicon running the amd64 SQL Server
+image, concurrent baseline provisioning can exceed the command timeout even
+when individual fixtures pass. Use the concurrency setting or shard filters
+below to reduce provisioning contention during local development.
+
+The same provisioning gate and diagnostics also apply to the SQL Server paths
+in `src/dms/tests/EdFi.DataManagementService.Tests.Integration` and
+`src/dms/clis/EdFi.DataManagementService.DocumentCacheAdmin.Tests.Integration`.
+
+Run the backend project without a fixture or category filter to see the same
+setup failures that occur in an unfiltered test host:
+
+```powershell
+dotnet test src/dms/backend/EdFi.DataManagementService.Backend.Mssql.Tests.Integration/EdFi.DataManagementService.Backend.Mssql.Tests.Integration.csproj
+```
+
+Generated-DDL admission is unlimited when
+`MSSQL_GENERATED_DDL_PROVISION_MAX_CONCURRENCY` is unset or blank. To cap the
+number of admitted provisioning operations in a new test process, set a
+positive integer before starting it:
+
+```powershell
+$env:MSSQL_GENERATED_DDL_PROVISION_MAX_CONCURRENCY = '1'
+dotnet test src/dms/backend/EdFi.DataManagementService.Backend.Mssql.Tests.Integration/EdFi.DataManagementService.Backend.Mssql.Tests.Integration.csproj
+```
+
+The setting is captured lazily once per process, so change it and restart the
+test process to apply a different value. It only coordinates tests inside that
+process; it does not limit other processes or SQL Server activity. The existing
+300-second generated-DDL command timeout remains unchanged. A timeout message
+reports process-wide admitted-operation samples at batch start and timeout,
+including the failing operation and excluding queued entrants. Those samples
+are not executing-query counts and do not prove an engine wait. The message
+labels provisioning contention as suspected when either sample observes
+overlap, and possible when neither does. Snapshot creation/restoration,
+backup/restore, resets, and standalone `ApplyGeneratedDdlAsync` reapplication
+are outside the gate and its counts, including the DS52-TPDM idempotency check.
+If the effective limit is already 1, investigate this ungated in-process work,
+other test processes, and SQL Server waits/logs; the limit cannot be reduced
+further. Use the local shard filters below to narrow the workload when investigating.
+
+Only command timeouts while applying generated-DDL batches under provisioning
+admission receive this diagnostic. Timeouts during `CREATE DATABASE`, connection
+opening, transaction commit, reset-plan discovery, snapshot creation/restoration,
+and backup/restore retain their provider failures without a contention diagnostic.
+The `contextOrigin` field identifies the recorded caller by source filename,
+member, and line; shared baselines retain the context from their first
+registration, which may differ from the fixture currently acquiring a lease.
+
+The diagnostic is attached to the original provider exception's `Data` under
+`MssqlGeneratedDdlProvisioningDiagnostic` and also written to stderr
+(`Console.Error`). NUnit includes exception data in each affected test's setup
+failure, making the context available in console and TRX results even when
+stderr is captured only at run level. The provider exception type, number,
+message, and stack are preserved. CSV timing output is optional.
+
+Optional CSV timing output, with rows per phase and DDL batch, can
+be enabled with `MSSQL_FIXTURE_TIMINGS_PATH`. Output failures are best-effort
+and do not replace test failures or interrupt cleanup. An unavailable path
+produces at most one warning per configured path in a process; inspect the
+setting's value and its parent directory permissions. Paths are omitted from
+warnings.
+
+Backend CI uses four categories, `MssqlCiShard1` through `MssqlCiShard4`, with
+the `backup-restore` lease strategy and a provisioning concurrency limit of 2
+by default. To isolate one shard locally:
+
+```powershell
+$env:MSSQL_GENERATED_DDL_LEASE_STRATEGY = 'backup-restore'
+$env:MSSQL_GENERATED_DDL_PROVISION_MAX_CONCURRENCY = '2'
+dotnet test src/dms/backend/EdFi.DataManagementService.Backend.Mssql.Tests.Integration/EdFi.DataManagementService.Backend.Mssql.Tests.Integration.csproj --filter "Category=MssqlCiShard4"
+```
+
+Replace the category to select another shard. On slow or emulated hosts,
+use shard filters for routine local runs and the unfiltered command above
+to reproduce whole-suite provisioning contention. Controlled
+provider-timeout probes are explicit and outside these CI shards; run them
+separately when changing the diagnostic wiring:
+
+```powershell
+dotnet test src/dms/backend/EdFi.DataManagementService.Backend.Mssql.Tests.Integration/EdFi.DataManagementService.Backend.Mssql.Tests.Integration.csproj --filter "FullyQualifiedName~Given_MssqlGeneratedDdlProvisioningPipeline&FullyQualifiedName!~Non_Timeout"
+```
+
+Keep the non-timeout fixture excluded from this probe command. The pinned NUnit
+adapter skips explicit probes when the filter also selects non-explicit tests.
+The non-timeout failure fixture runs in `MssqlCiShard4`.
+
+## CMS DMS-template provisioning integration tests
+
+The Configuration Service's provisioning tests against real servers are in
+category `DmsProvisioning` of
+`backend/EdFi.DmsConfigurationService.Backend.Postgresql.Tests.Integration` and
+`backend/EdFi.DmsConfigurationService.Backend.Mssql.Tests.Integration` (under
+`src/config`). The regular integration run excludes the category; CI runs it in
+the `run-dms-provisioning-integration-tests` job. Each lane reads its settings
+from these variables:
+
+| Variable | Lane | Purpose |
+| --- | --- | --- |
+| `ConnectionStrings__PostgresqlDmsAdmin` | PostgreSQL | Superuser connection to a PostgreSQL 18 server, database `postgres` |
+| `DMS_PROVISIONING_PSQL_PATH` | PostgreSQL | `psql` 18 executable |
+| `ConnectionStrings__MssqlDmsAdmin` | SQL Server | `sysadmin` connection to SQL Server 2022 or later (CI uses 2025, which the real packages need) |
+| `DMS_PROVISIONING_MSSQL_STAGING_PATH`, `DMS_PROVISIONING_MSSQL_STAGING_SERVER_PATH` | SQL Server | A directory the server also sees, as the tests see it and as the server sees it |
+| `DMS_TEMPLATE_PACKAGE_DIRECTORY` | Both | The four `EdFi.Api.{Minimal,Populated}.Template.{PostgreSql,MsSql}` packages, for the real-package tests |
+| `DMS_EXPECTED_EFFECTIVE_SCHEMA_HASH` | Both | Optional: the hash those packages must declare |
+
+Locally a test whose settings are missing is skipped. Under GitHub Actions
+(`GITHUB_ACTIONS=true`) it fails instead, so set that variable to check that a
+run skipped nothing. The PostgreSQL tests that replay a template need `psql`
+and a POSIX shell and skip on Windows, so run the whole PostgreSQL lane on
+Linux. The job in
+`.github/workflows/on-config-pullrequest.yml` shows a complete setup, including
+the package download pinned by SHA-256.
+
+## CMS DMS-template provisioning: SQL Server staging with separate identities
+
+The Configuration Service stages a SQL Server template backup in a directory
+that it owns and the SQL Server service identity can only read: group = a
+staging group the server joins, mode `2750`. The CI lane
+(`run-dms-provisioning-integration-tests`) runs on a host bind mount. This
+recipe rebuilds the container topology locally with real, separate Linux
+identities. It works on Linux and on Docker Desktop, because a named volume
+keeps Linux permissions, whereas a Docker Desktop bind mount from Windows shows
+every file as `0777`:
+
+| Identity | Container | uid | Groups |
+| --- | --- | --- | --- |
+| CMS tests (`dmscms`) | `mcr.microsoft.com/dotnet/sdk:10.0`, non-root | 41438 | `dmscms` (41438), `dmsstaging` (41439) through `--group-add` |
+| SQL Server (`mssql`) | `mcr.microsoft.com/mssql/server:2025-latest` | 10001 | `mssql`, `dmsstaging` (41439) through `--group-add` |
+| Reader (`dmsreader`) | the CMS container, reached with `sudo` | 10001 | `dmsstaging` |
+
+It runs two test sets:
+
+- **`Category=DmsProvisioningSeparateIdentity`** (SQL Server integration).
+  With the staging group, the visibility probe is `Ready`, a create restores
+  through the staged file, and SQL Server can read a staged file but cannot
+  overwrite it or add an entry beside it (`3201`, OS error 5). When the
+  directory carries a group that SQL Server is not in (`dmscms`), the probe
+  reports `StagingNotVisible` and a create fails with `StagingFailed` (`3201`).
+  Neither case leaves a database or a file behind.
+- **`MssqlBackupStagerSeparateIdentityTests`** (unit). Running as `dmsreader`
+  (the server's uid and a staging-group member that does not own the files),
+  the reader can read a staged file. Its attempts to unlink, rename, or
+  overwrite the file, or to add a new entry, fail with `EACCES`.
+
+Run from a Bash shell at the repository root. In Git Bash on Windows, run
+`export MSYS_NO_PATHCONV=1` first. Otherwise Git Bash rewrites container paths
+such as `/var/opt/...`, `/home/dmscms` and `/opt/mssql-tools18/...` into
+Windows paths before Docker receives them. The recipe uses no host paths.
+
+```bash
+SA_PASSWORD='<StrongPassword>'
+docker network create dms-provisioning-identity
+docker volume create dms-provisioning-staging
+
+# The shared staging directory: owned by the CMS uid, group dmsstaging, mode 2750.
+docker run --rm -v dms-provisioning-staging:/staging alpine:3.20 \
+  sh -c 'chown 41438:41439 /staging && chmod 2750 /staging'
+
+docker run -d --name dms-provisioning-identity-mssql --network dms-provisioning-identity \
+  --group-add 41439 -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD="$SA_PASSWORD" \
+  -v dms-provisioning-staging:/var/opt/dms-template-staging \
+  mcr.microsoft.com/mssql/server:2025-latest
+
+docker run -d --name dms-provisioning-identity-cms --network dms-provisioning-identity \
+  --user 41438:41438 --group-add 41439 -e HOME=/home/dmscms \
+  -v dms-provisioning-staging:/var/opt/dms-template-staging \
+  mcr.microsoft.com/dotnet/sdk:10.0 sleep infinity
+
+# Names for the identities, and sudo to the reader only (as root, once).
+docker exec -u 0 dms-provisioning-identity-cms sh -c '
+  apt-get update -qq && apt-get install -y -qq sudo > /dev/null &&
+  groupadd -g 41439 dmsstaging && groupadd -g 41438 dmscms &&
+  useradd -m -u 41438 -g dmscms -G dmsstaging dmscms &&
+  useradd -M -u 10001 -G dmsstaging dmsreader &&
+  echo "dmscms ALL=(dmsreader) NOPASSWD: ALL" > /etc/sudoers.d/dmsreader'
+
+# The committed tree, as the CMS user. To include uncommitted changes, stage
+# them and replace HEAD with "$(git stash create)".
+git archive --format=tar HEAD | docker exec -i dms-provisioning-identity-cms \
+  sh -c 'mkdir -p ~/dms && tar -x -C ~/dms'
+
+until docker exec dms-provisioning-identity-mssql /opt/mssql-tools18/bin/sqlcmd \
+  -S localhost -U sa -P "$SA_PASSWORD" -C -Q 'SELECT 1' > /dev/null 2>&1; do sleep 2; done
+
+docker exec -w /home/dmscms/dms/src/config \
+  -e ConnectionStrings__MssqlDmsAdmin="Server=dms-provisioning-identity-mssql;User Id=sa;Password=$SA_PASSWORD;TrustServerCertificate=true" \
+  -e DMS_PROVISIONING_MSSQL_STAGING_PATH=/var/opt/dms-template-staging \
+  -e DMS_PROVISIONING_MSSQL_STAGING_SERVER_PATH=/var/opt/dms-template-staging \
+  -e DMS_PROVISIONING_STAGING_GROUP=dmsstaging \
+  -e DMS_PROVISIONING_UNSHARED_GROUP=dmscms \
+  -e DMS_PROVISIONING_STAGING_READER_COMMAND='sudo -n -u dmsreader' \
+  dms-provisioning-identity-cms sh -c '
+    id &&
+    dotnet test backend/EdFi.DmsConfigurationService.Backend.Tests.Unit \
+      --filter "FullyQualifiedName~MssqlBackupStagerSeparateIdentityTests" &&
+    dotnet test backend/EdFi.DmsConfigurationService.Backend.Mssql.Tests.Integration \
+      --filter "Category=DmsProvisioningSeparateIdentity"'
+```
+
+`id` must print `uid=41438(dmscms)` with group `41439(dmsstaging)`. Expect
+both test sets to pass with no skips. A skip means a variable is missing. The
+integration fixture fails at setup if it runs as root, or if the shared
+directory is not owned by the test user with group `dmsstaging` and mode `2750`.
+To run every SQL Server test that restores under these identities, also run
+`--filter "Category=DmsProvisioning"` on the integration project in the same
+`docker exec`. Tests that need template packages skip unless
+`DMS_TEMPLATE_PACKAGE_DIRECTORY` is set (see the CI job).
+
+Remove everything afterwards:
+
+```bash
+docker rm -f dms-provisioning-identity-cms dms-provisioning-identity-mssql
+docker volume rm dms-provisioning-staging
+docker network rm dms-provisioning-identity
+```
 
 ## Running Unit Tests and Generate Code Coverage Report
 
