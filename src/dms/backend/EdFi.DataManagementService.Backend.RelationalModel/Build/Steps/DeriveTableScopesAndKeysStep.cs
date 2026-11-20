@@ -188,28 +188,54 @@ public sealed class DeriveTableScopesAndKeysStep : IRelationalModelBuilderStep
     }
 
     /// <summary>
-    /// Creates the shared descriptor table root (<c>dms.Descriptor</c>), keyed by <c>DocumentId</c> and
-    /// FK'd to <c>dms.Document</c>.
+    /// Creates the shared descriptor table root, keyed by compact <c>DescriptorId</c> with a unique
+    /// owning <c>DocumentId</c>. The denormalized <c>ResourceKeyId</c> and <c>DocumentId</c> together
+    /// reference <c>dms.Document (DocumentId, ResourceKeyId)</c>, so the database enforces that each
+    /// row's <c>ResourceKeyId</c> matches its owning document.
     /// </summary>
     private static TableScope CreateDescriptorRootTable()
     {
         var jsonScope = JsonPathExpressionCompiler.FromSegments([]);
-        var key = BuildRootTableKey(_descriptorTableName);
-        var identityMetadata = BuildRootTableIdentityMetadata();
-        var columns = BuildIdentityColumns(identityMetadata);
+        var descriptorId = RelationalNameConventions.DescriptorKeyColumnName;
+        var documentId = RelationalNameConventions.DocumentIdColumnName;
+        var key = new TableKey(
+            ConstraintNaming.BuildPrimaryKeyName(_descriptorTableName),
+            [new DbKeyColumn(descriptorId, ColumnKind.ParentKeyPart)]
+        );
+        var identityMetadata = new DbTableIdentityMetadata(
+            DbTableKind.Root,
+            [descriptorId],
+            [documentId],
+            [],
+            []
+        );
+        DbColumnModel[] columns =
+        [
+            .. RelationalModelSystemColumnFactory.BuildKeyColumns(key.Columns),
+            RelationalModelSystemColumnFactory.CreateKeyColumn(documentId, ColumnKind.DocumentFk),
+            new DbColumnModel(
+                RelationalNameConventions.ResourceKeyIdColumnName,
+                ColumnKind.Scalar,
+                new RelationalScalarType(ScalarKind.Int16),
+                IsNullable: false,
+                SourceJsonPath: null,
+                TargetResource: null
+            ),
+        ];
 
         var fkName = ConstraintNaming.BuildForeignKeyName(
             _descriptorTableName,
-            ConstraintNaming.DocumentToken
+            ConstraintNaming.DocumentResourceKeyToken
         );
 
         TableConstraint[] constraints =
         [
+            new TableConstraint.Unique("UX_Descriptor_DocumentId", [documentId]),
             new TableConstraint.ForeignKey(
                 fkName,
-                [RelationalNameConventions.DocumentIdColumnName],
+                RelationalNameConventions.DocumentResourceKeyColumns,
                 _documentTableName,
-                [RelationalNameConventions.DocumentIdColumnName],
+                RelationalNameConventions.DocumentResourceKeyColumns,
                 OnDelete: DocumentSafetyNetDeleteAction
             ),
         ];

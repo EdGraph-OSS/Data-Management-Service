@@ -5,8 +5,10 @@
 
 using EdFi.DataManagementService.Backend.External;
 using EdFi.DataManagementService.Backend.External.Plans;
+using EdFi.DataManagementService.Backend.Plans;
 using EdFi.DataManagementService.Core.External.Backend;
 using EdFi.DataManagementService.Core.External.Model;
+using EdFi.DataManagementService.Core.Extraction;
 
 namespace EdFi.DataManagementService.Backend;
 
@@ -31,6 +33,23 @@ internal static class RelationalQueryRequestPreprocessor
             throw new ArgumentException(
                 "Relational query preprocessing requires resource query capability metadata in the supported state.",
                 nameof(queryCapability)
+            );
+        }
+
+        var validationFailures = ValidateDescriptorQueryValues(queryElements, queryCapability);
+        validationFailures = AddSqlServerStorageWidthFailures(
+            mappingSet,
+            requestResource,
+            queryElements,
+            queryCapability,
+            validationFailures
+        );
+
+        if (validationFailures is not null)
+        {
+            return new RelationalQueryPreprocessingResult(
+                new RelationalQueryPreprocessingOutcome.ValidationFailure(validationFailures),
+                []
             );
         }
 
@@ -170,8 +189,8 @@ internal static class RelationalQueryRequestPreprocessor
                     new PreprocessedRelationalQueryElement(
                         pendingDescriptorResolution.QueryElement,
                         pendingDescriptorResolution.SupportedField,
-                        new PreprocessedRelationalQueryValue.DescriptorDocumentId(
-                            resolvedDescriptorReference.DocumentId
+                        new PreprocessedRelationalQueryValue.DescriptorId(
+                            resolvedDescriptorReference.DescriptorId
                         )
                     );
             }
@@ -181,6 +200,102 @@ internal static class RelationalQueryRequestPreprocessor
             new RelationalQueryPreprocessingOutcome.Continue(),
             preprocessedElements
         );
+    }
+
+    /// <summary>
+    /// Checks every descriptor-valued element before the main pass, so a malformed value is rejected
+    /// whatever its position: the main pass returns an empty page as soon as an earlier element proves
+    /// the query has no matches. Returns null when every value is well-formed.
+    /// </summary>
+    private static List<WriteValidationFailure>? ValidateDescriptorQueryValues(
+        IReadOnlyList<QueryElement> queryElements,
+        RelationalQueryCapability queryCapability
+    )
+    {
+        List<WriteValidationFailure>? failures = null;
+
+        foreach (var queryElement in queryElements)
+        {
+            if (
+                queryElement is not null
+                && queryCapability.SupportedFieldsByQueryField.TryGetValue(
+                    queryElement.QueryFieldName,
+                    out var supportedField
+                )
+                && supportedField.Target is RelationalQueryFieldTarget.DescriptorIdColumn
+                && !DescriptorText.IsWellFormedWithoutNul(queryElement.Value)
+            )
+            {
+                failures ??= [];
+                failures.Add(
+                    new WriteValidationFailure(
+                        queryElement.DocumentPaths[0],
+                        DescriptorText.InvalidValueMessage
+                    )
+                );
+            }
+        }
+
+        return failures;
+    }
+
+    /// <summary>
+    /// Appends a failure for every SQL Server string filter wider than the root column it is compared
+    /// against, by the column's mapped length. Descriptor references are not checked here: they bind a
+    /// resolved descriptor ID, and the descriptor lookup accepts URIs wider than any stored one because the
+    /// SQL Server identity collation can equate them with a stored descriptor.
+    /// Runs before the main pass for the same reason descriptor values are checked first, so a rejection
+    /// does not depend on an earlier element proving the query has no matches.
+    /// </summary>
+    private static List<WriteValidationFailure>? AddSqlServerStorageWidthFailures(
+        MappingSet mappingSet,
+        QualifiedResourceName requestResource,
+        IReadOnlyList<QueryElement> queryElements,
+        RelationalQueryCapability queryCapability,
+        List<WriteValidationFailure>? failures
+    )
+    {
+        SqlDialect dialect = mappingSet.Key.Dialect;
+
+        if (dialect != SqlDialect.Mssql)
+        {
+            return failures;
+        }
+
+        Dictionary<DbColumnName, DbColumnModel>? rootColumnsByName = null;
+
+        foreach (var queryElement in queryElements)
+        {
+            if (
+                queryElement is null
+                || !queryCapability.SupportedFieldsByQueryField.TryGetValue(
+                    queryElement.QueryFieldName,
+                    out var supportedField
+                )
+                || supportedField.Target is not RelationalQueryFieldTarget.RootColumn(var column)
+            )
+            {
+                continue;
+            }
+
+            rootColumnsByName ??= mappingSet
+                .GetConcreteResourceModelOrThrow(requestResource)
+                .RelationalModel.Root.Columns.ToDictionary(static rootColumn => rootColumn.ColumnName);
+
+            int? columnLength =
+                rootColumnsByName.TryGetValue(column, out var rootColumn)
+                && rootColumn.ScalarType is { Kind: ScalarKind.String } scalarType
+                    ? scalarType.MaxLength
+                    : null;
+
+            if (QueryFilterStorageWidth.ExceedsSqlServerColumn(dialect, queryElement.Value, columnLength))
+            {
+                failures ??= [];
+                failures.Add(QueryFilterStorageWidth.InvalidValueFailure(queryElement));
+            }
+        }
+
+        return failures;
     }
 
     private static string BuildDescriptorLookupFailureMessage(
@@ -196,9 +311,6 @@ internal static class RelationalQueryRequestPreprocessor
             DescriptorReferenceFailureReason.Missing =>
                 $"Relational query preprocessing determined descriptor query field '{queryElement.QueryFieldName}' value "
                     + $"'{queryElement.Value}' does not resolve to descriptor resource '{targetResource}', so the query has no matches.",
-            DescriptorReferenceFailureReason.DescriptorTypeMismatch =>
-                $"Relational query preprocessing determined descriptor query field '{queryElement.QueryFieldName}' value "
-                    + $"'{queryElement.Value}' resolves to a different descriptor resource than '{targetResource}', so the query has no matches.",
             _ => throw new InvalidOperationException(
                 $"Relational query preprocessing does not recognize descriptor failure reason '{failure.Reason}'."
             ),
@@ -219,14 +331,13 @@ internal static class RelationalQueryRequestPreprocessor
         var documentIdentity = new DocumentIdentity([
             new DocumentIdentityElement(
                 DocumentIdentity.DescriptorIdentityJsonPath,
-                queryElement.Value.ToLowerInvariant()
+                DescriptorText.AssertWellFormedWithoutNul(queryElement.Value)
             ),
         ]);
 
         return new DescriptorReference(
             descriptorResourceInfo,
             documentIdentity,
-            ReferentialIdFactory.Create(descriptorResourceInfo, documentIdentity),
             new JsonPath($"$.query[{index}]")
         );
     }

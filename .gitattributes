@@ -17,7 +17,7 @@
 
 *.sh eol=lf
 ApiSchema*.json text eol=lf
-*-claimset.json text eol=lf
+*-claims.json text eol=lf
 
 ## SOURCE CODE
 *.bat  text eol=crlf
@@ -80,6 +80,7 @@ ApiSchema*.json text eol=lf
 *.rar binary
 *.tar binary
 *.zip binary
+*.nupkg binary
 
 ## FONTS
 *.ttf   binary

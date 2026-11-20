@@ -1,7 +1,7 @@
 # OWASP Authentication Coverage Summary
 
 This document summarizes the authentication security posture of the **Ed-Fi Data
-Management Service (DMS)** and the **Ed-Fi DMS Configuration Service (CMS)**, with
+Management Service (DMS)** and the **Ed-Fi API Configuration Service**, with
 particular focus on **JWT replay risk** and the compensating controls that apply
 where replay prevention depends on the Identity Provider (IdP).
 
@@ -11,14 +11,14 @@ stated control to the automated tests that exercise it.
 
 ## Trust paths
 
-DMS and CMS accept JSON Web Tokens (JWTs) issued under three trust paths. The
+DMS and the Configuration Service accept JSON Web Tokens (JWTs) issued under three trust paths. The
 replay posture differs by path because the responsibility for revocation differs.
 
 | Path | Token issuer | Per-request validation owner |
 |---|---|---|
-| **DMS resource API** | Configured OIDC IdP (Keycloak or the CMS self-contained provider) | DMS, by stateless self-inspection against the IdP's published signing keys |
-| **CMS self-contained provider** | CMS (OpenIddict-based, `AppSettings:IdentityProvider = self-contained`, the default) | CMS, with an additional per-request token-status check |
-| **Keycloak / external IdP** | Keycloak (`AppSettings:IdentityProvider = keycloak`) | DMS/CMS validate signature and claims only; revocation state lives at the IdP, which CMS `/connect/revoke` delegates to |
+| **DMS resource API** | Configured OIDC IdP (Keycloak or the Configuration Service self-contained provider) | DMS, by stateless self-inspection against the IdP's published signing keys |
+| **Configuration Service self-contained provider** | the Configuration Service (OpenIddict-based, `AppSettings:IdentityProvider = self-contained`, the default) | the Configuration Service, with an additional per-request token-status check |
+| **Keycloak / external IdP** | Keycloak (`AppSettings:IdentityProvider = keycloak`) | DMS and the Configuration Service validate signature and claims only; revocation state lives at the IdP, which Configuration Service `/connect/revoke` delegates to |
 
 ## Token validation controls
 
@@ -29,7 +29,7 @@ All paths validate the following before a request is authorized:
 - **Signature** verifies against the issuer's signing key(s) (`RequireSignedTokens`).
 - **Lifetime** is enforced (`ValidateLifetime`), with **expiration required**
   (`RequireExpirationTime`).
-- A bounded **clock skew** is allowed (DMS: configurable `ClockSkewSeconds`; CMS:
+- A bounded **clock skew** is allowed (DMS: configurable `ClockSkewSeconds`; the Configuration Service:
   5 minutes).
 
 A token failing any of these checks is rejected with `401 Unauthorized`.
@@ -62,12 +62,12 @@ revocation is **not** enforced for already-issued bearer tokens on this path. Re
 exposure is therefore bounded by the *measurable* compensating controls below (short
 token TTL and signing-key rotation, plus TLS in transit), not by IdP revocation.
 
-### CMS self-contained provider — per-request revocation-on-demand
+### Configuration Service self-contained provider — per-request revocation-on-demand
 
-For self-contained tokens, CMS issues a token with a GUID `jti`, persists it in the
+For self-contained tokens, the Configuration Service issues a token with a GUID `jti`, persists it in the
 `dmscs.OpenIddictToken` table, and on **every** authenticated request re-checks that
 token's status by `jti` after standard validation. A request is authorized only when
-the stored status is `valid`. CMS exposes:
+the stored status is `valid`. The Configuration Service exposes:
 
 - `POST /connect/revoke` (RFC 7009) — sets the token status to `revoked`. The caller
   authenticates with **client credentials**, as RFC 7009 §2.1 requires: HTTP Basic, or
@@ -107,6 +107,8 @@ the stored status is `valid`. CMS exposes:
   ownership details here are `self-contained` behaviour; see the Keycloak section below
   for how the endpoint revokes in `keycloak` mode.
 - `POST /connect/introspect` (RFC 7662) — reports active/inactive status.
+  The caller must authenticate with client credentials, and only the token's own client receives its metadata.
+  Any other token is reported as `{"active": false}`.
 
 This is **not** one-time-use enforcement (a valid token remains reusable until it
 expires or is revoked), but it does provide **immediate, server-side revocation**:
@@ -121,9 +123,10 @@ success, wrong owner, unverifiable token, expired token, unknown token. RFC 7009
 this, and it is what stops the endpoint from becoming an oracle for token existence and
 ownership, but it also means the status code carries no confirmation. **Incident response
 must not treat `200 OK` as proof that a leaked credential was contained** — confirm with
-`POST /connect/introspect` (self-contained), which reports `{"active": false}` only once
-revocation has actually taken effect, or with Keycloak's own introspection endpoint in
-`keycloak` mode (see the Keycloak section below). A `503` is not a "not revoked" answer
+`POST /connect/introspect` (self-contained) authenticated as the token's owner, which reports `{"active": false}` once
+revocation has taken effect (or when it could not decide the token because a key or token-status store failed, which it
+logs as the Error `Token validation could not reach a decision`), or in `keycloak` mode as the Keycloak section below
+describes. A `503` is not a "not revoked" answer
 either: it means the outcome could not be confirmed, and the caller should retry (which is
 safe) and confirm the same way.
 
@@ -144,9 +147,132 @@ Reading stored status directly is not a substitute either: an expired target tok
 its stored status rather than being marked `revoked`, so a `valid` reading in
 `dmscs.OpenIddictToken` or an admin status view does not mean the token is still usable.
 
+#### Credential reset, client deletion and un-approval revoke outstanding tokens
+
+Three client lifecycle operations mark every outstanding self-contained token of the affected
+client `revoked`, in the same database transaction that makes the client's change (DMS-1493):
+
+| Operation | Endpoints | The client's tokens are revoked when |
+|---|---|---|
+| Credential reset | `PUT /v3/apiClients/{id}/reset-credential`, `PUT /v3/applications/{id}/reset-credential` | the new secret is committed |
+| Client deletion | `DELETE /v3/apiClients/{id}`, `DELETE /v3/applications/{id}` for each client of the application, and `DELETE /v3/vendors/{id}` for each client of each of the vendor's applications | the client is deleted from the identity provider |
+| Un-approval | `PUT /v3/apiClients/{id}` with `isApproved: false` | `isApproved = false` is committed |
+
+Once the operation has answered success, the next Configuration Service request that presents one
+of those tokens is rejected with `401`, because the per-request status check no longer finds it
+`valid`. Tokens of clients the operation does not target do not change: a client-level operation
+leaves the application's other clients alone, while deleting an application or a vendor targets
+every client it has.
+
+- **A grant racing the operation is revoked or refused.** Every token grant for a client takes the
+  same database row lock as these operations and, while holding it, re-checks that the client
+  still exists, still has the secret the grant authenticated with, and is still approved. A grant
+  that stored its token before the operation has that token revoked by it. A grant that reaches
+  the store after the operation and is stale — it authenticated with the secret the reset
+  replaced, its client was deleted, or its client is still un-approved — is answered
+  `invalid_client`, exactly as a wrong secret is, and stores nothing. A new grant with the new
+  secret after a reset, or after the client is approved again, is not stale and succeeds.
+- **Re-approval does not revive tokens.** Approving the client again lets it obtain new tokens;
+  the tokens revoked by the un-approval stay revoked.
+- **All or nothing per client transaction.** A client's change and its revocation commit together
+  or not at all: the new secret, the un-approval, or the client's deletion from the identity
+  provider. If the revocation fails before that commit, the transaction rolls back and the request
+  fails. A deletion request is not one transaction, though. It deletes each client from the
+  identity provider, each in its own transaction with its revocation, and only then deletes the
+  Configuration Service rows in a separate commit. An application or vendor deletion that fails
+  partway can therefore leave some of its clients deleted from the provider, with their tokens
+  revoked, while the Configuration Service rows of all of them survive. A provider failure stops
+  the request before those rows are deleted, so a retry finds the same clients and treats the ones
+  already deleted as done. A success answer confirms every commit. An error or a response that
+  never arrives does not establish the outcome, because a transaction may have committed before
+  the failure was reported. Confirm the client's token state, or retry: retrying is safe, and a
+  retried reset issues another new secret.
+- **Deadlocks in lifecycle operations currently answer `500`.** A credential reset, provider
+  deletion or un-approval whose transaction is chosen as a deadlock victim (for example against the
+  expired-token sweep, since revocation also updates expired, unrevoked rows) answers `500` on both
+  engines. That client's transaction rolls back; in a multi-client deletion, provider deletions
+  that committed earlier stay committed. Confirm or retry as above. Mapping these deadlocks to a
+  retriable response is deferred.
+
+**Residual DMS window.** DMS does not consult token status (see
+[DMS resource API](#dms-resource-api--stateless-bearer-validation-no-app-side-replay-cache)), so it
+keeps accepting a revoked token until the token's `exp` plus `JwtAuthentication:ClockSkewSeconds`
+(default 30 seconds). With the default self-contained token lifetime
+(`IdentitySettings:TokenExpirationMinutes`, 30 minutes), a token stays usable at DMS for up to 30
+minutes 30 seconds after it was issued, however soon after issuance its client was reset, deleted
+or un-approved. This is the same window that follows `/connect/revoke`; a shorter token lifetime
+shortens it.
+
+**Tokens that were never marked revoked.** Only an operation performed by a Configuration Service
+that includes DMS-1493 marks tokens revoked. A token of a client that was reset, deleted or
+un-approved before that version was deployed is still `valid` in the token store. The
+Configuration Service accepts it until its `exp` plus the Configuration Service's fixed 5-minute
+clock skew (up to 35 minutes after issuance with the default lifetime). DMS accepts it until `exp`
+plus `ClockSkewSeconds`, as above. These are two separate bounds. Repeating the reset or the
+un-approval revokes such tokens. A client deleted with `DELETE /v3/apiClients/{id}` or
+`DELETE /v3/applications/{id}` before that version cannot be addressed through the API again, so
+its tokens are left to expire, within one token lifetime, plus the applicable clock skew, of the
+deployment.
+
+**Clients orphaned by earlier vendor deletions.** Before this change, `DELETE /v3/vendors/{id}`
+removed the vendor's applications and API clients from the Configuration Service without deleting
+their clients from the identity provider. Those provider clients, with their credentials and
+tokens, still exist. Before DMS-1494, a `self-contained` client with no `dmscs.ApiClient` row left
+counted as approved, so its credentials could keep obtaining new tokens. Since DMS-1494 such a
+client is refused at `/connect/token`, `/connect/revoke` and `/connect/introspect` with
+`invalid_client`, the answer an unapproved client gets, unless its roles and scopes qualify it as
+an administrative client. A vendor client holds only `IdentitySettings:ClientRole` and does not
+qualify; each refusal logs a Warning naming the client and the category
+`NoApiClientRowHoldsClientRoleOnly`. The tokens it already holds are not revoked, so its exposure
+ends one token lifetime, plus the applicable clock skew, after the deployment. In `keycloak` mode
+the Configuration Service does not read this state, and an orphaned Keycloak client keeps whatever
+access Keycloak grants it. No Configuration Service API reaches these clients, and this version
+provides no cleanup for them. See
+[CS-AUTH](../reference/design/configuration-service/CS-AUTH.md#approval-states-and-clients-without-an-api-client-row)
+for the rule and for role-name changes, which can make an old vendor membership count as
+administrative.
+[OPERATIONS.md](OPERATIONS.md#finding-provider-clients-that-no-api-client-references) describes a
+read-only comparison that lists candidates for an operator to review.
+
+**Concurrent creation during a vendor deletion.** A vendor deletion deletes from the identity
+provider the clients it read, and then deletes the vendor only if no other client would go with it.
+That last step locks the vendor row and the vendor's application rows before it reads the vendor's
+clients, so a client created under the vendor at the same time cannot be removed without first
+being deleted from the provider. Such a client is either one the deletion sees, and the vendor
+deletion then deletes nothing and answers `409` (a retry deletes the new client from the provider
+too), or one whose creation waits for the deletion and then fails because its vendor or
+application is gone. On SQL Server the creation and the deletion can instead deadlock, and SQL
+Server can choose either one as the victim: a creation chosen as the victim fails, and a vendor
+deletion chosen as the victim deletes no vendor row and answers `409`, so it can be retried safely.
+Provider deletions the request made before that stay committed. This covers a new application
+under the vendor and a new client on any of its applications, including one that had no client.
+On SQL Server the locking reads seek the vendor's own index entries, so they lock only that vendor's
+rows and wait only for uncommitted changes to them; another vendor's applications and clients can
+be created, changed and read meanwhile. The cascade delete that follows takes locks SQL Server
+chooses, which can still make another vendor's write wait until the deletion commits, for example
+an insert into the index range adjoining the deleted vendor's entries, and SQL Server can escalate
+many row locks of a very large vendor to a table lock.
+
+**Keycloak mode.** The same operations regenerate the client's secret, delete the client, or
+disable it at Keycloak, so the old credentials stop obtaining new tokens. The Configuration Service
+stores no Keycloak tokens, and neither it nor DMS asks Keycloak about a token on each request, so a
+Keycloak token issued before the operation is accepted by the Configuration Service until `exp`
+plus 5 minutes and by DMS until `exp` plus `ClockSkewSeconds`.
+
+**Grants for one client are serialized.** Because every grant takes the client's row lock,
+concurrent grants for the same client queue behind one another. This holds also when the per-client
+token limit is disabled (`IdentitySettings:BearerTokenPerClientLimit` below 1) and for clients
+exempt from the limit, which previously stored tokens without the lock. A grant that cannot obtain
+the lock within 5 seconds is answered `409` and can be retried, on both engines. A grant chosen as
+a deadlock victim is answered `409` on SQL Server, and `500` on PostgreSQL. Different clients do
+not share this per-client lock.
+
+The transaction order of each operation, the logging and the confirmation procedure are in
+[CS-AUTH.md § Lifecycle revocation](../reference/design/configuration-service/CS-AUTH.md#lifecycle-revocation).
+
 ### Keycloak / external IdP — delegated to the IdP
 
-When tokens are issued by Keycloak or another external IdP, DMS and CMS validate
+When tokens are issued by Keycloak or another external IdP, DMS and the Configuration Service validate
 the signature and claims against the IdP's published keys but **cannot locally
 verify revocation**, and neither app path calls the IdP per request. Revocation,
 session management, and any `jti`/introspection semantics are owned by the IdP. The
@@ -154,37 +280,39 @@ practical constraint: an externally-issued token revoked at the IdP is still
 **accepted by these paths until it expires**. This is an **IdP-dependent gap**
 bounded (not closed) by the compensating controls below.
 
-In Keycloak mode `POST /connect/revoke` is authenticated and revokes at Keycloak. CMS
+In Keycloak mode `POST /connect/revoke` is authenticated and revokes at Keycloak. The Configuration Service
 applies the same request rules as in self-contained mode (exactly one authentication
 mechanism, no duplicated parameters, a non-empty `token`, no request without credentials),
 then:
 
-1. reads the caller's client definition through the Keycloak Admin API with the CMS
+1. reads the caller's client definition through the Keycloak Admin API with the Configuration Service
    service credentials, and continues only when it proves exactly one **confidential**,
    non-bearer-only client with that exact `client_id`. Keycloak authenticates a public
    client without checking any secret, so this gate is what stops a public client — or
    anyone who knows its id — from revoking. Public and bearer-only clients get
    `invalid_client`; a failed, refused or ambiguous read is `503`, never "not found";
 2. forwards the revocation to Keycloak with the **caller's** credentials as form fields
-   (never the CMS service credentials), so Keycloak authenticates the caller and enforces
+   (never the Configuration Service service credentials), so Keycloak authenticates the caller and enforces
    ownership by the token's `azp`. Keycloak's answer for another client's token
    (`400 invalid_request` "Unmatching clients") is the only provider error normalized to
-   `200 OK`; every other answer maps to a fixed CMS response, and provider text is never
+   `200 OK`; every other answer maps to a fixed Configuration Service response, and provider text is never
    forwarded or logged.
 
-Revocation at Keycloak does not change the stateless posture above: CMS and DMS validate
+Revocation at Keycloak does not change the stateless posture above: Configuration Service and DMS validate
 Keycloak tokens locally and keep accepting a revoked token until it expires (plus their
-clock skew). Confirm a revocation through Keycloak's introspection endpoint with a
-confidential client that is in the token's audience (from Keycloak 26.4.12, per Red Hat's
-migration guide, and observed on 26.7.5, any other client is answered `active:false`) —
-CMS `/connect/introspect` cannot observe Keycloak tokens. Details: [CS-AUTH.md § Token revocation](../reference/design/configuration-service/CS-AUTH.md#token-revocation).
+clock skew).
+Confirm a revocation through Keycloak's introspection endpoint with a confidential client that is in the token's audience (from Keycloak 26.6.2, the Red Hat build of Keycloak 26.4.12, and observed on 26.7.5, any other client is answered `active:false`).
+Configuration Service `/connect/introspect`, authenticated as the token's owner, passes the owner's credentials to that same endpoint and describes only the owner's access tokens.
+Every Keycloak client the Configuration Service creates is in its own tokens' audience, so such a client can confirm the revocation of its own token there too.
+On Keycloak 26.6.2 or later, a token whose `aud` lacks the owner's client id, such as one issued to a client created by an earlier version before the client was updated through the Configuration Service or given the same audience mapper, is answered `{"active": false}` even while live, so check the token's `aud` before relying on that answer.
+Details: [CS-AUTH.md § Token revocation](../reference/design/configuration-service/CS-AUTH.md#token-revocation).
 
 ## `jti` handling matrix
 
 How each path treats the `jti` (JWT ID) claim. "Accepted"/"Rejected" assume the
 token is otherwise validly signed and unexpired.
 
-| `jti` condition | DMS resource API | CMS self-contained |
+| `jti` condition | DMS resource API | Configuration Service self-contained |
 |---|---|---|
 | Present and status `valid` | Accepted (`jti` informational) | Accepted |
 | Missing | Accepted — `TokenId` falls back to a derived value; `jti` not required | **Rejected** (no status to confirm) |
@@ -194,17 +322,22 @@ token is otherwise validly signed and unexpired.
 
 ## Replay / lifecycle behavior matrix
 
-| Scenario | DMS resource API | CMS self-contained |
+| Scenario | DMS resource API | Configuration Service self-contained |
 |---|---|---|
 | Same valid token reused before expiry | Accepted on every request | Accepted until revoked or expired |
 | Expired token | Rejected (lifetime check) | Rejected (lifetime check) |
 | Manipulated signature | Rejected | Rejected |
 | Revoked token reused | Not detected app-side (see compensating controls) | Rejected |
 | Externally-issued token, revocation unverifiable | Not detected app-side (see compensating controls) | Not detected app-side (Keycloak scheme) |
+| Self-contained token issued before its client was reset, deleted or un-approved, operation after DMS-1493 was deployed | Accepted until `exp` + `ClockSkewSeconds` (residual DMS window) | **Rejected** (`401`) on the next request |
+| Self-contained token issued before its client was reset, deleted or un-approved, operation before DMS-1493 was deployed | Accepted until `exp` + `ClockSkewSeconds` | Accepted until `exp` + 5 minutes (never marked revoked) |
+| Self-contained token grant racing a reset, deletion or un-approval | Not applicable (DMS issues no tokens) | Stored before the operation and revoked by it; after it, refused with `invalid_client` when stale (old secret, deleted client, client still un-approved) |
+| Self-contained token granted with the new secret after a reset, or after re-approval | Accepted until it expires | Accepted until revoked or expired (a new token, not a revived one) |
+| Earlier self-contained token after the client is re-approved | Accepted until `exp` + `ClockSkewSeconds` | **Rejected** (stays `revoked`) |
 
 ## Compensating controls for IdP-dependent gaps
 
-Where app-side replay/revocation is not performed (DMS for all tokens; CMS for
+Where app-side replay/revocation is not performed (DMS for all tokens; the Configuration Service for
 externally-issued tokens), the following compensating controls bound the risk:
 
 - **Short access-token lifetime (TTL).** A short TTL shrinks the window in which a
@@ -218,13 +351,13 @@ externally-issued tokens), the following compensating controls bound the risk:
   makes every token issued under it fail signature validation once validators have
   successfully refreshed their keys, which cuts short the acceptance window for tokens
   already in circulation. Combined with the short TTL above, this is the measurable
-  control on the stateless paths; rotate per IdP guidance. For the CMS self-contained
+  control on the stateless paths; rotate per IdP guidance. For the Configuration Service self-contained
   provider there are two separate caches:
-  - **CMS instances.** A retired key's tokens are rejected on the CMS's own endpoints
+  - **Configuration Service instances.** A retired key's tokens are rejected on the Configuration Service's own endpoints
     only after each instance reloads its signing-key snapshot: within a bounded delay
     on a healthy instance, and up to the maximum staleness while an instance cannot
     read the key store.
-  - **DMS instances.** DMS validates against its own cached JWKS, which the CMS
+  - **DMS instances.** DMS validates against its own cached JWKS, which the Configuration Service
     bounds do not cover. A DMS instance stops accepting the retired key only after it
     successfully re-fetches JWKS or is restarted. A failed re-fetch keeps the old key
     set.
@@ -233,18 +366,22 @@ externally-issued tokens), the following compensating controls bound the risk:
   [Rotating and retiring a database signing key](../reference/design/configuration-service/CS-AUTH.md#rotating-and-retiring-a-database-signing-key).
 - **IdP-side revocation (constraint, not an app-side control).** Revoking a token at
   the IdP does **not** retroactively reject it on the stateless app paths (DMS for
-  all tokens; CMS for externally-issued tokens) — a revoked externally-issued token
+  all tokens; the Configuration Service for externally-issued tokens) — a revoked externally-issued token
   is accepted until it expires. IdP revocation and session management still prevent
   *new* tokens from being issued to a compromised client, but do not invalidate
-  tokens already in circulation on these paths. CMS `/connect/revoke` reaches Keycloak's
+  tokens already in circulation on these paths. Configuration Service `/connect/revoke` reaches Keycloak's
   revocation in `keycloak` mode as an authenticated, ownership-checked operation, which
   takes effect at Keycloak (its introspection and, for a refresh token, its session) but
   not on these paths.
-- **Server-side revocation (CMS self-contained only).** The per-request `jti`
+- **Server-side revocation (Configuration Service self-contained only).** The per-request `jti`
   status check plus `/connect/revoke` provide immediate revocation for
   self-contained tokens. Revocation is itself an authenticated, ownership-checked
   operation: a client can revoke only its own tokens, so the control cannot be
-  turned into a denial-of-service against other clients.
+  turned into a denial-of-service against other clients. Credential reset, client
+  deletion and un-approval revoke every token of the client in the transaction that
+  makes the change, so they also cut off a compromised client's outstanding tokens at
+  the Configuration Service, though not at DMS (see
+  [Credential reset, client deletion and un-approval revoke outstanding tokens](#credential-reset-client-deletion-and-un-approval-revoke-outstanding-tokens)).
 - **No sensitive-detail leakage on failure.** DMS authentication failures return
   a fixed `application/problem+json` `401` body — `type`
   `urn:ed-fi:api:security:authentication`, `title` `Authentication Failed`,
@@ -296,9 +433,9 @@ The behaviors above are exercised by automated tests:
 
   `EdFi.DataManagementService.Core.Tests.Unit/Startup/WarmUpOidcMetadataTaskTests.cs` covers
   **DMS startup failing** on a metadata issuer mismatch, with both values named and sanitized
-  in the error. These fixtures cover DMS only; the CMS's own issuer validation is not
+  in the error. These fixtures cover DMS only; the Configuration Service's own issuer validation is not
   exercised by them.
-- CMS — `EdFi.DmsConfigurationService.Backend.Tests.Unit/OpenIddictTokenManagerTests.cs`:
+- The Configuration Service — `EdFi.DmsConfigurationService.Backend.Tests.Unit/OpenIddictTokenManagerTests.cs`:
   `ValidateTokenAsync` accepts a token whose status is `valid` on repeated
   presentation (reusable while valid) and **rejects** expired (lifetime check, before
   the status lookup), revoked, unknown-`jti`, missing-`jti`, and malformed-`jti`
@@ -337,7 +474,7 @@ The behaviors above are exercised by automated tests:
   token's state; a fault in the comparison logic propagates (500) rather than being
   relabelled an outage; and capturing loggers walk every field, scope and exception for
   planted token, secret and `kid` sentinels.
-- CMS — `EdFi.DmsConfigurationService.Frontend.AspNetCore.Tests.Unit/Modules/IdentityModuleTests.cs`:
+- The Configuration Service — `EdFi.DmsConfigurationService.Frontend.AspNetCore.Tests.Unit/Modules/IdentityModuleTests.cs`:
   `/connect/revoke` returns `invalid_client` to a caller presenting no client credentials,
   an unregistered `client_id`, a wrong `client_secret`, or credentials for an unapproved
   application — `401` with a `WWW-Authenticate: Basic` challenge only when HTTP Basic was
@@ -353,14 +490,22 @@ The behaviors above are exercised by automated tests:
   decoding. Ordering is pinned too: a request with neither credentials nor a `token`
   field gets `400 invalid_request`, since the request-shape check runs first. Every error
   is checked against the **OAuth error contract**, and pipeline fixtures show an
-  unexpected fault is `500 server_error` in the same format while `/connect/token` keeps
-  the Ed-Fi contract. A further fixture
+  unexpected fault is `500 server_error` in the same format. `/connect/token` answers in
+  the same contract (DMS-1491).
+  The `TokenErrorRequest` fixtures in the same file cover an unsupported or missing `grant_type` (`Given_a_token_request_with_an_unsupported_grant_type`, `Given_a_token_request_without_a_grant_type_but_with_valid_credentials`), a JSON body, a repeated parameter or `Authorization` header (`Given_a_token_request_with_a_repeated_parameter`, including an empty copy, and `Given_a_token_request_with_two_authorization_headers`), a malformed form payload, a Bearer header, and missing, empty or whitespace-only client credentials, with the request-shape check before the credential check, plus a token manager that faults (`500 server_error`).
+  Form credentials get `400` with no `WWW-Authenticate` challenge, and an HTTP Basic header without usable credentials gets `401` with the challenge.
+  The `ManagerOutcomeRequest` family drives the token manager and identity provider outcomes: the client authentication failures, always `invalid_client` with the fixed description even for a Keycloak public client (`Given_the_identity_provider_rejects_a_public_client`), the unknown-failure `500` and the `502 server_error` answers, a provider `403` among them, each run in both the Basic-attempted and form-credential variants, and the `429` and `409` `temporarily_unavailable` answers run with HTTP Basic beside their form-credential fixtures in `TokenEndpointTests`, which shows only a client authentication failure carries the challenge.
+  Provider pass-through is pinned case by case: only the Keycloak `invalid_scope` description reaches the caller, and only with one of the six RFC 6749 section 5.2 token codes, matched case-sensitively, in a complete structured body, with every character one section 5.2 allows (for example `Given_the_identity_provider_matches_error_codes_case_sensitively`, `Given_a_provider_body_with_an_extra_member`, `Given_a_provider_body_whose_description_is_not_a_string` and `Given_the_identity_provider_rejects_the_scope_with_a_description_outside_the_oauth_character_set`); everything else takes the fixed text, and the `error` is always the service's own.
+  The DMS proxy side is pinned in `OAuthManagerTests.cs`: `Given_the_Client_Credentials_Are_Invalid` shows an upstream OAuth `401` body keeps its `error` and `error_description` in the DMS answer, `Given_A_Token_Limit_Rejection_In_The_OAuth_Envelope_Built_By_The_Configuration_Service` builds the token-limit body from the CMS DataModel's own code and sentence, and `Given_A_Deviating_OAuth_Envelope_429` shows a deviating envelope degrades to the generic `429`.
+  The `/connect/*` rate-limit `429` is pinned in the OAuth format on token, revoke and introspect at both gates, by `IdentityModuleRateLimitTests` for the client gate and `ConnectRateLimitPipelineTests.Given_a_connect_route_over_the_source_limit` for the source gate, where `/connect/register` keeps the Ed-Fi body; `Given_A_Configuration_Service_Rate_Limit_Response_In_The_OAuth_Format` builds the DMS-side body from the CMS DataModel's own code and text.
+  A further fixture
   drives the **canonical-casing path end to end over HTTP**: the repository resolves a
   mis-cased `client_id` the way SQL Server's collation does, and the token minted under
   the canonical spelling is still revoked — the case that would otherwise be a silent
   `200 OK` no-op against the caller's own token. A final fixture asserts
-  `/connect/register`, `/connect/token` and `/connect/introspect` stayed anonymous.
-- CMS — `EdFi.DmsConfigurationService.Backend.Tests.Unit/KeycloakTokenRevocationManagerTests.cs`
+  `/connect/register` and `/connect/token` are not answered `401`, and that `/connect/introspect` rejects a
+  request without client credentials with `400 invalid_client`.
+- The Configuration Service — `EdFi.DmsConfigurationService.Backend.Tests.Unit/KeycloakTokenRevocationManagerTests.cs`
   and `KeycloakClientFacadeTests.cs`: the delegated request carries the caller's
   credentials and never the service secret, forwards only recognised hints, and is sent
   exactly once; every client-type gate outcome (public, bearer-only, case variant,
@@ -372,7 +517,7 @@ The behaviors above are exercised by automated tests:
   sent are `TemporarilyUnavailable`; provider bodies with planted sentinels never reach
   a log. The facade fixtures run the real Keycloak.Net package against Flurl's test
   transport and pin the bounded wait around its synchronous admin-token fetch.
-- CMS — `EdFi.DmsConfigurationService.Frontend.AspNetCore.Tests.Unit/Configuration/TokenRevocationStartupTests.cs`,
+- The Configuration Service — `EdFi.DmsConfigurationService.Frontend.AspNetCore.Tests.Unit/Configuration/TokenRevocationStartupTests.cs`,
   `Middleware/ExceptionContentBoundaryMiddlewareTests.cs`, `Middleware/RequestLoggingMiddlewareTests.cs`
   and `Infrastructure/GlobalExceptionHandlerTests.cs`: every provider/engine shape boots
   with its shipped registration and refuses to start, with a fixed message naming only
@@ -381,10 +526,49 @@ The behaviors above are exercised by automated tests:
   including one where the framework's exception middleware logs, never puts the
   exception's message, inner exception or `Data` into any log record, while an aborted
   request stays a cancellation.
-- CMS — `EdFi.DmsConfigurationService.Backend.Postgresql.Tests.Integration` and
+- The Configuration Service, lifecycle revocation (DMS-1493) —
+  `EdFi.DmsConfigurationService.Backend.Tests.Unit`: `OpenIddictClientRepositoryTests.cs` pins the
+  transaction order of credential reset (secret hashed before the transaction, secret written,
+  tokens revoked, commit) and of deletion (application deleted, tokens revoked, commit, also when
+  no application row was deleted); a reset of a missing client revokes nothing and rolls back, and
+  a throwing revocation commits nothing. `OpenIddictUnapprovalTokenRevocationTests.cs` pins that
+  the un-approval participant locks the application row and then revokes in the caller's
+  transaction, revokes when the row is absent, and leaves commit and rollback to the caller, and
+  that the Keycloak participant does nothing. `OpenIddictTokenManagerTests.cs` pins that a grant
+  passes the stored secret it authenticated against to the store, and that a store refused on
+  re-validation is answered exactly as a vanished client is. In
+  `EdFi.DmsConfigurationService.Frontend.AspNetCore.Tests.Unit`,
+  `Configuration/TokenRevocationStartupTests.cs` boots each datastore and identity-provider
+  combination and asserts that the API client repository receives that provider's participant,
+  and that a missing participant registration fails resolution instead of skipping revocation.
+  `Modules/VendorModuleTests.cs` pins that a vendor deletion deletes every client of every
+  application from the identity provider before the vendor, that a provider failure or exception
+  deletes no vendor, that a retry after a partial cleanup treats the clients already deleted
+  as done and completes, that the vendor delete is guarded by exactly the clients deleted from the
+  provider, and that a guarded delete refused because a new client appeared answers `409` and its
+  retry deletes the new client from the provider before the vendor.
+  `VendorTests.cs` in both engines' integration projects covers the guarded vendor delete: a
+  client created under the vendor (in a new application, or in one that had no client) after the
+  cleanup, whether committed before the delete or still uncommitted while the delete waits for
+  it, makes the delete refuse and keep every row; a creation arriving while the delete holds its
+  locks waits for it and then fails, leaving no client behind.
+- The Configuration Service — `EdFi.DmsConfigurationService.Backend.Postgresql.Tests.Integration` and
   `Backend.Mssql.Tests.Integration` (`OpenIddictDataRepositoryTests.cs`): the revocation
   `UPDATE` changes only a row stored for the caller's application, and a second revocation
   changes nothing and keeps the original `RedemptionDate`, on both engines.
+
+  For lifecycle revocation, the same files and `ApiClientTests.cs` cover, on both engines: the
+  bulk revocation (scoped to one application, idempotent, undone with its transaction, and on
+  PostgreSQL dated in UTC under a non-UTC session time zone) and the
+  application-row lock; grants that wait for the lock and refuse a changed secret, an un-approved
+  client or a deleted client, with the token limit enforced and disabled; reset, deletion and
+  un-approval through the real repositories (the client's tokens revoked, another client's
+  untouched, an update that keeps the client approved and a repeated un-approval changing nothing,
+  re-approval reviving nothing); concurrency fixtures in which a grant that commits while the
+  operation waits for the lock has its token revoked, a grant with the old state after the
+  operation is refused, and a stale grant blocked behind the open operation is refused once it commits;
+  and rollback fixtures in which a failing revocation or a failing `ApiClient` update leaves the
+  secret, the application rows, the approval and the tokens unchanged.
 
 **End-to-end tests**
 
@@ -397,11 +581,11 @@ The behaviors above are exercised by automated tests:
   without re-signing, so it is rejected on signature validation before expiry is
   evaluated; true-expiry rejection via the lifetime check is covered by the DMS
   unit test above.)
-- CMS — `EdFi.DmsConfigurationService.Tests.E2E/Features/OwaspCriticalPaths.feature`:
+- The Configuration Service — `EdFi.DmsConfigurationService.Tests.E2E/Features/OwaspCriticalPaths.feature`:
   a revoked self-contained token is rejected on reuse (token issued → revoked via
   `/connect/revoke`, the caller authenticating with the same client's Basic
   credentials so it owns the target token → reused → `401`).
-- CMS — `EdFi.DmsConfigurationService.Tests.E2E/Features/Revocation.feature`, on both
+- The Configuration Service — `EdFi.DmsConfigurationService.Tests.E2E/Features/Revocation.feature`, on both
   identity providers: the OAuth error responses for a missing token, mixed mechanisms, no
   credentials and a wrong Basic secret; owner revocation with Basic and with form
   credentials proven active before and inactive after; a cross-client attempt answered
@@ -409,14 +593,27 @@ The behaviors above are exercised by automated tests:
   confidential observer client whose credentials are never submitted for revocation,
   and public clients (no secret, an arbitrary form secret, an arbitrary Basic secret) are
   refused with their token still active.
-- CMS — `EdFi.DmsConfigurationService.Tests.E2E/Keycloak/KeycloakRevocationCharacterizationTests.cs`:
+- The Configuration Service — `EdFi.DmsConfigurationService.Tests.E2E/Features/ClientLifecycleRevocation.feature`
+  (self-contained only; scenarios 01–03 and 06 also run in the SQL Server lane): a client's token
+  answers `403` on `GET /v3/vendors` while valid (authenticated but not authorized) and `401`
+  once revoked. Client credential reset rejects both of the client's earlier tokens, leaves another
+  client's token valid, accepts a token obtained with the new secret, and introspection with the
+  new credentials reports the earlier token inactive. Client deletion also refuses the old
+  credentials with `invalid_client`. Un-approval refuses new grants; after re-approval the earlier
+  tokens stay rejected and a new token is accepted. Application credential reset rejects the
+  application's earlier token, and deleting an application with several clients rejects every
+  captured token of its clients while another application's token stays valid. Deleting a vendor
+  with clients in two applications rejects every captured token of those clients and refuses
+  their credentials with `invalid_client`, while another vendor's client keeps its token and can
+  obtain a new one.
+- The Configuration Service — `EdFi.DmsConfigurationService.Tests.E2E/Keycloak/KeycloakRevocationCharacterizationTests.cs`:
   Keycloak's own revocation endpoint characterized row by row (status, `error`,
-  `error_description`, token state before and after), the evidence the CMS mapping is
+  `error_description`, token state before and after), the evidence the Configuration Service mapping is
   keyed on.
 
 ## Dynamic scanning
 
-OWASP ZAP can be run against the DMS and CMS OpenAPI specs using the convenience
+OWASP ZAP can be run against the DMS and Configuration Service OpenAPI specs using the convenience
 script described in [`eng/zap/README.md`](../eng/zap/README.md).
 
 ## References

@@ -21,7 +21,9 @@ namespace EdFi.DmsConfigurationService.Backend.Postgresql.OpenIddict.Repositorie
             Guid applicationId,
             string subject,
             DateTimeOffset expiration,
-            int maxActiveTokens
+            int maxActiveTokens,
+            string expectedClientSecret,
+            ApiClientApprovalState expectedApiClientApproval
         )
         {
             return await dataRepository.StoreTokenAsync(
@@ -29,13 +31,20 @@ namespace EdFi.DmsConfigurationService.Backend.Postgresql.OpenIddict.Repositorie
                 applicationId,
                 subject,
                 expiration,
-                maxActiveTokens
+                maxActiveTokens,
+                expectedClientSecret,
+                expectedApiClientApproval
             );
         }
 
         public async Task<string?> GetTokenStatusAsync(Guid tokenId)
         {
             return await dataRepository.GetTokenStatusAsync(tokenId);
+        }
+
+        public async Task<string?> GetTokenStatusForApplicationAsync(Guid tokenId, Guid applicationId)
+        {
+            return await dataRepository.GetTokenStatusForApplicationAsync(tokenId, applicationId);
         }
 
         public async Task<bool> RevokeTokenAsync(Guid tokenId, Guid applicationId)
@@ -77,6 +86,21 @@ namespace EdFi.DmsConfigurationService.Backend.Postgresql.OpenIddict.Repositorie
         public async Task<IEnumerable<string>> GetClientRolesAsync(Guid clientId)
         {
             return await dataRepository.GetClientRolesAsync(clientId);
+        }
+
+        public async Task<IEnumerable<string>> GetApplicationScopesAsync(Guid applicationId)
+        {
+            return await dataRepository.GetApplicationScopesAsync(applicationId);
+        }
+
+        public async Task<bool> RoleNamesShareARoleRowAsync(string firstRoleName, string secondRoleName)
+        {
+            return await dataRepository.RoleNamesShareARoleRowAsync(firstRoleName, secondRoleName);
+        }
+
+        public async Task<ClientCredential?> GetClientCredentialAsync(string clientId)
+        {
+            return await dataRepository.GetClientCredentialAsync(clientId);
         }
     }
 }

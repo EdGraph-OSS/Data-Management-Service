@@ -3,6 +3,7 @@
 // The Ed-Fi Alliance licenses this file to you under the Apache License, Version 2.0.
 // See the LICENSE and NOTICES files in the project root for more information.
 
+using System.Data.Common;
 using EdFi.DmsConfigurationService.Tests.E2E.Keycloak;
 using EdFi.DmsConfigurationService.Tests.E2E.Management;
 using Microsoft.Data.SqlClient;
@@ -42,27 +43,41 @@ public static class SetupHooks
             ? $"mssql localhost:{MssqlDbPortExternal}/{DatabaseName}"
             : $"postgresql localhost:{DbPortExternal}/{DatabaseName}";
 
-    private static bool UseMssql =>
+    internal static bool UseMssql =>
         string.Equals(
-            Environment.GetEnvironmentVariable("DMS_CONFIG_DATASTORE"),
+            Environment.GetEnvironmentVariable("CONFIGURATION_SERVICE_DATASTORE"),
             "mssql",
             StringComparison.OrdinalIgnoreCase
         );
 
-    // HTTP Basic auth on /connect/token is only supported in self-contained
-    // (OpenIddict) mode; keycloak mode expects credentials in the form body. Scope
-    // scenarios tagged @SelfContainedOnly accordingly so they don't run under keycloak.
+    private static string PostgresqlConnectionString =>
+        $"host=localhost;port={DbPortExternal};username={PgAdminUser};password={PgAdminPassword};database={DatabaseName};";
+
+    private static string MssqlConnectionString =>
+        $"Server=localhost,{MssqlDbPortExternal};User Id={MssqlSaUser};Password={MssqlSaPassword};TrustServerCertificate=true;Database={DatabaseName};";
+
+    internal static string DatabaseConnectionString =>
+        UseMssql ? MssqlConnectionString : PostgresqlConnectionString;
+
+    internal static DbConnection CreateDatabaseConnection() =>
+        UseMssql
+            ? new SqlConnection(MssqlConnectionString)
+            : new NpgsqlConnection(PostgresqlConnectionString);
+
+    // Scenarios tagged @SelfContainedOnly depend on behavior only the self-contained (OpenIddict)
+    // identity provider has, such as token revocation semantics or claim shapes Keycloak does not
+    // emit, so they do not run under keycloak.
     [BeforeScenario("SelfContainedOnly")]
     public static void SkipUnlessSelfContainedIdentityProvider()
     {
-        var identityProvider = Environment.GetEnvironmentVariable("DMS_CONFIG_IDENTITY_PROVIDER");
+        var identityProvider = Environment.GetEnvironmentVariable("CONFIGURATION_SERVICE_IDENTITY_PROVIDER");
         if (
             !string.IsNullOrEmpty(identityProvider)
             && !identityProvider.Equals("self-contained", StringComparison.OrdinalIgnoreCase)
         )
         {
             Assert.Ignore(
-                $"Requires the self-contained identity provider (HTTP Basic on /connect/token is self-contained only); current provider is '{identityProvider}'."
+                $"Requires the self-contained identity provider; current provider is '{identityProvider}'."
             );
         }
     }
@@ -74,7 +89,9 @@ public static class SetupHooks
     {
         if (!KeycloakCharacterizationEnvironment.IsKeycloakProvider)
         {
-            var identityProvider = Environment.GetEnvironmentVariable("DMS_CONFIG_IDENTITY_PROVIDER");
+            var identityProvider = Environment.GetEnvironmentVariable(
+                "CONFIGURATION_SERVICE_IDENTITY_PROVIDER"
+            );
             Assert.Ignore(
                 $"Requires the keycloak identity provider; current provider is '{identityProvider ?? "unset"}'."
             );
@@ -113,12 +130,12 @@ public static class SetupHooks
     [BeforeScenario("MultitenantOnly")]
     public static void SkipUnlessMultiTenancyEnabled()
     {
-        var multiTenancy = Environment.GetEnvironmentVariable("DMS_CONFIG_MULTI_TENANCY");
+        var multiTenancy = Environment.GetEnvironmentVariable("CONFIGURATION_SERVICE_MULTI_TENANCY");
         if (!string.Equals(multiTenancy, "true", StringComparison.OrdinalIgnoreCase))
         {
             Assert.Ignore(
                 "Requires a multi-tenant CMS (tenant endpoints are only mapped when multi-tenancy is enabled); "
-                    + $"DMS_CONFIG_MULTI_TENANCY is '{multiTenancy ?? "unset"}'."
+                    + $"CONFIGURATION_SERVICE_MULTI_TENANCY is '{multiTenancy ?? "unset"}'."
             );
         }
     }
@@ -128,10 +145,12 @@ public static class SetupHooks
     [BeforeScenario("SingleTenantOnly")]
     public static void SkipIfMultiTenancyEnabled()
     {
-        var multiTenancy = Environment.GetEnvironmentVariable("DMS_CONFIG_MULTI_TENANCY");
+        var multiTenancy = Environment.GetEnvironmentVariable("CONFIGURATION_SERVICE_MULTI_TENANCY");
         if (string.Equals(multiTenancy, "true", StringComparison.OrdinalIgnoreCase))
         {
-            Assert.Ignore($"Requires a single-tenant CMS; DMS_CONFIG_MULTI_TENANCY is '{multiTenancy}'.");
+            Assert.Ignore(
+                $"Requires a single-tenant CMS; CONFIGURATION_SERVICE_MULTI_TENANCY is '{multiTenancy}'."
+            );
         }
     }
 
@@ -155,15 +174,15 @@ public static class SetupHooks
         {
             if (!UseMssql)
             {
-                var hostConnectionString =
-                    $"host=localhost;port={DbPortExternal};username={PgAdminUser};password={PgAdminPassword};database={DatabaseName};";
-                using var conn = new NpgsqlConnection(hostConnectionString);
+                using var conn = new NpgsqlConnection(PostgresqlConnectionString);
                 await conn.OpenAsync();
 
                 // Delete in reverse dependency order
                 await DeleteData(@"""dmscs"".""DataStoreContext""");
                 await DeleteData(@"""dmscs"".""ApiClientOwnershipToken""");
                 await DeleteData(@"""dmscs"".""ApiClientDataStore""");
+                // A client's education organization rows reference it without cascading
+                await DeleteData(@"""dmscs"".""ApiClientEducationOrganization""");
                 await DeleteData(@"""dmscs"".""ApiClient""");
                 await DeleteData(@"""dmscs"".""OwnershipToken""");
                 await DeleteData(@"""dmscs"".""DataStore""");
@@ -196,15 +215,15 @@ public static class SetupHooks
             }
             else
             {
-                var mssqlConnectionString =
-                    $"Server=localhost,{MssqlDbPortExternal};User Id={MssqlSaUser};Password={MssqlSaPassword};TrustServerCertificate=true;Database={DatabaseName};";
-                using var conn = new SqlConnection(mssqlConnectionString);
+                using var conn = new SqlConnection(MssqlConnectionString);
                 await conn.OpenAsync();
 
                 // Delete in reverse dependency order
                 await DeleteData("dmscs.DataStoreContext");
                 await DeleteData("dmscs.ApiClientOwnershipToken");
                 await DeleteData("dmscs.ApiClientDataStore");
+                // A client's education organization rows reference it without cascading
+                await DeleteData("dmscs.ApiClientEducationOrganization");
                 await DeleteData("dmscs.ApiClient");
                 await DeleteData("dmscs.OwnershipToken");
                 await DeleteData("dmscs.DataStore");

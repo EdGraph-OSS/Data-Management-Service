@@ -38,7 +38,6 @@ public class Given_ManagementEndpointModule
         IApiService apiService,
         string? requiredRole,
         bool multiTenancy = false,
-        bool enableClaimsetReload = true,
         bool enableManagementEndpoints = true,
         IJwtValidationService? jwtValidationService = null,
         string? roleClaimType = RoleClaimType,
@@ -60,8 +59,7 @@ public class Given_ManagementEndpointModule
                     Dictionary<string, string?> settings = new()
                     {
                         ["AppSettings:MultiTenancy"] = multiTenancy ? "true" : "false",
-                        ["AppSettings:EnableClaimsetReload"] = enableClaimsetReload ? "true" : "false",
-                        ["AppSettings:EnableManagementEndpoints"] = enableManagementEndpoints
+                        ["AppSettings:ManagementEndpoints:Enabled"] = enableManagementEndpoints
                             ? "true"
                             : "false",
                         ["JwtAuthentication:ClientRole"] = "legacy-service",
@@ -149,22 +147,6 @@ public class Given_ManagementEndpointModule
 
         patterns.Should().Contain("/management/{tenant}/reload-claimsets");
         patterns.Should().Contain("/management/{tenant}/view-claimsets");
-    }
-
-    [Test]
-    public void It_maps_the_claimset_routes_even_when_claimset_reload_is_disabled()
-    {
-        using WebApplicationFactory<Program> factory = CreateFactory(
-            FakeApiService(),
-            ValidRequiredRole,
-            enableClaimsetReload: false,
-            enableManagementEndpoints: true
-        );
-
-        IEnumerable<string> patterns = MappedRoutePatterns(factory);
-
-        patterns.Should().Contain("/management/reload-claimsets");
-        patterns.Should().Contain("/management/view-claimsets");
     }
 
     [Test]
@@ -343,13 +325,12 @@ public class Given_ManagementEndpointModule
     }
 
     [Test]
-    public void It_warns_when_the_role_is_unusable_and_claimset_reload_is_enabled()
+    public void It_warns_when_the_role_is_invalid()
     {
         var loggerProvider = new RecordingLoggerProvider();
         using WebApplicationFactory<Program> factory = CreateFactory(
             FakeApiService(),
             requiredRole: "cms client",
-            enableClaimsetReload: true,
             loggerProvider: loggerProvider
         );
         _ = MappedRoutePatterns(factory);
@@ -366,13 +347,12 @@ public class Given_ManagementEndpointModule
     }
 
     [Test]
-    public void It_warns_when_the_role_is_unusable_and_claimset_reload_is_disabled()
+    public void It_warns_when_the_role_is_missing()
     {
         var loggerProvider = new RecordingLoggerProvider();
         using WebApplicationFactory<Program> factory = CreateFactory(
             FakeApiService(),
             requiredRole: null,
-            enableClaimsetReload: false,
             loggerProvider: loggerProvider
         );
         _ = MappedRoutePatterns(factory);
@@ -660,6 +640,93 @@ public class Given_ManagementEndpointModule
 
         response.StatusCode.Should().Be(HttpStatusCode.OK);
         A.CallTo(() => apiService.ViewClaimsetsAsync(null)).MustHaveHappenedOnceExactly();
+    }
+
+    [Test]
+    public async Task It_marks_the_single_tenant_claimset_reload_no_store()
+    {
+        await using WebApplicationFactory<Program> factory = CreateFactory(
+            FakeApiService(),
+            ValidRequiredRole,
+            jwtValidationService: ValidJwtWithClaims(new Claim(RoleClaimType, ValidRequiredRole))
+        );
+        using HttpClient client = factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
+            "Bearer",
+            ValidBearerToken
+        );
+
+        HttpResponseMessage response = await client.PostAsync("/management/reload-claimsets", content: null);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        response.Headers.GetValues("Cache-Control").Should().Equal("no-store");
+    }
+
+    [Test]
+    public async Task It_marks_the_tenant_scoped_claimset_reload_no_store()
+    {
+        await using WebApplicationFactory<Program> factory = CreateFactory(
+            FakeApiService(),
+            ValidRequiredRole,
+            multiTenancy: true,
+            jwtValidationService: ValidJwtWithClaims(new Claim(RoleClaimType, ValidRequiredRole)),
+            tenantValidator: TenantValidatorWithKnownTenants()
+        );
+        using HttpClient client = factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
+            "Bearer",
+            ValidBearerToken
+        );
+
+        HttpResponseMessage response = await client.PostAsync(
+            "/management/Tenant1/reload-claimsets",
+            content: null
+        );
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        response.Headers.GetValues("Cache-Control").Should().Equal("no-store");
+    }
+
+    [Test]
+    public async Task It_marks_the_single_tenant_claimset_view_no_store()
+    {
+        await using WebApplicationFactory<Program> factory = CreateFactory(
+            FakeApiService(),
+            ValidRequiredRole,
+            jwtValidationService: ValidJwtWithClaims(new Claim(RoleClaimType, ValidRequiredRole))
+        );
+        using HttpClient client = factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
+            "Bearer",
+            ValidBearerToken
+        );
+
+        HttpResponseMessage response = await client.GetAsync("/management/view-claimsets");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        response.Headers.GetValues("Cache-Control").Should().Equal("no-store");
+    }
+
+    [Test]
+    public async Task It_marks_the_tenant_scoped_claimset_view_no_store()
+    {
+        await using WebApplicationFactory<Program> factory = CreateFactory(
+            FakeApiService(),
+            ValidRequiredRole,
+            multiTenancy: true,
+            jwtValidationService: ValidJwtWithClaims(new Claim(RoleClaimType, ValidRequiredRole)),
+            tenantValidator: TenantValidatorWithKnownTenants()
+        );
+        using HttpClient client = factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
+            "Bearer",
+            ValidBearerToken
+        );
+
+        HttpResponseMessage response = await client.GetAsync("/management/Tenant1/view-claimsets");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        response.Headers.GetValues("Cache-Control").Should().Equal("no-store");
     }
 
     [TestCaseSource(nameof(TenantScopedRouteCases))]

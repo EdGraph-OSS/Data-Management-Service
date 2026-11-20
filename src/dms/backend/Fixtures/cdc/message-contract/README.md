@@ -41,9 +41,10 @@ image-only runner, its resource packaging, observations, and prerequisite diagno
 
 `upsertVariant` optionally names a file under this root. The loader validates the
 shared E18 files first, then applies only the variant's signed `contentVersion`,
-paired source/expected timestamps, and additive `documentProperties`. Additions
+paired source/expected timestamps (`lastModifiedAt`/`expectedLastModifiedAt` and
+`contentCreatedAt`/`expectedDocumentCreatedAt`), and additive `documentProperties`. Additions
 cannot overwrite shared document fields or reserved metadata. Expected timestamps
-are explicit whole-second values checked against the cache timestamp, so rounding
+are explicit whole-second values checked against the cache timestamps, so rounding
 across the year boundary is not accepted. Variant files are test inputs, not new
 materializer goldens. The shared opaque ETag is deliberately unchanged even when a
 synthetic variant changes the version or body: these scenarios test copying, not
@@ -58,16 +59,18 @@ digits; SQL Server supplies seven. Numeric data includes adjacent integers beyon
 exact decimal/exponent values, mixed nested arrays, Unicode strings, and absent
 versus explicitly null sibling properties. Updates also supply uppercase source
 UUIDs and a distinct before row to detect stale metadata or body selection.
-Provider upsert templates include `ComputedAt`
-distinct from `LastModifiedAt` to prove that computation metadata does not leak.
+Provider upsert templates bind `ContentCreatedAt` beside `LastModifiedAt`, with that
+provider's timestamp logical schema, and include `ComputedAt` distinct from both published
+timestamps to prove that computation metadata does not leak.
 The nested-field variant preserves resource properties named `source`, `schema`,
 `payload`, `deleted`, and `_etag` inside objects and collection items. Transport-field
-exclusions apply to the eight envelope properties; complete semantic equality and the
+exclusions apply to the nine envelope properties; complete semantic equality and the
 explicit `document._etag` assertion check the document body and injected ETag placement.
 
 Each scenario independently asserts the complete semantic public envelope, derived
 topic and unquoted UTF-8 key, exact required logical BYTES schema/version and
-converter defensive copy, whole-second document time and cleared Connect metadata,
+converter defensive copy, whole-second document and creation times (the creation time
+absent from `document`) and cleared Connect metadata,
 and opaque ETag placement/internal-field exclusion. Public JSON object order and
 equivalent numeric spelling/scale are not golden byte contracts. Byte equality is
 asserted separately only across the transform-to-converter boundary.
@@ -343,8 +346,8 @@ row availability permits snapshot/capture replay; provider routing and ordering
 assertions remain MC-08/09. Categories are `DatabaseIntegration`,
 `CdcMessageContract`, `CdcMessageContractKafka`, and the relevant provider category.
 
-Set `CDC_CONNECTOR_TEMPLATE_CONNECT_IMAGE` to the qualified immutable sha256 image,
-`CDC_CONNECTOR_TEMPLATE_REDPANDA_IMAGE`, and the relevant
+Set `CDC_CONNECTOR_TEMPLATE_CONNECT_IMAGE` to the qualified immutable sha256 image
+and configure the relevant
 `CDC_CONNECTOR_TEMPLATE_POSTGRES_IMAGE` or
 `CDC_CONNECTOR_TEMPLATE_SQLSERVER_2025_IMAGE`. Set
 `CDC_CONNECTOR_TEMPLATE_FAIL_FAST=true` in qualification lanes. Missing local
@@ -352,6 +355,12 @@ prerequisites retain the sanitized skip policy. Containers/networks are isolated
 cleanup attempts every resource with independent timeouts, including assertion or
 cancellation failures during startup. The existing explicit keep-containers option
 continues to support debugging.
+
+All shared fixtures use Apache Kafka, defaulting to the digest-pinned
+`CdcComposeBrokerSizeDeployment.BrokerImage` shared with Compose. Direct fixture runs
+may set `CDC_CONNECTOR_TEMPLATE_KAFKA_IMAGE` for candidate Apache Kafka testing.
+`Invoke-CdcQualification.ps1` always selects the branch pin, including when pulling
+and recording images; no Redpanda image setting is required.
 
 ```sh
 dotnet test src/dms/backend/EdFi.DataManagementService.Backend.Cdc.Tests.Integration --filter 'Category=CdcMessageContractKafka'
@@ -432,7 +441,8 @@ and records only allowlisted schema descriptors, operation kinds, canonical UUID
 boolean source-identity checks and numeric offsets. It never serializes documents,
 server/database names, connection strings, credentials or exception details, and
 fails closed after 4096 observations. This permits assertions about actual Debezium
-UUID/JSON/ZonedTimestamp/INT64 schemas and delete-before key availability. The raw
+UUID/JSON/ZonedTimestamp/INT64 schemas, the `ContentCreatedAt` timestamp schema, and
+delete-before key availability. The raw
 observer file lives only in the isolated container and is removed during cleanup;
 its bounded observations are included in the NUnit attachment.
 It supplies source-shape evidence, not a second transformer or provider pipeline.
@@ -441,7 +451,7 @@ It supplies source-shape evidence, not a second transformer or provider pipeline
 CDC_CONNECTOR_TEMPLATE_FAIL_FAST=true dotnet test src/dms/backend/EdFi.DataManagementService.Backend.Cdc.Tests.Integration/EdFi.DataManagementService.Backend.Cdc.Tests.Integration.csproj --filter 'Category=CdcMessageContract&FullyQualifiedName~MessageContractPostgresql'
 ```
 
-Configure the qualified immutable Connect digest, PostgreSQL and Redpanda image
+Configure the qualified immutable Connect digest and PostgreSQL image
 variables described under MC-07. The suite starts no API or projector. The fixture's
 optional partition count defaults to one for existing smoke tests; its topic setup
 now explicitly applies compaction and delete retention for both binding topics.
@@ -475,7 +485,8 @@ Neither source-table heartbeat values nor Kafka offsets substitute for that fenc
 
 The pass-through source observer validates the database-qualified relational topics
 and source partition by equality flags, retaining no database/server names. It records
-plain STRING UUID/JSON schemas, IsoTimestamp/INT64 schemas, fractional-precision flags
+plain STRING UUID/JSON schemas, IsoTimestamp/INT64 schemas (for both `LastModifiedAt` and
+`ContentCreatedAt`), fractional-precision flags
 and bounded before-image availability categories. The live canonical UUID before
 images and changed JSON LOB before images are available in this matrix; MC-04 owns
 injected unavailable-marker delete evidence. The actual native heartbeat has a
@@ -486,8 +497,7 @@ Cache deletes and canonical non-delete operations produce no public records; fen
 work insert/update/delete is absent from capture, public output and attributable
 progress. Legitimate periodic/native/relational heartbeats remain separately allowed.
 
-Run with `CDC_CONNECTOR_TEMPLATE_CONNECT_IMAGE` set to the qualified immutable digest,
-`CDC_CONNECTOR_TEMPLATE_REDPANDA_IMAGE` and
+Run with `CDC_CONNECTOR_TEMPLATE_CONNECT_IMAGE` set to the qualified immutable digest and
 `CDC_CONNECTOR_TEMPLATE_SQLSERVER_2025_IMAGE` configured:
 
 ```sh
@@ -536,8 +546,8 @@ Stable executable scenario IDs:
   stale callbacks, observe fresh broker bounds, rescan every partition from earliest,
   and reconstruct the expected final state through the same bootstrap harness.
 
-Configure `CDC_CONNECTOR_TEMPLATE_CONNECT_IMAGE` with the qualified immutable digest,
-`CDC_CONNECTOR_TEMPLATE_POSTGRES_IMAGE`, and `CDC_CONNECTOR_TEMPLATE_REDPANDA_IMAGE`
+Configure `CDC_CONNECTOR_TEMPLATE_CONNECT_IMAGE` with the qualified immutable digest and configure
+`CDC_CONNECTOR_TEMPLATE_POSTGRES_IMAGE`
 as for MC-07/08, then run:
 
 ```sh
@@ -585,7 +595,7 @@ then removes owned Docker resources unless keep-containers diagnostics are enabl
 Whole-broker interruption here is **not** progress acknowledgement-gating or
 readiness evidence; MC-12 owns that isolated failure boundary.
 
-Supply the existing Connect digest, Redpanda, PostgreSQL and SQL Server 2025 image
+Supply the existing Connect digest, PostgreSQL and SQL Server 2025 image
 settings described above, then run (twice for restart determinism):
 
 ```sh
@@ -610,7 +620,7 @@ route, so the proxy permits metadata and fetch requests while disconnecting Kafk
 Produce requests (API key 0) before forwarding them. It never decodes record bodies.
 The block is confirmed after closing existing sockets, before barrier capture.
 This uses Kafka's [connector client overrides](https://kafka.apache.org/25/kafka-connect/user-guide/)
-and [named broker listeners](https://docs.redpanda.com/streaming/current/manage/security/listener-configuration/).
+and the shared Apache Kafka fixture's named broker listeners (`INTERNAL`, `EXTERNAL`, and `PRODUCER`).
 
 Stable IDs use `MC-PROGRESS-ACK-{PG|SQL}-` with these suffixes:
 
@@ -631,7 +641,7 @@ Stable IDs use `MC-PROGRESS-ACK-{PG|SQL}-` with these suffixes:
   restoring the full focused sequence can admit. Ownership, projection, history and lag evidence
   are synthetic inputs. This does not qualify production writer admission or initial-enable orchestration.
 
-Use the same four image settings as MC-07/08/09, then run:
+Use the same Connect and provider image settings as MC-07/08/09, then run:
 
 ```sh
 CDC_CONNECTOR_TEMPLATE_FAIL_FAST=true dotnet test src/dms/backend/EdFi.DataManagementService.Backend.Cdc.Tests.Integration/EdFi.DataManagementService.Backend.Cdc.Tests.Integration.csproj --filter 'Category=CdcMessageContract&FullyQualifiedName~MessageContractProgressAcknowledgement' --logger trx
@@ -667,8 +677,9 @@ headroom for supported batching and protocol overhead is separately qualified by
 
 Generated/read-back settings require compression `none`, explicit `max.request.size`,
 32 MiB `buffer.memory`, and `errors.tolerance=none`. Both topic limits are set/read back;
-Redpanda batch limits and observer fetch limits must accommodate the record budget;
-request capacity must also leave room for protocol overhead and batching.
+Kafka `message.max.bytes` is recorded as the broker default, which the explicit topic
+`max.message.bytes` overrides. Effective broker `socket.request.max.bytes` must leave
+request headroom, and observer fetch limits must accommodate the record budget.
 The isolated topic has one in-sync replica, so there is no inter-broker replication hop;
 this does not qualify a production multi-broker replication configuration.
 
@@ -687,7 +698,7 @@ source position, and permit focused readiness again. This is an isolated recover
 not the supported operational record-size increase procedure. Consumer capacity attestation,
 durable acknowledgement, and interrupted-rollout reconciliation remain DMS-1323 responsibilities.
 
-Use the same four image settings as MC-07/08/09, then run:
+Use the same Connect and provider image settings as MC-07/08/09, then run:
 
 ```sh
 CDC_CONNECTOR_TEMPLATE_FAIL_FAST=true dotnet test src/dms/backend/EdFi.DataManagementService.Backend.Cdc.Tests.Integration/EdFi.DataManagementService.Backend.Cdc.Tests.Integration.csproj --filter 'Category=CdcMessageContract&FullyQualifiedName~MessageContractRecordSize' --logger trx
@@ -713,6 +724,12 @@ the original shared upsert works. No E18 or authoritative goldens are copied or 
 The catalog covers source/work-table rejection, ConfigException, retained upsert/delete
 key types, required row schemas/runtime types, unavailable markers, invalid document JSON
 and embedded metadata, UTC/logical timestamp failures, and direct converter handshakes.
+The `ContentCreatedAt` cases mirror the `LastModifiedAt` set one for one:
+`FIELD-CONTENTCREATEDAT-{MISSING,NULL}` expect `MISSING_REQUIRED_FIELD`;
+`FIELD-CONTENTCREATEDAT-{OPTIONAL,NAME}` and `CREATED-TIME-{NUMERIC,PLAIN,MICRO}` expect
+`UNSUPPORTED_REQUIRED_FIELD_SHAPE`; and
+`CREATED-TIME-{NON-UTC,LOCAL,INVALID,EMPTY,UNAVAILABLE,RUNTIME-NUMBER}` expect
+`INVALID_CONTENT_CREATED_AT`.
 Artifact-owned reason accessors are asserted for transforms; converter/configuration
 failures use Kafka exception categories with runner-owned stage reasons, never exception prose.
 
@@ -794,8 +811,7 @@ Manual workflow dispatch uses the same lane and suite choices.
 
 Use the image recorded in
 `src/dms/backend/EdFi.DataManagementService.Backend.Cdc/CdcQualifiedWorkerImage.json`.
-Configure `CDC_CONNECTOR_TEMPLATE_REDPANDA_IMAGE`,
-`CDC_CONNECTOR_TEMPLATE_POSTGRES_IMAGE`, and
+Configure `CDC_CONNECTOR_TEMPLATE_POSTGRES_IMAGE` and
 `CDC_CONNECTOR_TEMPLATE_SQLSERVER_2025_IMAGE` for the selected providers. SQL Server
 must be 2025 (major version 17). Provider `All` also needs the existing History
 suite's admin connection strings. Each invocation requires a fresh results directory:

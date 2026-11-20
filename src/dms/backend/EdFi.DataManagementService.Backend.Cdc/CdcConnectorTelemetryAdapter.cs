@@ -18,17 +18,31 @@ public sealed class CdcConnectorTelemetryAdapter(
     HttpClient client,
     ICdcConnectTransport connect,
     ICdcWorkerInspectionTransport worker,
-    TimeProvider clock
+    TimeProvider clock,
+    IReadOnlySet<string> qualifiedDigests
 ) : ICdcWorkerMetricsTransport
 {
     internal const int MaximumResponseBytes = 4 * 1024 * 1024;
+
+    // Deployment composition supplies the published qualification inventory, not request input.
+    private readonly IReadOnlySet<string> _qualifiedDigests = (
+        qualifiedDigests ?? throw new ArgumentNullException(nameof(qualifiedDigests))
+    ).ToHashSet(StringComparer.Ordinal);
 
     public CdcConnectorTelemetryAdapter(
         HttpClient client,
         ICdcConnectTransport connect,
         ICdcWorkerInspectionTransport worker
     )
-        : this(client, connect, worker, TimeProvider.System) { }
+        : this(client, connect, worker, TimeProvider.System, CdcQualifiedWorkerImage.Digests) { }
+
+    public CdcConnectorTelemetryAdapter(
+        HttpClient client,
+        ICdcConnectTransport connect,
+        ICdcWorkerInspectionTransport worker,
+        TimeProvider clock
+    )
+        : this(client, connect, worker, clock, CdcQualifiedWorkerImage.Digests) { }
 
     public static HttpClient CreateHttpClient() =>
         new(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = Timeout.InfiniteTimeSpan };
@@ -51,8 +65,11 @@ public sealed class CdcConnectorTelemetryAdapter(
         {
             return Failure(CdcDeploymentComponent.Metrics, CdcDeploymentFailure.InvalidInput);
         }
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(request.Timing.WaitTimeout);
+        using var operationTimer = new CancellationTokenSource(request.Timing.WaitTimeout, clock);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            operationTimer.Token
+        );
         var component = CdcDeploymentComponent.Worker;
         try
         {
@@ -147,14 +164,14 @@ public sealed class CdcConnectorTelemetryAdapter(
         }
     }
 
-    private static async Task<T> CallAsync<T>(
+    private async Task<T> CallAsync<T>(
         CdcDeploymentRequest request,
         Func<CancellationToken, Task<T>> call,
         CancellationToken token
     )
     {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-        timeout.CancelAfter(request.Timing.CallTimeout);
+        using var deadline = new CancellationTokenSource(request.Timing.CallTimeout, clock);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token, deadline.Token);
         return await call(timeout.Token).WaitAsync(timeout.Token);
     }
 
@@ -205,11 +222,11 @@ public sealed class CdcConnectorTelemetryAdapter(
             _ => throw new TelemetryEvidenceException(component, CdcDeploymentFailure.Unavailable),
         };
 
-    private static bool Matches(CdcWorkerInspection evidence, CdcDeploymentRequest request) =>
+    private bool Matches(CdcWorkerInspection evidence, CdcDeploymentRequest request) =>
         !string.IsNullOrWhiteSpace(evidence.ProcessIdentity)
         && !string.IsNullOrWhiteSpace(evidence.ConnectWorkerId)
         && evidence.MetricsEndpoint == request.WorkerMetricsEndpoint
-        && CdcQualifiedWorkerImage.Digests.Contains(evidence.ImageDigest)
+        && _qualifiedDigests.Contains(evidence.ImageDigest)
         && evidence.ImageDigest == request.WorkerPolicy.QualifiedImageDigest
         && evidence.HeapBytes == request.WorkerPolicy.HeapBytes
         && evidence.EffectiveConfiguration.TryGetValue("group.id", out var group)
