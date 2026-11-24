@@ -11,7 +11,7 @@ public static class ApiVersionDetails
 {
     // Keep in sync with <InformationalVersion> in src/config/Directory.Build.props; only used when
     // the assembly attribute is absent (e.g. an unstamped build).
-    private const string FallbackInformationalVersion = "8.0.0";
+    private const string FallbackInformationalVersion = "8.1.0";
 
     private static readonly Version AssemblyVersion =
         Assembly.GetExecutingAssembly().GetName().Version ?? new Version(0, 0, 0);
