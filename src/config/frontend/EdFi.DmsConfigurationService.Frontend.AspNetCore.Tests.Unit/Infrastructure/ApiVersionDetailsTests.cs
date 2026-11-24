@@ -36,6 +36,13 @@ public class ApiVersionDetailsTests
         string normalized = ApiVersionDetails.NormalizeInformationalVersion(raw);
 
         // Assert
-        Assert.That(normalized, Is.EqualTo("8.0.0"));
+        Assert.That(normalized, Is.EqualTo("8.1.0"));
+    }
+
+    [Test]
+    public void Given_ApiVersionDetails_When_RetrievingVersion_Then_ReturnsTheReleaseVersion()
+    {
+        // The assembly version; an image build stamps only InformationalVersion.
+        Assert.That(ApiVersionDetails.Version, Is.EqualTo("8.1.0"));
     }
 }

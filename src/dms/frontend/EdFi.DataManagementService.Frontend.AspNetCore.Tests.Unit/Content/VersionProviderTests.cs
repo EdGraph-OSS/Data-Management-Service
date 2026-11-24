@@ -26,6 +26,13 @@ public class VersionProviderTests
     }
 
     [Test]
+    public void Given_VersionProvider_When_RetrievingVersion_Then_ReturnsTheReleaseVersion()
+    {
+        // Discovery's "version" is the assembly version; an image build stamps only InformationalVersion.
+        Assert.That(new VersionProvider().Version, Is.EqualTo("8.1.0"));
+    }
+
+    [Test]
     public void Given_VersionProvider_When_RetrievingApplicationName_Then_ReturnsEdFiApi()
     {
         // Arrange
@@ -62,6 +69,6 @@ public class VersionProviderTests
         string normalized = VersionProvider.NormalizeInformationalVersion(raw);
 
         // Assert
-        Assert.That(normalized, Is.EqualTo("8.0.0"));
+        Assert.That(normalized, Is.EqualTo("8.1.0"));
     }
 }
