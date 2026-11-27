@@ -121,7 +121,9 @@ public static class WebApplicationBuilderExtensions
                 webAppBuilder.Configuration.GetSection("AppSettings:Datastore").Value ?? string.Empty;
             var logger = serviceProvider.GetRequiredService<ILogger<DbHealthCheck>>();
 
-            return new DbHealthCheck(connectionStringProvider, datastore, logger);
+            bool multiTenancy = webAppBuilder.Configuration.GetValue<bool>("AppSettings:MultiTenancy");
+
+            return new DbHealthCheck(connectionStringProvider, datastore, logger, multiTenancy);
         });
 
         webAppBuilder

@@ -23,8 +23,9 @@ internal static class DbHealthCheckTestSupport
 
     public static DbHealthCheck CreateCheck(
         IConnectionStringProvider connectionStringProvider,
-        string providerName = "postgresql"
-    ) => new(connectionStringProvider, providerName, NullLogger<DbHealthCheck>.Instance);
+        string providerName = "postgresql",
+        bool multiTenancy = false
+    ) => new(connectionStringProvider, providerName, NullLogger<DbHealthCheck>.Instance, multiTenancy);
 
     public static HealthCheckContext CreateContext(DbHealthCheck check) =>
         new() { Registration = new HealthCheckRegistration("DbHealthCheck", check, null, null) };
@@ -189,5 +190,47 @@ public class Given_A_DbHealthCheck_With_An_Unsupported_Provider
         Action construct = () => DbHealthCheckTestSupport.CreateCheck(connectionStringProvider, providerName);
 
         construct.Should().NotThrow();
+    }
+}
+
+// The regression this guards: in multi-tenant mode every liveness and readiness probe opened a
+// connection to the first loaded tenant's database with that tenant's own login. Once that tenant
+// was deleted, each probe became a failed login against a dropped database (twelve a minute), which
+// Defender for Cloud reported as a brute-force attack, and one tenant's database could fail the
+// probes of a pod that serves every tenant. The probe must not touch any tenant database.
+[TestFixture]
+[Parallelizable]
+public class Given_A_DbHealthCheck_In_Multi_Tenant_Mode
+{
+    private IConnectionStringProvider _connectionStringProvider = null!;
+    private HealthCheckResult _result;
+
+    [SetUp]
+    public async Task Setup()
+    {
+        _connectionStringProvider = A.Fake<IConnectionStringProvider>();
+        A.CallTo(() => _connectionStringProvider.GetHealthCheckTarget())
+            .Returns(HealthCheckTarget.Available(DbHealthCheckTestSupport.UnreachableConnectionString));
+
+        var check = DbHealthCheckTestSupport.CreateCheck(_connectionStringProvider, multiTenancy: true);
+        _result = await check.CheckHealthAsync(DbHealthCheckTestSupport.CreateContext(check));
+    }
+
+    [Test]
+    public void It_reports_healthy()
+    {
+        _result.Status.Should().Be(HealthStatus.Healthy);
+    }
+
+    [Test]
+    public void It_says_tenant_databases_are_not_probed()
+    {
+        _result.Description.Should().Be(DbHealthCheck.MultiTenantDescription);
+    }
+
+    [Test]
+    public void It_never_selects_a_tenant_data_store()
+    {
+        A.CallTo(() => _connectionStringProvider.GetHealthCheckTarget()).MustNotHaveHappened();
     }
 }

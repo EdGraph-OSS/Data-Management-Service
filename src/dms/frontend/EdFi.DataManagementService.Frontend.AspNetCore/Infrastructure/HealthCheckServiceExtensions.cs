@@ -43,13 +43,22 @@ public class ApplicationHealthCheck(ILogger<ApplicationHealthCheck> logger) : IH
 /// to HTTP 200, so it does not fail probes. Data stores that are loaded but have no connection string
 /// are a misconfiguration, not a wait, so that state is <see cref="HealthStatus.Unhealthy"/> with
 /// its own description.
+/// In multi-tenant mode the check connects to nothing and reports Healthy. Each data store belongs to a
+/// tenant and is reached with that tenant's own login; probing one of them made every liveness and
+/// readiness probe a login into an arbitrary tenant's database. After that tenant was deleted the probes
+/// became failed logins against a dropped database, which Defender for Cloud reports as a brute-force
+/// attack, and one tenant's database could fail the probes of a pod that serves all tenants.
 /// </remarks>
 public class DbHealthCheck(
     IConnectionStringProvider connectionStringProvider,
     string providerName,
-    ILogger<DbHealthCheck> logger
+    ILogger<DbHealthCheck> logger,
+    bool multiTenancy = false
 ) : IHealthCheck
 {
+    internal const string MultiTenantDescription =
+        "Multi-tenant mode: tenant databases are not probed; each is reached with its tenant's login per request.";
+
     internal const string NoDataStoresDescription =
         "No data stores are loaded yet, so there is no database to check.";
 
@@ -71,6 +80,11 @@ public class DbHealthCheck(
         CancellationToken cancellationToken = default
     )
     {
+        if (multiTenancy)
+        {
+            return HealthCheckResult.Healthy(MultiTenantDescription);
+        }
+
         HealthCheckTarget target = _connectionStringProvider.GetHealthCheckTarget();
 
         switch (target.Status)
